@@ -51,7 +51,8 @@ impl std::fmt::Display for CollectError {
 
 impl std::error::Error for CollectError {}
 
-/// Package dir (skip `target/`, `.git/`, dot-dirs, files > MAX_FILE),
+/// Package dir (skip `target/`, `.git/`, dot-dirs anywhere, dot-files directly
+/// in the package dir such as `.env` and `.npmrc`, files > MAX_FILE),
 /// `OUT_DIR` contents, and native libs for static `-l` libraries (`name.lib`
 /// for msvc targets, `lib<name>.a` otherwise) from `native`/`all` search dirs.
 /// Exceeding MAX_TOTAL is `TooLarge`.
@@ -123,10 +124,16 @@ fn walk(root: &Path, is_package: bool, max_file: u64, acc: &mut Acc) -> Result<(
         .sort_by_file_name()
         .into_iter()
         .filter_entry(|e| {
-            if !is_package || e.depth() == 0 || !e.file_type().is_dir() {
+            if !is_package || e.depth() == 0 {
                 return true;
             }
             let name = e.file_name().to_string_lossy();
+            if !e.file_type().is_dir() {
+                // A dot-FILE directly in the package dir (`.env`, `.npmrc`,
+                // `.netrc`, ...) is where credentials and local settings live;
+                // rustc never reads one, so it is not sent to a peer (CF-19).
+                return !(e.depth() == 1 && name.starts_with('.'));
+            }
             !(name.starts_with('.') || (e.depth() == 1 && name == "target"))
         });
     for entry in walker {
@@ -318,16 +325,16 @@ mod tests {
         write(&r.join(".git/HEAD"), b"ref");
         write(&r.join(".hidden/x.rs"), b"x");
         write(&r.join("src/.cache/y.rs"), b"y");
-        write(&r.join(".gitignore"), b"a dot FILE is kept");
+        // CF-19: dot-files at the package root hold credentials and local
+        // settings; none of them leaves the machine. Deeper ones are source.
+        write(&r.join(".gitignore"), b"x");
+        write(&r.join(".env"), b"TOKEN=secret");
+        write(&r.join(".npmrc"), b"//registry:_authToken=secret");
+        write(&r.join("src/.keep"), b"a nested dot file is kept");
         let c = collect_pkg(r);
         assert_eq!(
             names(&c, r),
-            vec![
-                ".gitignore",
-                "Cargo.toml",
-                "src/lib.rs",
-                "src/target/mod.rs"
-            ]
+            vec!["Cargo.toml", "src/.keep", "src/lib.rs", "src/target/mod.rs"]
         );
         assert_eq!(c.total, c.files.iter().map(|f| f.1).sum::<u64>());
     }

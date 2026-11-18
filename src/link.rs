@@ -39,6 +39,15 @@ impl Activity {
     }
 }
 
+/// Ends the task it holds when dropped (`JoinHandle` alone detaches).
+pub struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub struct Link {
     pub tx: mpsc::Sender<Message>,
     pub rx: mpsc::Receiver<Message>,
@@ -156,6 +165,40 @@ impl Link {
         );
     }
 
+    /// Send `Message::Keepalive` every `every` while `gate` says so. The task
+    /// holds only a weak sender, so it never keeps the connection open: a
+    /// closing link still drains and shuts down. A full queue skips the tick
+    /// (frames are flowing then); a closed link ends the task (CF-25).
+    pub fn keepalive_ticker(
+        &self,
+        every: Duration,
+        gate: impl Fn() -> bool + Send + 'static,
+    ) -> AbortOnDrop {
+        let weak = self.tx.downgrade();
+        AbortOnDrop(tokio::spawn(async move {
+            let mut t = tokio::time::interval(every);
+            t.tick().await;
+            loop {
+                t.tick().await;
+                if !gate() {
+                    continue;
+                }
+                let Some(tx) = weak.upgrade() else { return };
+                if let Err(mpsc::error::TrySendError::Closed(_)) = tx.try_send(Message::Keepalive) {
+                    return;
+                }
+            }
+        }))
+    }
+
+    /// True when the other end has closed the connection or sent a frame this
+    /// side never expects at that point, judged within `wait` so a closed
+    /// socket whose end-of-file the reader task has not seen yet still counts
+    /// (CF-25). A frame read here is dropped.
+    pub async fn peer_gone(&mut self, wait: Duration) -> bool {
+        tokio::time::timeout(wait, self.rx.recv()).await.is_ok()
+    }
+
     /// Queue a frame. Fails once the writer task has stopped (connection gone).
     pub async fn send(&self, m: Message) -> anyhow::Result<()> {
         self.tx
@@ -268,6 +311,57 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// CF-25: the ticker sends while its gate is open, stays quiet while it is
+    /// closed, and does not keep a closing link open.
+    #[tokio::test]
+    async fn keepalive_ticker_follows_its_gate_and_does_not_hold_the_link() {
+        let (a, mut b) = pair();
+        let link = Link::new(a);
+        let open = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let gate = open.clone();
+        let _t = link.keepalive_ticker(Duration::from_millis(40), move || {
+            gate.load(Ordering::SeqCst)
+        });
+        assert!(matches!(b.recv().await, Ok(Some(Message::Keepalive))));
+        open.store(false, Ordering::SeqCst);
+        // Frames already in flight arrive; a closed gate then means silence.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut got = 0;
+        while tokio::time::timeout(Duration::from_millis(250), b.recv())
+            .await
+            .is_ok_and(|m| matches!(m, Ok(Some(Message::Keepalive))))
+        {
+            got += 1;
+            assert!(got < 4, "ticker keeps sending with a closed gate");
+        }
+        open.store(true, Ordering::SeqCst);
+        // Closing flushes and ends the connection although the ticker lives.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), link.close())
+                .await
+                .is_ok()
+        );
+        loop {
+            match tokio::time::timeout(Duration::from_secs(3), b.recv()).await {
+                Ok(Ok(Some(Message::Keepalive))) => {}
+                Ok(Ok(None)) => break,
+                other => panic!("the link did not close: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_gone_sees_a_closed_connection_and_a_quiet_one() {
+        let (a, b) = pair();
+        let mut link = Link::new(a);
+        assert!(
+            !link.peer_gone(Duration::from_millis(50)).await,
+            "quiet but open"
+        );
+        drop(b);
+        assert!(link.peer_gone(Duration::from_millis(500)).await);
     }
 
     #[tokio::test]

@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// The executor sends `Message::Keepalive` this often while a job is on its
+/// slot; the submitter gives up on 30 s without any frame (CF-25).
+pub const HEARTBEAT: Duration = Duration::from_secs(5);
 /// How long a reserved slot waits for the `JobRequest`.
 const REQUEST_WAIT: Duration = Duration::from_secs(30);
 /// Silence while the submitter uploads blobs.
@@ -57,6 +60,10 @@ impl Node {
         if spec.job_id != job_id {
             bail!("JobRequest for a different job");
         }
+        // From here to the end of the job the submitter hears from this node
+        // every few seconds, whatever rustc does: its per-frame idle limit is
+        // how it notices a machine that froze or lost its network (CF-25).
+        let _heartbeat = link.keepalive_ticker(HEARTBEAT, || true);
         // Caps, arguments and environment are checked before any blob is
         // received or written (CF-8); a refusal makes the submitter run locally.
         exec::validate_spec(

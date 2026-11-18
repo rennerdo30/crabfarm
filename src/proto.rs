@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bump on any incompatible change to these types.
-pub const PROTO_VERSION: u16 = 4;
+pub const PROTO_VERSION: u16 = 5;
 /// Maximum encoded frame size in bytes.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// Blob transfer chunk size (plaintext bytes before compression).
@@ -347,6 +347,10 @@ pub enum Message {
     /// `ipc::KEEPALIVE_INTERVAL` while a `Submit` is in flight, so a wrapper can
     /// tell a busy node from a dead one. The wrapper runs rustc itself after
     /// `ipc::NODE_SILENCE_LIMIT` without any frame.
+    ///
+    /// Protocol 5 (CF-25): the executor also sends it every 5 s on a job
+    /// connection while a job is on its slot; the submitter treats 30 s
+    /// without any frame as a vanished peer.
     Keepalive,
     /// CLI -> node over authenticated local IPC only (appended in CF-22, the
     /// encoding of every earlier variant is unchanged): shut down cleanly.

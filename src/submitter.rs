@@ -16,7 +16,7 @@ use anyhow::bail;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// After a remote `Exit` the wrapper may still ask for a local retry.
@@ -122,6 +122,78 @@ impl Drop for RunningGuard {
         };
         c.fetch_sub(1, Ordering::Relaxed);
         self.node.status_changed();
+    }
+}
+
+/// How long a job link may stay without a frame from the peer, outside blob
+/// transfers (CF-25). The executor sends a keepalive every 5 s, so this is six
+/// missed beats.
+pub const PEER_FRAME_IDLE: Duration = Duration::from_secs(30);
+/// Time beyond `job_timeout_min` the whole remote attempt may take: upload,
+/// output transfer and the executor's own timeout handling.
+const JOB_SLACK: Duration = Duration::from_secs(120);
+
+/// What the node knows about the liveness of the work behind one `Submit`.
+/// The keepalive to the wrapper is sent only while this says the job is alive,
+/// so a wrapper never mistakes "the node is up" for "my job is progressing".
+struct Liveness {
+    base: Instant,
+    last_ms: AtomicU64,
+    /// A remote attempt is in flight (waiting on a peer).
+    remote: AtomicBool,
+    /// The wrapper was told to run rustc itself: nothing more to say to it.
+    stopped: AtomicBool,
+}
+
+impl Liveness {
+    fn new() -> Arc<Liveness> {
+        Arc::new(Liveness {
+            base: Instant::now(),
+            last_ms: AtomicU64::new(0),
+            remote: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+        })
+    }
+
+    /// Progress of the peer: a frame came from it, or one went to it.
+    fn touch(&self) {
+        self.last_ms
+            .store(self.base.elapsed().as_millis() as u64, Ordering::Release);
+    }
+
+    fn since_touch(&self) -> Duration {
+        let last = self.last_ms.load(Ordering::Acquire);
+        Duration::from_millis((self.base.elapsed().as_millis() as u64).saturating_sub(last))
+    }
+
+    /// Mark the start or end of a remote attempt.
+    fn set_remote(&self, on: bool) {
+        self.touch();
+        self.remote.store(on, Ordering::Release);
+    }
+
+    /// Whether the wrapper should hear a keepalive now.
+    fn keepalive_due(&self) -> bool {
+        if self.stopped.load(Ordering::Acquire) {
+            return false;
+        }
+        !self.remote.load(Ordering::Acquire) || self.since_touch() < PEER_FRAME_IDLE
+    }
+}
+
+/// Marks a remote attempt for the length of its scope.
+struct RemoteScope<'a>(&'a Liveness);
+
+impl<'a> RemoteScope<'a> {
+    fn new(live: &'a Liveness) -> Self {
+        live.set_remote(true);
+        RemoteScope(live)
+    }
+}
+
+impl Drop for RemoteScope<'_> {
+    fn drop(&mut self) {
+        self.0.set_remote(false);
     }
 }
 
@@ -418,6 +490,30 @@ async fn send_by(link: &Link, m: Message, deadline: Instant) -> anyhow::Result<(
     }
 }
 
+/// The next frame of a job link. Fails when the peer sent nothing for
+/// [`PEER_FRAME_IDLE`] (its executor beats every 5 s, so that peer is gone), when
+/// the link closed, or when `deadline` (the whole job) has passed.
+async fn next_frame(link: &mut Link, deadline: Instant) -> anyhow::Result<Message> {
+    next_frame_within(link, deadline, PEER_FRAME_IDLE).await
+}
+
+async fn next_frame_within(
+    link: &mut Link,
+    deadline: Instant,
+    idle: Duration,
+) -> anyhow::Result<Message> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        bail!("remote job exceeded its overall deadline");
+    }
+    match tokio::time::timeout(idle.min(left), link.recv()).await {
+        Ok(Some(m)) => Ok(m),
+        Ok(None) => bail!("connection to the peer lost"),
+        Err(_) if Instant::now() >= deadline => bail!("remote job exceeded its overall deadline"),
+        Err(_) => bail!("peer silent"),
+    }
+}
+
 struct PeerView {
     id: NodeId,
     free: u32,
@@ -469,19 +565,19 @@ impl Node {
                     // The wrapper tells a busy node from a dead one by these
                     // (CF-19). Input collection, a wait for a peer or for a local
                     // slot can all take a while without any other frame.
-                    let tx = link.tx.clone();
-                    let ticker = tokio::spawn(async move {
-                        let mut t = tokio::time::interval(crate::ipc::KEEPALIVE_INTERVAL);
-                        t.tick().await;
-                        loop {
-                            t.tick().await;
-                            if tx.send(Message::Keepalive).await.is_err() {
-                                return;
-                            }
-                        }
-                    });
-                    self.handle_submit(&mut link, spec, info, force_local).await;
-                    ticker.abort();
+                    //
+                    // Not blindly: while a peer runs the job, a keepalive means
+                    // "the job is alive" (a frame came from the peer in the last
+                    // 30 s), so a dead peer reaches the wrapper's own fallback
+                    // instead of being papered over (CF-25).
+                    let live = Liveness::new();
+                    let gate = live.clone();
+                    let _ticker = link
+                        .keepalive_ticker(crate::ipc::KEEPALIVE_INTERVAL, move || {
+                            gate.keepalive_due()
+                        });
+                    self.handle_submit(&mut link, spec, info, force_local, &live)
+                        .await;
                     break;
                 }
                 _ => break,
@@ -498,30 +594,31 @@ impl Node {
         spec: JobSpec,
         info: SubmitInfo,
         force_local: bool,
+        live: &Liveness,
     ) {
         lock(&self.depgraph).begin(&info.produces, &info.externs);
         if force_local {
             // The wrapper knows a variable this crate reads is not forwarded
             // (CF-18): no peer is tried, no inputs are collected.
-            self.local_phase(wrapper, LocalReason::EnvDependency, &info)
+            self.local_phase(wrapper, LocalReason::EnvDependency, &info, live)
                 .await;
             return;
         }
         let plan = match self.plan(spec, &info).await {
             Ok(p) => p,
             Err(reason) => {
-                self.local_phase(wrapper, reason, &info).await;
+                self.local_phase(wrapper, reason, &info, live).await;
                 return;
             }
         };
-        match self.run_remote(wrapper, &plan, &info).await {
+        match self.run_remote(wrapper, &plan, &info, live).await {
             RemoteEnd::Done => {
                 // The wrapper may reject the result (compile error of a
                 // non-registry crate, env-dep mismatch) and ask for a slot.
                 if let Ok(Some(Message::RetryLocal { reason })) =
                     tokio::time::timeout(RETRY_WAIT, wrapper.recv()).await
                 {
-                    self.local_phase(wrapper, reason, &info).await;
+                    self.local_phase(wrapper, reason, &info, live).await;
                 }
             }
             RemoteEnd::Fallback(why) => {
@@ -530,7 +627,7 @@ impl Node {
                     "remote job failed: {why}"
                 );
                 self.count("remote_failed", 1);
-                self.local_phase(wrapper, LocalReason::RemoteFailed, &info)
+                self.local_phase(wrapper, LocalReason::RemoteFailed, &info, live)
                     .await;
             }
             RemoteEnd::Tainted => {
@@ -538,7 +635,7 @@ impl Node {
                     crate_name = plan.spec.crate_name.as_str(),
                     "remote output embeds the sandbox path, rerunning locally"
                 );
-                self.local_phase(wrapper, LocalReason::SandboxPathInOutput, &info)
+                self.local_phase(wrapper, LocalReason::SandboxPathInOutput, &info, live)
                     .await;
             }
         }
@@ -551,6 +648,7 @@ impl Node {
         wrapper: &mut Link,
         reason: LocalReason,
         info: &SubmitInfo,
+        live: &Liveness,
     ) {
         self.count_local(reason);
         lock(&self.depgraph).begin(&info.produces, &info.externs);
@@ -562,6 +660,8 @@ impl Node {
             lock(&self.depgraph).finish(&info.produces, false);
             return;
         }
+        // The wrapper reads nothing more until it is done with rustc.
+        live.stopped.store(true, Ordering::Release);
         let ok = loop {
             match wrapper.recv().await {
                 Some(Message::LocalDone { code, .. }) => break code == 0,
@@ -734,12 +834,20 @@ impl Node {
 
     // --------------------------------------------------------------- remote
 
-    async fn open_job_link(self: &Arc<Self>, peer: NodeId, job_id: JobId) -> Option<Link> {
+    async fn open_job_link(
+        self: &Arc<Self>,
+        peer: NodeId,
+        job_id: JobId,
+        live: &Liveness,
+    ) -> Option<Link> {
         let addrs = lock(&self.peers)
             .get(&peer)
             .map(|p| p.info.addrs.clone())
             .unwrap_or_default();
         for a in addrs {
+            // Every attempt is bounded (connect 5 s, reserve 10 s); the node
+            // is working on the job meanwhile.
+            live.touch();
             let Ok((pid, _hello, conn)) = crate::transport::connect(&self.tls, &self.id, &a).await
             else {
                 continue;
@@ -765,15 +873,19 @@ impl Node {
         wrapper: &Link,
         plan: &Plan,
         info: &SubmitInfo,
+        live: &Liveness,
     ) -> RemoteEnd {
         let _running = RunningGuard::new(self, true);
+        let _remote = RemoteScope::new(live);
         for target in plan.targets.iter().take(2) {
-            let Some(link) = self.open_job_link(*target, plan.spec.job_id).await else {
+            let Some(link) = self.open_job_link(*target, plan.spec.job_id, live).await else {
                 continue;
             };
             lock(&plan.pending).take();
             let started = Instant::now();
-            let end = self.drive_remote(wrapper, link, plan, info, *target).await;
+            let end = self
+                .drive_remote(wrapper, link, plan, info, *target, live)
+                .await;
             if matches!(end, RemoteEnd::Done) {
                 tracing::debug!(
                     crate_name = plan.spec.crate_name.as_str(),
@@ -794,9 +906,10 @@ impl Node {
         plan: &Plan,
         info: &SubmitInfo,
         target: NodeId,
+        live: &Liveness,
     ) -> RemoteEnd {
         match self
-            .drive_remote_inner(wrapper, &mut link, plan, info, target)
+            .drive_remote_inner(wrapper, &mut link, plan, info, target, live)
             .await
         {
             Ok(end) => {
@@ -818,6 +931,7 @@ impl Node {
         plan: &Plan,
         info: &SubmitInfo,
         target: NodeId,
+        live: &Liveness,
     ) -> anyhow::Result<RemoteEnd> {
         let spec = &plan.spec;
         link.send(Message::JobRequest {
@@ -825,7 +939,10 @@ impl Node {
             blob_key: self.id.blob_key,
         })
         .await?;
-        let idle = Duration::from_secs(self.cfg.job_timeout_min.max(1) * 60 + 120);
+        // One deadline for the whole attempt: a peer that trickles stderr lines
+        // is "alive" to the idle limit but cannot keep the job past this.
+        let job_deadline =
+            Instant::now() + Duration::from_secs(self.cfg.job_timeout_min.max(1) * 60) + JOB_SLACK;
         let mut pending: Option<(Assembler, ClientPath, BlobHash, u64)> = None;
         // Outputs are applied at `Exit`, except clean metadata and dep-info
         // files, which are applied at their notification line so cargo can
@@ -836,18 +953,16 @@ impl Node {
         let upload_deadline = Instant::now() + UPLOAD_DEADLINE;
         let style = spec.out_dir.style;
         loop {
-            let m = tokio::time::timeout(idle, link.recv())
-                .await
-                .map_err(|_| anyhow::anyhow!("peer silent"))?;
-            let Some(m) = m else {
-                bail!("connection to the peer lost")
-            };
+            let m = next_frame(link, job_deadline).await?;
+            live.touch();
             match m {
                 Message::NeedBlobs { hashes } => {
-                    self.upload_blobs(link, plan, target, &hashes, upload_deadline)
+                    // The upload has its own deadline; its chunks count as progress.
+                    self.upload_blobs(link, plan, target, &hashes, upload_deadline, live)
                         .await?
                 }
-                Message::Started => {}
+                // The executor's heartbeat: the job is alive, nothing to apply.
+                Message::Started | Message::Keepalive => {}
                 Message::Stderr { line } => {
                     if pending.is_some() {
                         bail!("stderr inside an output transfer");
@@ -970,6 +1085,7 @@ impl Node {
         target: NodeId,
         hashes: &[BlobHash],
         deadline: Instant,
+        live: &Liveness,
     ) -> anyhow::Result<()> {
         let started = Instant::now();
         let mut wire = 0u64;
@@ -998,6 +1114,7 @@ impl Node {
                     deadline,
                 )
                 .await?;
+                live.touch();
             }
         }
         self.count("bytes_up", wire);
@@ -1295,6 +1412,84 @@ mod tests {
         let err = result.expect_err("the upload must not wait for ever");
         assert!(format!("{err:#}").contains("deadline"), "{err:#}");
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    fn duplex_link() -> (Link, crate::transport::FramedConn<tokio::io::DuplexStream>) {
+        use crate::transport::FramedConn;
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        (Link::new(FramedConn::new(a)), FramedConn::new(b))
+    }
+
+    /// CF-25: a peer that sends nothing is given up on after the idle limit,
+    /// and a quiet but open connection is not mistaken for a closed one.
+    #[tokio::test]
+    async fn a_silent_peer_ends_the_job_at_the_idle_limit() {
+        let (mut link, _peer) = duplex_link();
+        let started = Instant::now();
+        let err = next_frame_within(
+            &mut link,
+            Instant::now() + Duration::from_secs(60),
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("peer silent"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// CF-25: frames that keep coming (stderr trickled one line per beat) reset
+    /// the idle limit but cannot extend the overall deadline.
+    #[tokio::test]
+    async fn a_peer_that_trickles_frames_cannot_outlive_the_job_deadline() {
+        let (mut link, mut peer) = duplex_link();
+        let feeder = tokio::spawn(async move {
+            loop {
+                if peer.send(&Message::Keepalive).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let result = loop {
+            match next_frame_within(&mut link, deadline, Duration::from_millis(300)).await {
+                Ok(_) => {}
+                Err(e) => break e,
+            }
+        };
+        feeder.abort();
+        assert!(
+            format!("{result:#}").contains("overall deadline"),
+            "{result:#}"
+        );
+        assert!(Instant::now() < deadline + Duration::from_secs(2));
+    }
+
+    /// CF-25: the wrapper hears keepalives while the node waits for a peer slot
+    /// or a local one, and while a peer is demonstrably alive; not once a peer
+    /// went quiet, and not after the wrapper was told to run rustc itself.
+    #[test]
+    fn keepalive_to_the_wrapper_needs_a_live_job() {
+        let live = Liveness::new();
+        assert!(
+            live.keepalive_due(),
+            "no remote attempt: the node is just busy"
+        );
+        live.set_remote(true);
+        assert!(live.keepalive_due(), "peer heard from just now");
+        // Age the last frame by hand: 31 s ago.
+        let aged = Liveness {
+            base: Instant::now() - Duration::from_secs(40),
+            last_ms: AtomicU64::new(9_000),
+            remote: AtomicBool::new(true),
+            stopped: AtomicBool::new(false),
+        };
+        assert!(!aged.keepalive_due(), "peer silent for 31 s");
+        aged.touch();
+        assert!(aged.keepalive_due(), "a frame arrived");
+        aged.remote.store(false, Ordering::SeqCst);
+        aged.stopped.store(true, Ordering::SeqCst);
+        assert!(!aged.keepalive_due(), "the wrapper runs rustc itself");
     }
 
     #[test]

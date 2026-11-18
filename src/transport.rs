@@ -314,6 +314,22 @@ fn peer_leaf(conn: &tokio_rustls::rustls::CommonState) -> Option<Vec<u8>> {
         .map(|c| c.to_vec())
 }
 
+/// Idle time and probe interval of the TCP keepalive on every peer connection
+/// (CF-25): a peer that vanished without a reset (lid closed, Wi-Fi dropped)
+/// is noticed by the operating system even where no frame is expected.
+pub const TCP_KEEPALIVE: Duration = Duration::from_secs(10);
+
+/// Turn on SO_KEEPALIVE (about 10 s idle and interval). Best effort: a socket
+/// that refuses the option still works, the application heartbeat covers it.
+pub fn set_keepalive(tcp: &tokio::net::TcpStream) {
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE)
+        .with_interval(TCP_KEEPALIVE);
+    if let Err(e) = socket2::SockRef::from(tcp).set_tcp_keepalive(&ka) {
+        tracing::debug!("TCP keepalive not set: {e}");
+    }
+}
+
 /// Connect to a peer (`host:port`), TLS handshake, exchange `Hello`.
 /// Timeout 5 s for connect + handshake. Returns the peer's node id (from its
 /// certificate, checked against its Hello) and the framed stream.
@@ -327,6 +343,7 @@ pub async fn connect(
             .await
             .with_context(|| format!("connect to {addr}"))?;
         tcp.set_nodelay(true).ok();
+        set_keepalive(&tcp);
         let name = ServerName::try_from(SERVER_NAME).context("server name")?;
         tokio_rustls::TlsConnector::from(tls.client.clone())
             .connect(name, tcp)
@@ -399,6 +416,7 @@ pub async fn accept(
     tcp: tokio::net::TcpStream,
 ) -> anyhow::Result<Accepted> {
     tcp.set_nodelay(true).ok();
+    set_keepalive(&tcp);
     let stream = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         tokio_rustls::TlsAcceptor::from(tls.server.clone()).accept(tcp),

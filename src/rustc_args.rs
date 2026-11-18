@@ -7,8 +7,10 @@
 use crate::proto::{Arg, ClientPath, PathStyle};
 use std::path::Path;
 
-/// Result of classifying one invocation.
+/// Result of classifying one invocation. Not boxed: one value per rustc
+/// invocation, so the size difference does not matter.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Classified {
     /// Run locally without contacting the node. `why` is for debug logs.
     Local { why: String },
@@ -152,8 +154,8 @@ fn parse_flag(args: &[String], i: usize) -> Result<Option<Tok>, String> {
         if let Some((_, canon)) = LONG_VALUE_FLAGS.iter().find(|(l, _)| l == a) {
             return separate(canon);
         }
-        if let Some((flag, value)) = a.split_once('=') {
-            if let Some((_, canon)) = LONG_VALUE_FLAGS.iter().find(|(l, _)| *l == flag) {
+        if let Some((flag, value)) = a.split_once('=')
+            && let Some((_, canon)) = LONG_VALUE_FLAGS.iter().find(|(l, _)| *l == flag) {
                 return Ok(Some(Tok {
                     name: canon,
                     value: value.to_string(),
@@ -162,7 +164,6 @@ fn parse_flag(args: &[String], i: usize) -> Result<Option<Tok>, String> {
                     original: vec![a.clone()],
                 }));
             }
-        }
         return Ok(None);
     }
     if a.len() >= 2 && a.starts_with('-') && a.is_char_boundary(2) {
@@ -447,16 +448,14 @@ fn classify_inner(args: &[String], opts: &ClassifyOptions) -> Result<RemoteCandi
 
         if a.starts_with('-') {
             // Unknown flag: harmless only if no path-like value is attached or follows.
-            if let Some((_, v)) = a.split_once('=') {
-                if looks_absolute(cx.style, v) {
+            if let Some((_, v)) = a.split_once('=')
+                && looks_absolute(cx.style, v) {
                     return Err(format!("unknown flag {} with a path value", a.split('=').next().unwrap_or(a)));
                 }
-            }
-            if let Some(next) = args.get(i + 1) {
-                if !next.starts_with('-') && looks_absolute(cx.style, next) {
+            if let Some(next) = args.get(i + 1)
+                && !next.starts_with('-') && looks_absolute(cx.style, next) {
                     return Err(format!("unknown flag {a} followed by a path"));
                 }
-            }
             out.push(Arg::Plain(a.clone()));
             i += 1;
             continue;

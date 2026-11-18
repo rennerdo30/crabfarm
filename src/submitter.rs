@@ -38,7 +38,8 @@ struct Plan {
     targets: Vec<NodeId>,
     /// Local file for every blob the peer may ask for.
     files: HashMap<BlobHash, PathBuf>,
-    _pending: PendingGuard,
+    /// Released once the peer confirmed the reservation (its own status then counts the slot).
+    pending: std::sync::Mutex<Option<PendingGuard>>,
 }
 
 /// Counts a reservation we are about to make, so concurrent submits do not
@@ -365,7 +366,7 @@ impl Node {
         if let Some(p) = lock(&self.peers).get_mut(&targets[0]) {
             p.pending += 1;
         }
-        Ok(Plan { spec, targets: targets.clone(), files: built.files, _pending: PendingGuard { node: self.clone(), peer: targets[0] } })
+        Ok(Plan { spec, targets: targets.clone(), files: built.files, pending: std::sync::Mutex::new(Some(PendingGuard { node: self.clone(), peer: targets[0] })) })
     }
 
     // --------------------------------------------------------------- remote
@@ -396,6 +397,7 @@ impl Node {
             let Some(link) = self.open_job_link(*target, plan.spec.job_id).await else {
                 continue;
             };
+            lock(&plan.pending).take();
             let started = Instant::now();
             let end = self.drive_remote(wrapper, link, plan, info, *target).await;
             if matches!(end, RemoteEnd::Done) {

@@ -1,0 +1,6 @@
+# Fixture workspace of the end-to-end test (tests/e2e_two_nodes.rs). No registry
+# dependencies, so the test builds offline. Its own workspace root keeps it
+# apart from the crabfarm crate.
+[workspace]
+resolver = "2"
+members = ["app", "core_lib", "derive_mac", "util"]

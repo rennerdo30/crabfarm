@@ -384,10 +384,22 @@ fn learn_env_deps(
     dep_file: &Path,
     forwarded: &HashSet<String>,
 ) -> bool {
+    learn_env_deps_with(data_dir, crate_name, dep_file, forwarded, |n| {
+        std::env::var_os(n).is_some()
+    })
+}
+
+fn learn_env_deps_with(
+    data_dir: &Path,
+    crate_name: &str,
+    dep_file: &Path,
+    forwarded: &HashSet<String>,
+    is_set: impl Fn(&str) -> bool,
+) -> bool {
     let Ok(text) = std::fs::read_to_string(dep_file) else {
         return false;
     };
-    let missing = missing_env_deps(&text, forwarded, |n| std::env::var_os(n).is_some());
+    let missing = missing_env_deps(&text, forwarded, is_set);
     if !missing.is_empty() {
         let _ = crate::envlearn::remember(data_dir, crate_name, &missing);
     }
@@ -1078,5 +1090,62 @@ cargo:rustc-env=OK_NAME=\n";
         let forwarded: HashSet<String> = ["CARGO_PKG_NAME".to_string()].into_iter().collect();
         let set = |n: &str| n == "FOO" || n == "CARGO_PKG_NAME";
         assert_eq!(missing_env_deps(d, &forwarded, set), vec![v("FOO")]);
+    }
+
+    /// CF-28: a local run may enter the compile cache only when the dep-info
+    /// shows that no variable outside the job's environment was read. A result
+    /// compiled with `FOO=1` must not be served to a build without it.
+    #[test]
+    fn a_local_run_that_read_an_unforwarded_variable_is_not_cacheable() {
+        let d = tempfile::tempdir().unwrap();
+        let dep = d.path().join("x.d");
+        std::fs::write(&dep, "x.rmeta: a.rs\n\na.rs:\n\n# env-dep:FOO=1\n").unwrap();
+        let none = HashSet::new();
+        let fwd: HashSet<String> = ["FOO".to_string()].into();
+        // FOO is set and not part of the job: not cacheable (and recorded).
+        assert!(!learn_env_deps_with(d.path(), "x", &dep, &none, |n| n == "FOO"));
+        // FOO is not set here: what was compiled is what any build without it gets.
+        assert!(learn_env_deps_with(d.path(), "x", &dep, &none, |_| false));
+        // FOO travels with the job, so it is in the cache key.
+        assert!(learn_env_deps_with(d.path(), "x", &dep, &fwd, |n| n == "FOO"));
+        // No dep-info at all: nothing to judge by.
+        assert!(!learn_env_deps_with(
+            d.path(),
+            "x",
+            &d.path().join("missing.d"),
+            &none,
+            |_| false
+        ));
+    }
+
+    /// CF-28: what rustc prints is passed on line by line AND kept; a notice
+    /// cargo already saw is kept but not passed on again; text that is not
+    /// valid UTF-8 makes the run uncacheable.
+    #[test]
+    fn the_tee_keeps_every_line_and_flags_what_cannot_be_replayed() {
+        let tee = |input: &[u8], skip: &HashSet<(String, String)>| {
+            let t = std::sync::Mutex::new(Tee {
+                lines: Vec::new(),
+                bytes: 0,
+                valid: true,
+            });
+            pump(std::io::BufReader::new(input), false, skip, &t);
+            t.into_inner().unwrap()
+        };
+        let notice = r#"{"artifact":"C:\\o\\libx-1.rmeta","emit":"metadata"}"#;
+        let input = format!("warning: a\r\n{notice}\nlast without newline");
+        let mut skip = HashSet::new();
+        skip.insert(notice_key(r"C:\o\libx-1.rmeta", "metadata"));
+        let t = tee(input.as_bytes(), &skip);
+        assert!(t.valid);
+        assert_eq!(
+            t.lines,
+            vec![
+                (false, "warning: a".to_string()),
+                (false, notice.to_string()),
+                (false, "last without newline".to_string())
+            ]
+        );
+        assert!(!tee(b"ok\n\xff\xfe\n", &HashSet::new()).valid);
     }
 }

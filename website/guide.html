@@ -80,13 +80,17 @@ sensitive  = ['C:\Work']                  # sent, but peers delete it after each
     <li><code>local</code> counts compiles that ran here, with the reason. Linking, build scripts and the final binary always run locally.</li>
     <li><code>remote failed</code> counts jobs a peer could not do, which your machine then redid. A few are normal.</li>
   </ul>
+  <p><strong>The compile cache.</strong> Every library crate crabfarm compiles, here or on a peer, is also kept (default limit 10 GB). When the same crate comes up again with the same compiler, flags, sources and dependencies, the stored result is used and rustc does not run: after <code>cargo clean</code>, after switching branches, and on another farm machine that builds the same project at the same path. <code>crabfarm status</code> shows <code>compile cache: 41 hits (35 local, 6 farm), 3 misses, ...</code>.</p>
+<pre>crabfarm cache stats    # entries and size on disk, hit counters
+crabfarm cache clear    # delete everything the cache holds on this machine</pre>
+  <p>In <code>config.toml</code>: <code>cache = false</code> turns it off on this machine, <code>cache_entries_max_gb = 10</code> sets its size. Nothing under <code>local_only</code> or <code>sensitive</code> is cached.</p>
 
   <h2>9. If something is wrong</h2>
   <ul>
     <li><strong>The node is not running:</strong> <code>crabfarm service status</code>; <code>crabfarm service install</code> to turn autostart on and start it, or <code>crabfarm node</code> in a terminal to see what it says.</li>
     <li><strong>Everything runs locally (<code>NoPeer</code>):</strong> the machines do not see each other. Check the firewall (step 4), the network, or add <code>peers</code> (step 5).</li>
     <li><strong>The first build is slow:</strong> the desktop may have to install the Rust version your project needs, once.</li>
-    <li><strong>Version mismatch</strong> (<code>peer speaks protocol 4, this node speaks 5</code>): install the same crabfarm version on both machines.</li>
+    <li><strong>Version mismatch</strong> (<code>peer speaks protocol 5, this node speaks 6</code>): install the same crabfarm version on both machines.</li>
     <li><strong>The log:</strong> <code>%APPDATA%\renner\crabfarm\data\logs\node.log</code> holds crate names, sizes and timings, never your code.</li>
   </ul>
 

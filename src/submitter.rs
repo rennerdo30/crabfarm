@@ -509,6 +509,18 @@ struct Prepared {
     files: HashMap<BlobHash, PathBuf>,
 }
 
+/// Whether the result of a local run is kept for the compile cache, by the
+/// reason it ran locally. A crate that failed on a peer but built here, or
+/// whose result the wrapper rejected, depends on something the job did not
+/// carry (a file outside the package directory read by a proc macro, a
+/// variable): exactly the crates the cache must not hold (DESIGN section 16).
+fn stores_local_result(reason: LocalReason) -> bool {
+    !matches!(
+        reason,
+        LocalReason::RemoteCompileErrorRetry | LocalReason::EnvDependency
+    )
+}
+
 /// The primary input file must be one of the hashed inputs: a source outside
 /// the package directory is not in the key (DESIGN section 16).
 fn covers_input(spec: &JobSpec, input: &ClientPath) -> bool {
@@ -939,7 +951,7 @@ impl Node {
             }
         }
         self.count("cache_miss", 1);
-        tracing::info!(crate_name = ctx.spec.crate_name.as_str(), "cache miss");
+        tracing::debug!(crate_name = ctx.spec.crate_name.as_str(), "cache miss");
         false
     }
 
@@ -993,7 +1005,7 @@ impl Node {
         if stored.is_some() {
             self.count("cache_stored", 1);
         } else {
-            tracing::info!("cache: remote result not stored");
+            tracing::debug!("cache: remote result not stored");
         }
     }
 
@@ -1066,7 +1078,7 @@ impl Node {
         if stored.is_some() {
             self.count("cache_stored", 1);
         } else {
-            tracing::info!("cache: local result not stored");
+            tracing::debug!("cache: local result not stored");
         }
     }
 
@@ -1107,7 +1119,10 @@ impl Node {
         };
         lock(&self.depgraph).finish(&info.produces, ok);
         drop(permit);
-        if ok && let (Some(c), Some(cap)) = (ctx, capture) {
+        if ok
+            && stores_local_result(reason)
+            && let (Some(c), Some(cap)) = (ctx, capture)
+        {
             self.store_local(c, info, cap).await;
         }
     }
@@ -1836,6 +1851,27 @@ impl Node {
 
 #[cfg(test)]
 mod tests {
+    /// CF-28: a local run that happened because the crate failed remotely or
+    /// the wrapper rejected the remote result is not cached; the ordinary
+    /// reasons are.
+    #[test]
+    fn local_results_of_crates_with_hidden_inputs_are_not_stored() {
+        use LocalReason::*;
+        for r in [RemoteCompileErrorRetry, EnvDependency] {
+            assert!(!stores_local_result(r), "{r:?}");
+        }
+        for r in [
+            NoPeer,
+            PeersBusy,
+            LocalSlotFree,
+            RemoteFailed,
+            SandboxPathInOutput,
+            NotEligible,
+        ] {
+            assert!(stores_local_result(r), "{r:?}");
+        }
+    }
+
     /// CF-27 F4: one dead address never costs more than the deadline, and a
     /// live address wins at once even when others hang.
     #[tokio::test]

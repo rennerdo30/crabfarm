@@ -628,3 +628,78 @@ fn cache_clear_empties_the_cache_and_stats_reads_it() {
     build_ok(&n, &f.work, &f.target);
     assert_eq!(cache(&n.home).local, 0);
 }
+
+fn write(path: &Path, text: &str) {
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(path, text).expect("write");
+}
+
+/// A crate that reads a variable the job does not carry (`option_env!`): its
+/// result depends on something outside the cache key, so an entry made under
+/// one value must never be served under another, in either direction.
+#[test]
+fn a_variable_the_crate_reads_never_makes_a_stale_hit() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let work = tmp.path().join("probe");
+    write(
+        &work.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"probe_lib\", \"probe_app\"]\n",
+    );
+    write(
+        &work.join("probe_lib/Cargo.toml"),
+        "[package]\nname = \"probe_lib\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write(
+        &work.join("probe_lib/src/lib.rs"),
+        "pub const PROBE: Option<&str> = option_env!(\"CF_CACHE_PROBE\");\n",
+    );
+    write(
+        &work.join("probe_app/Cargo.toml"),
+        "[package]\nname = \"probe_app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nprobe_lib = { path = \"../probe_lib\" }\n",
+    );
+    write(
+        &work.join("probe_app/src/main.rs"),
+        "fn main() { println!(\"probe={}\", probe_lib::PROBE.unwrap_or(\"none\")); }\n",
+    );
+    let target = tmp.path().join("target");
+    let n = single_node(tmp.path(), "");
+    let exe = target.join("release").join(if cfg!(windows) {
+        "probe_app.exe"
+    } else {
+        "probe_app"
+    });
+    let build = |value: Option<&str>| -> String {
+        let _ = std::fs::remove_dir_all(&target);
+        let mut c = crabfarm(&n.home);
+        c.args([
+            "cargo",
+            "build",
+            "--release",
+            "--color",
+            "never",
+            "--manifest-path",
+        ])
+        .arg(work.join("Cargo.toml"))
+        .env("CARGO_TARGET_DIR", &target)
+        .env("CARGO_NET_OFFLINE", "true")
+        .env_remove("CF_CACHE_PROBE");
+        if let Some(v) = value {
+            c.env("CF_CACHE_PROBE", v);
+        }
+        let b = run(c, 150);
+        assert!(b.ok, "build failed: {}\n{}", b.stderr, node_log(&n.home));
+        let o = run(Command::new(&exe), 30);
+        assert!(o.ok);
+        o.stdout.trim().to_string()
+    };
+    assert_eq!(build(None), "probe=none");
+    // The entry exists now (compiled without the variable). With it set, the
+    // wrapper rejects the hit and compiles here.
+    assert_eq!(build(Some("1")), "probe=1");
+    // That run saw the variable, so it must not have replaced the entry.
+    assert_eq!(build(None), "probe=none", "a stale entry was served");
+    assert_eq!(build(Some("2")), "probe=2");
+    assert_eq!(build(Some("1")), "probe=1");
+    assert!(cache(&n.home).local >= 1, "the unset builds should hit");
+}

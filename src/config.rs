@@ -87,21 +87,6 @@ impl Config {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// CF-25: build-script variables are accepted unless the operator opts out.
-    #[test]
-    fn accept_build_env_defaults_to_true_and_can_be_turned_off() {
-        assert!(Config::default().accept_build_env);
-        let on: Config = toml::from_str("node_name = \"n\"").unwrap();
-        assert!(on.accept_build_env);
-        let off: Config = toml::from_str("accept_build_env = false").unwrap();
-        assert!(!off.accept_build_env);
-    }
-}
-
 /// Data directory: `CRABFARM_HOME` if set (tests, multiple nodes on one
 /// machine), else the platform data dir (`%APPDATA%\renner\crabfarm\data`,
 /// `~/Library/Application Support/dev.renner.crabfarm`, `~/.local/share/crabfarm`).
@@ -118,4 +103,19 @@ fn hostname() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "node".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CF-25: build-script variables are accepted unless the operator opts out.
+    #[test]
+    fn accept_build_env_defaults_to_true_and_can_be_turned_off() {
+        assert!(Config::default().accept_build_env);
+        let on: Config = toml::from_str("node_name = \"n\"").unwrap();
+        assert!(on.accept_build_env);
+        let off: Config = toml::from_str("accept_build_env = false").unwrap();
+        assert!(!off.accept_build_env);
+    }
 }

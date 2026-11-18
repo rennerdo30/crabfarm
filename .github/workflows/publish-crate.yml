@@ -1,0 +1,50 @@
+name: publish-crate
+
+# Uploads the crate to crates.io. Manual only: the owner starts it from the
+# Actions tab, after the GitHub release for the same tag is published.
+# Needs the repository secret CARGO_REGISTRY_TOKEN (docs/RELEASING.md); the
+# secret is read only by the last step and is scoped to the "crates-io"
+# environment, which can require the owner's approval.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag to publish (vX.Y.Z)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-crate
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+      - name: Tag matches the crate version
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          if [ "$TAG" != "v$version" ]; then
+            echo "Tag $TAG does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+      # rust-toolchain.toml pins the toolchain; this installs it.
+      - run: rustup show active-toolchain
+      - name: Package check (no upload)
+        run: cargo package --locked
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked

@@ -4,7 +4,23 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.100"
 description = "Distributed rustc over a peer-to-peer farm of Windows, macOS and Linux machines"
-publish = false
+license = "MIT"
+repository = "https://github.com/rennerdo30/crabfarm"
+homepage = "https://crabfarm.renner.dev"
+readme = "README.md"
+keywords = ["rust", "distributed", "compiler", "build", "cargo"]
+categories = ["development-tools", "development-tools::build-utils"]
+# Ship only what is needed to build and understand the crate: no briefs,
+# no tests, no machine-local config, no pinned toolchain file.
+include = [
+    "/src/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/LICENSE",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/docs/DESIGN.md",
+]
 
 [dependencies]
 anyhow = "1.0.104"

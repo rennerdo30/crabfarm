@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>crabfarm: distributed rustc over your own machines</title>
+<meta name="description" content="crabfarm spreads rustc work over a peer-to-peer farm of your own Windows, macOS and Linux machines. Run crabfarm cargo build; your notebook builds with your desktop's cores.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="canonical" href="https://crabfarm.renner.dev/">
+<meta property="og:title" content="crabfarm">
+<meta property="og:description" content="Distributed rustc over a peer-to-peer farm of your own machines.">
+<meta property="og:url" content="https://crabfarm.renner.dev/">
+<meta name="theme-color" content="#b8420f">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="./"><img src="favicon.svg" alt="" width="28" height="28">crabfarm</a>
+    <nav aria-label="Main">
+      <a href="#how">How it works</a>
+      <a href="#security">Security</a>
+      <a class="hide-sm" href="#platforms">Platforms</a>
+      <a href="#install">Install</a>
+      <a href="https://github.com/rennerdo30/crabfarm">Source</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="wrap">
+    <div>
+      <p class="eyebrow">distributed rustc</p>
+      <h1>Your other machines already have <em>the cores</em>.</h1>
+      <p class="lede">crabfarm turns the computers you own into one build farm. Type <code>crabfarm cargo build</code> on the weak one, and the library crates compile on whichever machine has free capacity.</p>
+      <div class="cta">
+        <a class="btn primary" href="#install">Install</a>
+        <a class="btn" href="https://github.com/rennerdo30/crabfarm">View the source</a>
+      </div>
+      <p class="status"><strong>Early version.</strong> The first release distributes builds between Windows machines. Mixed-OS farms and proc macros on other systems are planned; see <a href="#platforms">Platforms</a>.</p>
+    </div>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 460 330" role="img" aria-labelledby="dt dd">
+        <title id="dt">Three machines connected in a farm</title>
+        <desc id="dd">A notebook sends compile jobs to a desktop and a second PC over encrypted connections, and the machines also connect to each other.</desc>
+        <path class="d-link" d="M150 105 L318 70"/>
+        <path class="d-link" d="M130 135 L200 245"/>
+        <path class="d-link" d="M330 105 L300 235"/>
+        <g>
+          <rect class="d-node d-me" x="20" y="60" width="150" height="86" rx="12"/>
+          <text class="d-text" x="36" y="88">notebook</text>
+          <text class="d-sub" x="36" y="106">you run cargo here</text>
+          <rect class="d-bar" x="36" y="119" width="20" height="9" rx="2"/>
+          <rect class="d-bar-off" x="60" y="119" width="20" height="9" rx="2"/>
+          <rect class="d-bar-off" x="84" y="119" width="20" height="9" rx="2"/>
+          <rect class="d-bar-off" x="108" y="119" width="20" height="9" rx="2"/>
+        </g>
+        <g>
+          <rect class="d-node" x="290" y="20" width="150" height="86" rx="12"/>
+          <text class="d-text" x="306" y="48">desktop</text>
+          <text class="d-sub" x="306" y="66">compiles for others</text>
+          <rect class="d-bar" x="306" y="79" width="20" height="9" rx="2"/>
+          <rect class="d-bar" x="330" y="79" width="20" height="9" rx="2"/>
+          <rect class="d-bar" x="354" y="79" width="20" height="9" rx="2"/>
+          <rect class="d-bar-off" x="378" y="79" width="20" height="9" rx="2"/>
+        </g>
+        <g>
+          <rect class="d-node" x="170" y="236" width="150" height="86" rx="12"/>
+          <text class="d-text" x="186" y="264">spare PC</text>
+          <text class="d-sub" x="186" y="282">compiles for others</text>
+          <rect class="d-bar" x="186" y="295" width="20" height="9" rx="2"/>
+          <rect class="d-bar" x="210" y="295" width="20" height="9" rx="2"/>
+          <rect class="d-bar-off" x="234" y="295" width="20" height="9" rx="2"/>
+          <rect class="d-bar-off" x="258" y="295" width="20" height="9" rx="2"/>
+        </g>
+        <text class="d-sub" x="196" y="76" transform="rotate(-9 196 76)">mutual TLS 1.3</text>
+      </svg>
+      <figcaption>An illustration: every machine runs the same node, and any of them can submit work or take it.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section id="how" class="alt">
+  <div class="wrap">
+    <h2>Three steps, no cargo configuration</h2>
+    <p class="sub">Your projects stay untouched. crabfarm sets itself up as cargo's rustc wrapper only for the command you run through it.</p>
+    <ol class="steps">
+      <li>
+        <h3>Create a farm</h3>
+        <div>
+          <p>On the machine with the most cores. It creates the farm's certificate authority and prints a one-time join code that is valid for ten minutes.</p>
+<pre><span class="p">$</span> crabfarm farm create
+<span class="p">$</span> crabfarm node            <span class="c"># keep running</span>
+<span class="p">$</span> crabfarm farm invite
+<span class="c">cf1-...@desktop:47070</span></pre>
+        </div>
+      </li>
+      <li>
+        <h3>Join from your other machines</h3>
+        <div>
+          <p>Paste the code once. The machine gets its own certificate and starts its node.</p>
+<pre><span class="p">$</span> crabfarm farm join cf1-...@desktop:47070
+<span class="p">$</span> crabfarm node            <span class="c"># keep running</span></pre>
+        </div>
+      </li>
+      <li>
+        <h3>Build as usual, with crabfarm in front</h3>
+        <div>
+          <p>Any cargo command works. Library crates go to free machines; linking, build scripts and anything unusual stay on yours, so the result is the same as a local build.</p>
+<pre><span class="p">$</span> crabfarm cargo build --release
+<span class="p">$</span> crabfarm status          <span class="c"># peers, free slots, local vs remote jobs</span></pre>
+        </div>
+      </li>
+    </ol>
+  </div>
+</section>
+
+<section id="runs">
+  <div class="wrap">
+    <h2>What runs where</h2>
+    <p class="sub">The farm is about compiling. Anything that could behave differently on another machine does not leave yours.</p>
+    <div class="cols">
+      <div class="card">
+        <h3>Sent to the farm</h3>
+        <ul>
+          <li>Library crates, the bulk of a dependency tree</li>
+          <li>Whichever machine has free slots, balanced by load</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Always built locally</h3>
+        <ul>
+          <li>Linking: binaries, tests, dynamic libraries</li>
+          <li>Build scripts and the <code>cc</code> crate</li>
+          <li>Incremental workspace crates</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>If anything goes wrong</h3>
+        <p>A peer that vanished, a missing toolchain, a network error or a flag crabfarm does not know: that crate builds locally. Fallbacks are counted in <code>crabfarm status</code>, never hidden.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="security" class="alt">
+  <div class="wrap">
+    <h2>Security, in plain words</h2>
+    <p class="sub">Only your own machines belong in a farm. Within it, nothing travels in the clear and nobody gets in without an invitation.</p>
+    <div class="cols two">
+      <div class="card">
+        <h3>Closed membership</h3>
+        <p>The first machine becomes the farm's certificate authority. Others join with a one-time code (ten minutes, single use) and receive a certificate that only this farm accepts.</p>
+      </div>
+      <div class="card">
+        <h3>Encrypted and authenticated</h3>
+        <p>Every connection is TLS 1.3 with certificates checked in both directions. There is no plaintext, anonymous or "insecure" mode.</p>
+      </div>
+      <div class="card">
+        <h3>Encrypted at rest on other machines</h3>
+        <p>Files a machine keeps for your later builds are encrypted with your machine's key, which never leaves it. Job folders are deleted when the job ends.</p>
+      </div>
+      <div class="card">
+        <h3>Trust each other fully</h3>
+        <p>A farm member compiles your code and runs your proc macros, so it can run code of yours, and you can run code on it. Only join machines you own. crabfarm is not a sandbox against a hostile member.</p>
+      </div>
+    </div>
+    <p class="sub" style="margin-top:1.5rem">Machines reach each other on a local network or over a VPN such as Tailscale or WireGuard. There is no relay and no cloud service, and crabfarm sends nothing to us.</p>
+  </div>
+</section>
+
+<section id="platforms">
+  <div class="wrap">
+    <h2>Platforms</h2>
+    <p class="sub">The binary builds for Windows, macOS and Linux on x86-64 and ARM. What a farm can distribute grows in three phases.</p>
+    <div class="table-scroll">
+    <table>
+      <thead><tr><th>Phase</th><th>What works</th><th>Status</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Windows to Windows farms: discovery, join, TLS, distributed library crates, fallback to local</td><td><span class="tag now">first release</span></td></tr>
+        <tr><td>2</td><td>Jobs across operating systems (without proc macros), result cache, live status, opt-in autostart</td><td><span class="tag">planned</span></td></tr>
+        <tr><td>3</td><td>Proc macros compiled for the machine that runs the job</td><td><span class="tag">planned</span></td></tr>
+      </tbody>
+    </table>
+    </div>
+  </div>
+</section>
+
+<section id="install" class="alt">
+  <div class="wrap">
+    <h2>Install</h2>
+    <p class="sub">One binary, <code>crabfarm</code>. Put it on every machine of the farm.</p>
+    <div class="install">
+      <div>
+        <h3>From a GitHub release</h3>
+<pre><span class="c"># Windows, macOS and Linux: x86-64 and ARM</span>
+<span class="c"># 1. Download the archive for your platform:</span>
+<span class="c">#    github.com/rennerdo30/crabfarm/releases/latest</span>
+<span class="c"># 2. Check it against SHA256SUMS.txt</span>
+<span class="c"># 3. Unpack; put crabfarm on your PATH</span>
+<span class="p">$</span> crabfarm --version</pre>
+        <p>Archives are <code>.zip</code> on Windows and <code>.tar.gz</code> elsewhere. They are not code-signed, so Windows or macOS may ask for confirmation on the first run.</p>
+      </div>
+      <div>
+        <h3>With cargo</h3>
+<pre><span class="p">$</span> cargo install crabfarm
+<span class="p">$</span> crabfarm --version</pre>
+        <p>Builds on your machine, so there is no download prompt. Needs a current stable Rust toolchain.</p>
+      </div>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>crabfarm, a project by <a href="https://github.com/rennerdo30">rennerdo30</a>. MIT licensed.</span>
+    <span><a href="https://github.com/rennerdo30/crabfarm">Source</a> · <a href="https://github.com/rennerdo30/crabfarm/issues">Issues</a> · <a href="privacy.html">Privacy</a></span>
+  </div>
+</footer>
+
+</body>
+</html>

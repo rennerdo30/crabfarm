@@ -101,6 +101,7 @@ Target: if no `--target` is given, the wrapper adds `--target <client host tripl
   - Windows `C:\a\b` → `R/C/a/b`; UNC `\\server\share\a` → `R/UNC/server/share/a`.
   - Posix `/a/b` → `R/_/a/b`.
   - Mapping is a pure function in both directions; tests cover round trips.
+  - Every component of a client path is validated in `ClientPath::parse` and again in `SandboxMap::to_sandbox` (CF-7): no `:`, `\`, `/`, control characters or `<>"|?*`, no trailing dot or space, no `.`/`..`, no reserved device names (`CON PRN AUX NUL COM1-9 LPT1-9`, with or without an extension). The strictest (Windows) rules apply to both styles because a Posix client path is also mapped on Windows peers. A path that fails is not remote-eligible (the wrapper runs locally); on the peer `to_sandbox` returns `None` and the job is refused. The sandbox path is built from validated single names and checked to lie strictly below the job root.
 - Relative arguments stay relative; rustc runs with `cwd` = mapped client cwd.
 - `--remap-path-prefix`: for each drive/root that appears in the job, add `--remap-path-prefix <mapped root>=<client root>` **before** the user's own remap flags (rustc applies the last matching flag, so the user's flags still win).
 - **stderr rewriting**: every stderr line (JSON diagnostics and rendered text) has mapped prefixes replaced by client prefixes; for a Windows client, `/` after a replaced prefix in the same path token is converted to `\` (best effort; JSON strings are rewritten after parsing, not by raw text replace).

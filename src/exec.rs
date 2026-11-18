@@ -120,14 +120,22 @@ fn spec_paths(spec: &JobSpec) -> Vec<&ClientPath> {
 }
 
 /// A peer must not be able to place files outside the sandbox with a hand-built
-/// path (`..` components): every path has to be what `ClientPath::parse` yields.
-fn validate_paths(spec: &JobSpec) -> anyhow::Result<()> {
+/// path (`..` components, `D:` or `\` inside a component): every path has to be
+/// what `ClientPath::parse` yields (which checks each component) and must map
+/// below the sandbox root (CF-7).
+fn validate_paths(spec: &JobSpec, map: &SandboxMap) -> anyhow::Result<()> {
     for p in spec_paths(spec) {
         if ClientPath::parse(p.style, &p.path).as_ref() != Some(p) {
             bail!("job contains a path that is not absolute and normalized");
         }
+        sandbox_path(map, p)?;
     }
     Ok(())
+}
+
+/// `SandboxMap::to_sandbox` with an error for a path that cannot be mapped.
+fn sandbox_path(map: &SandboxMap, p: &ClientPath) -> anyhow::Result<PathBuf> {
+    map.to_sandbox(p).context("path cannot be mapped into the sandbox")
 }
 
 /// Deletes the job directory when dropped. The normal path calls
@@ -226,7 +234,7 @@ impl Emitter<'_> {
     async fn stderr_line(&mut self, line: &str) -> anyhow::Result<()> {
         if let Some((file, _emit)) = rewrite::artifact(line) {
             // The submitter must have the file before cargo sees the notice.
-            let sandbox_cwd = self.map.to_sandbox(&self.spec.cwd);
+            let sandbox_cwd = sandbox_path(self.map, &self.spec.cwd)?;
             let p = Path::new(&file);
             let abs = if p.is_absolute() { p.to_path_buf() } else { sandbox_cwd.join(p) };
             let client = self
@@ -255,12 +263,12 @@ pub async fn run(
     events: tokio::sync::mpsc::Sender<ExecEvent>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
-    validate_paths(spec)?;
     let job_dir = ctx.jobs_dir.join(job_hex(&spec.job_id));
+    let map = SandboxMap::new(job_dir.join("root"));
+    validate_paths(spec, &map)?;
     let _guard = DirGuard(job_dir.clone());
     // A directory left by a crashed run would leak old files into this job.
     let _ = std::fs::remove_dir_all(&job_dir);
-    let map = SandboxMap::new(job_dir.join("root"));
 
     let result = run_in_sandbox(ctx, spec, toolchain, &events, &cancel, &map).await;
 
@@ -286,7 +294,7 @@ async fn run_in_sandbox(
     // 1. Materialize inputs.
     let mut input_info: HashMap<ClientPath, (BlobHash, u64)> = HashMap::new();
     for input in &spec.inputs {
-        let dst = map.to_sandbox(&input.path);
+        let dst = sandbox_path(map, &input.path)?;
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
         }
@@ -305,7 +313,7 @@ async fn run_in_sandbox(
         tokio::task::yield_now().await;
     }
     for d in spec.dirs.iter().chain([&spec.out_dir, &spec.cwd]) {
-        let dir = map.to_sandbox(d);
+        let dir = sandbox_path(map, d)?;
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     }
 
@@ -323,7 +331,7 @@ async fn run_in_sandbox(
     // 3. Environment and process.
     let mut cmd = std::process::Command::new(&toolchain.rustc);
     cmd.args(&args);
-    cmd.current_dir(map.to_sandbox(&spec.cwd));
+    cmd.current_dir(sandbox_path(map, &spec.cwd)?);
     cmd.env_clear();
     for (k, v) in std::env::vars_os() {
         if !k.to_str().is_some_and(is_build_var) {
@@ -388,7 +396,7 @@ async fn run_in_sandbox(
     // 4. Outputs. After a failed compile the out-dir only holds partial files
     // that cargo would ignore, so nothing is collected.
     if code == 0 {
-        let out_root = map.to_sandbox(&spec.out_dir);
+        let out_root = sandbox_path(map, &spec.out_dir)?;
         let mut files: Vec<PathBuf> = walkdir::WalkDir::new(&out_root)
             .into_iter()
             .filter_map(|e| e.ok())
@@ -737,7 +745,8 @@ mod tests {
         let f = fixture();
         let mut spec = lib_spec(&f, SRC, false);
         spec.inputs[0].path = ClientPath { style: PathStyle::Posix, path: "/a/../../etc/x".into() };
-        assert!(validate_paths(&spec).is_err());
+        let map = SandboxMap::new(f.jobs.join("x").join("root"));
+        assert!(validate_paths(&spec, &map).is_err());
     }
 
     #[tokio::test]

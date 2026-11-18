@@ -364,7 +364,7 @@ rustc-wrapper = \"tools/w\"
         };
         assert_eq!(find(&both, &cli), Some("sccache".into()));
         // An empty value switches the wrapper off (variable or config file).
-        let empty = |n: &str| (n == "RUSTC_WRAPPER").then(|| OsString::new());
+        let empty = |n: &str| (n == "RUSTC_WRAPPER").then(OsString::new);
         assert_eq!(find(&empty, &[]), None);
         write_cfg(
             &proj,

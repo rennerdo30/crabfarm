@@ -549,6 +549,55 @@ fn sandbox_needles(map: &SandboxMap) -> Vec<Vec<u8>> {
     v.into_iter().map(String::into_bytes).collect()
 }
 
+/// A macOS dynamic library records the path it was linked to as its own
+/// install name, which would be the sandbox path (CF-29). Nothing resolves a
+/// proc-macro through its install name (rustc loads it by path), so the name is
+/// set to a neutral `@rpath/<file>`; without it every proc macro built on a Mac
+/// peer would be rejected by the sandbox-path scan and rebuilt locally.
+fn dylib_install_name_args(spec: &JobSpec) -> Vec<String> {
+    if !spec.target.contains("apple-darwin") {
+        return Vec::new();
+    }
+    let plain: Vec<&str> = spec
+        .args
+        .iter()
+        .filter_map(|a| match a {
+            Arg::Plain(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    // The value of `--flag value` / `--flag=value` (and `-C key=value`).
+    let value = |flag: &str, key: Option<&str>| -> Option<&str> {
+        plain.iter().enumerate().find_map(|(i, s)| {
+            if let Some(v) = s.strip_prefix(&format!("{flag}=")) {
+                return Some(v);
+            }
+            if *s == flag {
+                let next = *plain.get(i + 1)?;
+                return match key {
+                    Some(k) => next.strip_prefix(&format!("{k}=")),
+                    None => Some(next),
+                };
+            }
+            None
+        })
+    };
+    let crate_type = value("--crate-type", None);
+    if !matches!(crate_type, Some("proc-macro" | "dylib" | "cdylib")) {
+        return Vec::new();
+    }
+    let name = value("--crate-name", None).unwrap_or(&spec.crate_name);
+    let extra = plain
+        .iter()
+        .find_map(|s| s.strip_prefix("extra-filename="))
+        .unwrap_or("");
+    // cdylib files carry no `lib` prefix on every OS, but on macOS they do.
+    vec![
+        "-C".into(),
+        format!("link-arg=-Wl,-install_name,@rpath/lib{name}{extra}.dylib"),
+    ]
+}
+
 /// Debug-symbol files list the object and output paths of the link by design
 /// (a proc-macro `.pdb` always names the sandbox), and so does the export file
 /// `link.exe` leaves next to a proc-macro DLL (`.dll.exp`, CF-29). Nothing loads
@@ -763,6 +812,7 @@ async fn run_in_sandbox(
         args.push(format!("{from}={to}"));
     }
     args.extend(render_job_args(spec, map, toolchain, &ctx.jobs_dir));
+    args.extend(dylib_install_name_args(spec));
 
     let rewriter = Rewriter {
         pairs: remaps,
@@ -1363,6 +1413,30 @@ fn main() {
             }
         }
         assert!(!f.jobs.join(job_hex(OWNER, &spec.job_id)).exists());
+    }
+
+    /// CF-29: a proc-macro built for macOS gets a neutral install name; other
+    /// crate types and targets get nothing.
+    #[test]
+    fn mac_proc_macros_get_a_neutral_install_name() {
+        let f = fixture();
+        let mut spec = lib_spec(&f, SRC, false);
+        assert!(dylib_install_name_args(&spec).is_empty(), "plain lib");
+        for a in &mut spec.args {
+            if matches!(a, Arg::Plain(s) if s == "lib") {
+                *a = Arg::Plain("proc-macro".into());
+            }
+        }
+        spec.target = "aarch64-apple-darwin".into();
+        assert_eq!(
+            dylib_install_name_args(&spec),
+            vec![
+                "-C".to_string(),
+                "link-arg=-Wl,-install_name,@rpath/libfixture-abc.dylib".to_string()
+            ]
+        );
+        spec.target = "x86_64-pc-windows-msvc".into();
+        assert!(dylib_install_name_args(&spec).is_empty(), "other target");
     }
 
     #[test]

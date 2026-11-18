@@ -77,9 +77,33 @@ pub fn is_plain_rustc(program: &str) -> bool {
         .is_some_and(|s| s.eq_ignore_ascii_case("rustc"))
 }
 
+/// The command for a LOCAL rustc run: rustc itself, or rustc behind the
+/// wrapper that was configured before crabfarm (`crabfarm cargo` stores it in
+/// `CRABFARM_INNER_WRAPPER`, CF-19). Never crabfarm itself.
+fn local_command(rustc: &str, args: &[String]) -> Command {
+    let inner = std::env::var(crate::cargo_cmd::INNER_WRAPPER_ENV)
+        .ok()
+        .filter(|w| {
+            !w.is_empty()
+                && !crate::cargo_cmd::is_crabfarm(w, std::env::current_exe().ok().as_deref())
+        });
+    match inner {
+        Some(w) => {
+            let mut c = Command::new(w);
+            c.arg(rustc).args(args);
+            c
+        }
+        None => {
+            let mut c = Command::new(rustc);
+            c.args(args);
+            c
+        }
+    }
+}
+
 /// Run rustc with inherited stdio.
 fn passthrough(rustc: &str, args: &[String]) -> i32 {
-    match Command::new(rustc).args(args).status() {
+    match local_command(rustc, args).status() {
         Ok(s) => s.code().unwrap_or(1),
         Err(e) => {
             eprintln!("crabfarm: could not run {rustc}: {e}");
@@ -590,11 +614,7 @@ fn passthrough_skipping(rustc: &str, args: &[String], skip: &HashSet<(String, St
     if skip.is_empty() {
         return passthrough(rustc, args);
     }
-    let mut child = match Command::new(rustc)
-        .args(args)
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+    let mut child = match local_command(rustc, args).stderr(Stdio::piped()).spawn() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("crabfarm: could not run {rustc}: {e}");

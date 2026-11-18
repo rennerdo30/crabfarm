@@ -96,6 +96,8 @@ pub struct PeerState {
     pub pending: u32,
     /// Blobs this node already sent to the peer (they stay in its store).
     pub sent: HashSet<BlobHash>,
+    /// The address a job connection last opened on first; tried first next time.
+    pub good_addr: Option<String>,
 }
 
 impl PeerState {
@@ -108,6 +110,7 @@ impl PeerState {
             bandwidth_bps: crate::scheduler::DEFAULT_BANDWIDTH_BPS,
             pending: 0,
             sent: HashSet::new(),
+            good_addr: None,
         }
     }
 }

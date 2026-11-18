@@ -22,6 +22,58 @@ use std::time::{Duration, Instant};
 /// After a remote `Exit` the wrapper may still ask for a local retry.
 const RETRY_WAIT: Duration = Duration::from_secs(60);
 const RESERVE_WAIT: Duration = Duration::from_secs(10);
+/// Everything up to "slot reserved" (connect, handshake, reserve) for one job,
+/// over all addresses and both targets (CF-27).
+const OPEN_DEADLINE: Duration = Duration::from_secs(12);
+/// The address that worked last time gets this head start over the others.
+const ADDR_HEAD_START: Duration = Duration::from_millis(300);
+
+/// Connects to several addresses at once and hands out the successes in the
+/// order they finish. Dropping it cancels the connects that are still running.
+struct Race<T> {
+    set: tokio::task::JoinSet<Option<(String, T)>>,
+    deadline: tokio::time::Instant,
+}
+
+impl<T: 'static> Race<T> {
+    /// The next success, or `None` when all failed or the deadline passed.
+    async fn next(&mut self) -> Option<(String, T)> {
+        loop {
+            match tokio::time::timeout_at(self.deadline, self.set.join_next()).await {
+                Ok(Some(Ok(Some(found)))) => return Some(found),
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => return None,
+            }
+        }
+    }
+}
+
+/// Start `connect(addr)` for every address; the first address starts at once,
+/// the rest after `others_delay`.
+fn race_first<T, F, Fut>(
+    addrs: Vec<String>,
+    deadline: tokio::time::Instant,
+    others_delay: Duration,
+    connect: F,
+) -> Race<T>
+where
+    T: Send + 'static,
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Option<T>> + Send + 'static,
+{
+    let mut set = tokio::task::JoinSet::new();
+    for (i, a) in addrs.into_iter().enumerate() {
+        let fut = connect(a.clone());
+        let delay = if i == 0 { Duration::ZERO } else { others_delay };
+        set.spawn(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            fut.await.map(|t| (a, t))
+        });
+    }
+    Race { set, deadline }
+}
 /// Uploads smaller than this say nothing about the link speed.
 const MIN_MEASURED_UPLOAD: u64 = 2 * 1024 * 1024;
 /// The whole blob upload of one job (CF-19). The per-frame waits inside it only
@@ -863,33 +915,64 @@ impl Node {
 
     // --------------------------------------------------------------- remote
 
+    /// Open the job connection to `peer` and reserve a slot, all before
+    /// `deadline`. The peer's addresses are tried at the same time and the
+    /// first one that answers wins (CF-27): one dead address must not cost
+    /// seconds per target. The winner is remembered and goes first next time.
     async fn open_job_link(
         self: &Arc<Self>,
         peer: NodeId,
         job_id: JobId,
         live: &Liveness,
+        deadline: tokio::time::Instant,
     ) -> Option<Link> {
-        let addrs = lock(&self.peers)
-            .get(&peer)
-            .map(|p| p.info.addrs.clone())
-            .unwrap_or_default();
-        for a in addrs {
-            // Every attempt is bounded (connect 5 s, reserve 10 s); the node
-            // is working on the job meanwhile.
-            live.touch();
-            let Ok((pid, _hello, conn)) = crate::transport::connect(&self.tls, &self.id, &a).await
-            else {
-                continue;
-            };
-            if pid != peer {
-                continue;
-            }
+        let (mut addrs, good) = {
+            let peers = lock(&self.peers);
+            let p = peers.get(&peer)?;
+            (p.info.addrs.clone(), p.good_addr.clone())
+        };
+        // The address that worked last time starts first; the others join
+        // after a short head start, so a healthy peer sees one connection.
+        let mut head_start = false;
+        if let Some(g) = good
+            && let Some(i) = addrs.iter().position(|a| *a == g)
+        {
+            addrs.swap(0, i);
+            head_start = true;
+        }
+        let me = self.clone();
+        let mut race = race_first(
+            addrs,
+            deadline,
+            if head_start {
+                ADDR_HEAD_START
+            } else {
+                Duration::ZERO
+            },
+            move |a: String| {
+                let me = me.clone();
+                async move {
+                    let (pid, _hello, conn) =
+                        crate::transport::connect(&me.tls, &me.id, &a).await.ok()?;
+                    (pid == peer).then_some(conn)
+                }
+            },
+        );
+        while let Some((addr, conn)) = race.next().await {
             let mut link = Link::new(conn);
             if link.send(Message::Reserve { job_id }).await.is_err() {
                 continue;
             }
-            match tokio::time::timeout(RESERVE_WAIT, link.recv()).await {
-                Ok(Some(Message::Reserved { .. })) => return Some(link),
+            let wait = deadline.min(tokio::time::Instant::now() + RESERVE_WAIT);
+            match tokio::time::timeout_at(wait, link.recv()).await {
+                Ok(Some(Message::Reserved { .. })) => {
+                    // Real progress: a frame from the peer.
+                    live.touch();
+                    if let Some(p) = lock(&self.peers).get_mut(&peer) {
+                        p.good_addr = Some(addr);
+                    }
+                    return Some(link);
+                }
                 Ok(Some(Message::Busy { .. })) => return None,
                 _ => continue,
             }
@@ -906,8 +989,14 @@ impl Node {
     ) -> RemoteEnd {
         let _running = RunningGuard::new(self, true);
         let _remote = RemoteScope::new(live);
+        // One deadline for the whole open phase, however many targets and
+        // addresses: cargo waits for this, so it must be short.
+        let deadline = tokio::time::Instant::now() + OPEN_DEADLINE;
         for target in plan.targets.iter().take(2) {
-            let Some(link) = self.open_job_link(*target, plan.spec.job_id, live).await else {
+            let Some(link) = self
+                .open_job_link(*target, plan.spec.job_id, live, deadline)
+                .await
+            else {
                 continue;
             };
             lock(&plan.pending).take();
@@ -1185,6 +1274,65 @@ impl Node {
 
 #[cfg(test)]
 mod tests {
+    /// CF-27 F4: one dead address never costs more than the deadline, and a
+    /// live address wins at once even when others hang.
+    #[tokio::test]
+    async fn the_first_connect_to_answer_wins_and_the_rest_are_cancelled() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut race = race_first(
+            vec!["dead1".into(), "live".into(), "dead2".into()],
+            deadline,
+            Duration::ZERO,
+            |a: String| async move {
+                if a == "live" {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Some(7u32)
+                } else {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    None
+                }
+            },
+        );
+        let started = Instant::now();
+        let (addr, v) = race.next().await.unwrap();
+        assert_eq!((addr.as_str(), v), ("live", 7));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn all_addresses_dead_ends_at_the_deadline_not_per_address() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        let addrs: Vec<String> = (0..16).map(|i| format!("a{i}")).collect();
+        let mut race = race_first(addrs, deadline, Duration::ZERO, |_a: String| async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            None::<u32>
+        });
+        let started = Instant::now();
+        assert!(race.next().await.is_none());
+        // Sequentially this would be 16 attempts; here it is one deadline.
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_addresses_are_skipped_and_the_head_start_favours_the_first() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut race = race_first(
+            vec!["good".into(), "other".into()],
+            deadline,
+            Duration::from_millis(200),
+            |a: String| async move { (a == "good" || a == "other").then_some(1u8) },
+        );
+        let (first, _) = race.next().await.unwrap();
+        assert_eq!(first, "good");
+        let (second, _) = race.next().await.unwrap();
+        assert_eq!(second, "other");
+        assert!(race.next().await.is_none());
+    }
+
     use super::*;
     use crate::proto::PathStyle;
 

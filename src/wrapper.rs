@@ -422,6 +422,12 @@ fn submit(
     let mut buffered: Vec<(bool, String)> = Vec::new();
     let mut printed = false;
     let mut local_retry_allowed = true;
+    // Artifact notices cargo has already seen for this job (CF-16): a local
+    // rerun rewrites the files but must not announce them a second time.
+    let mut relayed_notices: HashSet<(String, String)> = HashSet::new();
+    // The dep-info showed an env dependency that was not forwarded: the result
+    // will be rejected, so no further early notice is passed on.
+    let mut stale_early = false;
 
     let verdict = loop {
         let msg = match rt.block_on(conn.recv()) {
@@ -441,14 +447,39 @@ fn submit(
                     reason: Some(reason),
                 };
             }
-            Message::Stderr { line } => {
-                if registry {
+            Message::Stderr { line } => match rewrite::artifact(&line) {
+                // Metadata and dep-info notices are printed at once even when
+                // the diagnostics of a path crate are buffered: the submitter
+                // has already put their (clean) files in place, and cargo
+                // starts dependents on the notice (CF-16).
+                Some((file, emit)) if crate::submitter::is_early_emit(&emit) => {
+                    if emit == "dep-info" && local_retry_allowed && !stale_early {
+                        // The dep-info is written before the metadata. A variable
+                        // it lists that was not forwarded means this result is
+                        // rejected at `Exit`; the metadata may differ from a local
+                        // one, so cargo must never see its notice.
+                        let missing = std::fs::read_to_string(&dep_file)
+                            .map(|d| {
+                                missing_env_deps(&d, &forwarded, |n| std::env::var_os(n).is_some())
+                            })
+                            .unwrap_or_default();
+                        if !missing.is_empty() {
+                            remember_env(data_dir, &cand.crate_name, &missing);
+                            stale_early = true;
+                        }
+                    }
+                    if !stale_early {
+                        relayed_notices.insert(notice_key(&file, &emit));
+                        printed |= registry;
+                        write_line(false, &line);
+                    }
+                }
+                _ if registry => {
                     printed = true;
                     write_line(false, &line);
-                } else {
-                    buffered.push((false, line));
                 }
-            }
+                _ => buffered.push((false, line)),
+            },
             Message::Stdout { line } => {
                 if registry {
                     printed = true;
@@ -522,7 +553,7 @@ fn submit(
             if printed {
                 eprintln!("crabfarm: remote job failed, rerunning locally");
             }
-            let code = passthrough(rustc, args);
+            let code = passthrough_skipping(rustc, args, &relayed_notices);
             if reason.is_some() {
                 // Releases the local slot the node reserved for this run.
                 let _ = rt.block_on(conn.send(&Message::LocalDone {
@@ -532,6 +563,60 @@ fn submit(
             }
             code
         }
+    }
+}
+
+/// Identity of an artifact notice that survives path rewriting: its emit kind
+/// and the file name (one file per kind exists per job).
+fn notice_key(file: &str, emit: &str) -> (String, String) {
+    let name = file.rsplit(['\\', '/']).next().unwrap_or(file);
+    (name.to_string(), emit.to_string())
+}
+
+/// True for a line that announces an artifact in `skip`.
+fn is_skipped_notice(line: &str, skip: &HashSet<(String, String)>) -> bool {
+    rewrite::artifact(line).is_some_and(|(f, e)| skip.contains(&notice_key(&f, &e)))
+}
+
+/// `passthrough`, except that artifact notices cargo already got from the
+/// remote attempt are dropped from rustc's stderr (cargo must see each notice
+/// once: a repeated metadata notice would release dependents twice).
+fn passthrough_skipping(rustc: &str, args: &[String], skip: &HashSet<(String, String)>) -> i32 {
+    use std::io::BufRead;
+    if skip.is_empty() {
+        return passthrough(rustc, args);
+    }
+    let mut child = match Command::new(rustc)
+        .args(args)
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("crabfarm: could not run {rustc}: {e}");
+            return 1;
+        }
+    };
+    if let Some(err) = child.stderr.take() {
+        let mut reader = std::io::BufReader::new(err);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let text = String::from_utf8_lossy(&buf);
+            if is_skipped_notice(text.trim_end_matches(['\r', '\n']), skip) {
+                continue;
+            }
+            // One write per line, bytes untouched.
+            let _ = std::io::stderr().lock().write_all(&buf);
+        }
+    }
+    match child.wait() {
+        Ok(s) => s.code().unwrap_or(1),
+        Err(_) => 1,
     }
 }
 
@@ -555,6 +640,23 @@ mod tests {
 
     fn v(s: &str) -> String {
         s.to_string()
+    }
+
+    #[test]
+    fn a_local_rerun_does_not_repeat_notices_cargo_already_saw() {
+        let mut skip = HashSet::new();
+        skip.insert(notice_key(r"C:\t\deps\libx-1.rmeta", "metadata"));
+        // Same file, spelled with the other separator by the rewriter.
+        assert!(is_skipped_notice(
+            r#"{"artifact":"C:/t/deps/libx-1.rmeta","emit":"metadata"}"#,
+            &skip
+        ));
+        // The rlib was never announced, and diagnostics are untouched.
+        assert!(!is_skipped_notice(
+            r#"{"artifact":"C:/t/deps/libx-1.rlib","emit":"link"}"#,
+            &skip
+        ));
+        assert!(!is_skipped_notice("warning: unused", &skip));
     }
 
     #[test]

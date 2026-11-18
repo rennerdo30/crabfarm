@@ -164,25 +164,36 @@ fn write_atomic(dest: &std::path::Path, data: &[u8]) -> anyhow::Result<()> {
 /// Whatever is still staged when this is dropped is deleted.
 #[derive(Default)]
 struct Staged {
-    files: Vec<(PathBuf, PathBuf)>,
+    files: Vec<(ClientPath, PathBuf, PathBuf)>,
 }
 
 impl Staged {
-    fn add(&mut self, tmp: PathBuf, dest: PathBuf) {
-        self.files.push((tmp, dest));
+    fn add(&mut self, client: ClientPath, tmp: PathBuf, dest: PathBuf) {
+        self.files.push((client, tmp, dest));
     }
 
     /// Move every staged file to its destination.
     fn commit(&mut self) -> anyhow::Result<()> {
         while !self.files.is_empty() {
-            let (tmp, dest) = self.files.remove(0);
+            let (_, tmp, dest) = self.files.remove(0);
             commit_temp(&tmp, &dest)?;
         }
         Ok(())
     }
 
+    /// Move the one staged file for `client` to its destination; false when
+    /// nothing is staged for that path.
+    fn commit_one(&mut self, client: &ClientPath) -> anyhow::Result<bool> {
+        let Some(i) = self.files.iter().position(|(c, _, _)| c == client) else {
+            return Ok(false);
+        };
+        let (_, tmp, dest) = self.files.remove(i);
+        commit_temp(&tmp, &dest)?;
+        Ok(true)
+    }
+
     fn discard(&mut self) {
-        for (tmp, _) in self.files.drain(..) {
+        for (_, tmp, _) in self.files.drain(..) {
             let _ = std::fs::remove_file(tmp);
         }
     }
@@ -194,9 +205,78 @@ impl Drop for Staged {
     }
 }
 
-/// True for the stderr line that announces a finished artifact to cargo.
-fn is_artifact_notice(m: &Message) -> bool {
-    matches!(m, Message::Stderr { line } if crate::rewrite::artifact(line).is_some())
+/// Artifact kinds that are relayed the moment their file is clean (CF-16):
+/// the metadata is what lets cargo start the dependents of a crate before its
+/// codegen is done, and dep-info lets the wrapper judge env dependencies early.
+/// Everything else (`link`, `obj`, ...) waits for `Exit` like the other files.
+pub(crate) fn is_early_emit(emit: &str) -> bool {
+    matches!(emit, "metadata" | "dep-info")
+}
+
+/// Decides, per frame of a remote job, what the wrapper sees now and what
+/// waits for `Exit` (DESIGN section 9, CF-10 and CF-16).
+///
+/// Files are staged next to their destination. A clean early artifact (the
+/// executor scanned it before sending it) is moved into place when its
+/// notification line arrives, and the line is relayed at once, so cargo starts
+/// dependents early. From the first notice that is not early on (the link
+/// artifact), all frames wait for `Exit`, which keeps the order of the
+/// diagnostics and keeps cargo from seeing a notice before its file exists.
+#[derive(Default)]
+struct Relay {
+    staged: Staged,
+    held: Vec<Message>,
+    holding: bool,
+}
+
+impl Relay {
+    /// A frame from the peer for the wrapper: `Some((frame, early))` when it
+    /// goes out now (`early` for an artifact notice relayed before `Exit`),
+    /// `None` when it was held.
+    fn offer(
+        &mut self,
+        m: Message,
+        style: crate::proto::PathStyle,
+    ) -> anyhow::Result<Option<(Message, bool)>> {
+        if self.holding {
+            self.held.push(m);
+            return Ok(None);
+        }
+        if let Message::Stderr { line } = &m
+            && let Some((file, emit)) = crate::rewrite::artifact(line)
+        {
+            let ready = match ClientPath::parse(style, &file) {
+                Some(client) if is_early_emit(&emit) => self.staged.commit_one(&client)?,
+                _ => false,
+            };
+            if !ready {
+                self.holding = true;
+                self.held.push(m);
+                return Ok(None);
+            }
+            return Ok(Some((m, true)));
+        }
+        Ok(Some((m, false)))
+    }
+
+    /// The peer found its sandbox path in an output: use none of the staged
+    /// files and relay nothing more. Files committed early stay; the local
+    /// rerun overwrites them (DESIGN section 9).
+    fn taint(&mut self) {
+        self.staged.discard();
+        self.held.clear();
+    }
+
+    /// `Exit` arrived: apply the remaining files (only for a success), then
+    /// hand back the held frames, which announce them.
+    fn finish(&mut self, ok: bool) -> anyhow::Result<Vec<Message>> {
+        if ok {
+            self.staged.commit()?;
+        } else {
+            self.staged.discard();
+        }
+        Ok(std::mem::take(&mut self.held))
+    }
 }
 
 fn env_path(spec: &JobSpec, name: &str) -> Option<ClientPath> {
@@ -669,13 +749,11 @@ impl Node {
         .await?;
         let idle = Duration::from_secs(self.cfg.job_timeout_min.max(1) * 60 + 120);
         let mut pending: Option<(Assembler, ClientPath, BlobHash, u64)> = None;
-        // Outputs are applied at `Exit`, not on arrival, so a tainted job leaves
-        // nothing behind. Cargo must not see an artifact notice before its file
-        // exists, so from the first notice on the lines wait for the commit too
-        // (this costs pipelining for registry crates).
-        let mut staged = Staged::default();
-        let mut held: Vec<Message> = Vec::new();
-        let mut holding = false;
+        // Outputs are applied at `Exit`, except clean metadata and dep-info
+        // files, which are applied at their notification line so cargo can
+        // pipeline (CF-16). A tainted job leaves no other file behind.
+        let mut relay = Relay::default();
+        let style = spec.out_dir.style;
         loop {
             let m = tokio::time::timeout(idle, link.recv())
                 .await
@@ -692,22 +770,23 @@ impl Node {
                     if pending.is_some() {
                         bail!("stderr inside an output transfer");
                     }
-                    let m = Message::Stderr { line };
-                    holding |= is_artifact_notice(&m);
-                    if holding {
-                        held.push(m);
-                    } else if wrapper.send(m).await.is_err() {
-                        let _ = link.send(Message::Cancel).await;
-                        return Ok(RemoteEnd::Done);
+                    if let Some((m, early)) = relay.offer(Message::Stderr { line }, style)? {
+                        if early {
+                            self.count("early_notices", 1);
+                        }
+                        if wrapper.send(m).await.is_err() {
+                            let _ = link.send(Message::Cancel).await;
+                            return Ok(RemoteEnd::Done);
+                        }
                     }
                 }
                 Message::Stdout { line } => {
                     if pending.is_some() {
                         bail!("stdout inside an output transfer");
                     }
-                    if holding {
-                        held.push(Message::Stdout { line });
-                    } else if wrapper.send(Message::Stdout { line }).await.is_err() {
+                    if let Some((m, _)) = relay.offer(Message::Stdout { line }, style)?
+                        && wrapper.send(m).await.is_err()
+                    {
                         let _ = link.send(Message::Cancel).await;
                         return Ok(RemoteEnd::Done);
                     }
@@ -745,15 +824,14 @@ impl Node {
                         let to = dest.clone();
                         let tmp =
                             tokio::task::spawn_blocking(move || write_temp(&to, &plain)).await??;
-                        staged.add(tmp, dest);
+                        relay.staged.add(path.clone(), tmp, dest);
                         self.count("bytes_down", n);
                         pending = None;
                     }
                 }
                 Message::Tainted { .. } => {
                     // The peer's sandbox path is inside an output: use none of them.
-                    staged.discard();
-                    held.clear();
+                    relay.taint();
                     let _ = link.send(Message::Cancel).await;
                     return Ok(RemoteEnd::Tainted);
                 }
@@ -762,12 +840,11 @@ impl Node {
                         bail!("exit inside an output transfer");
                     }
                     // Files first, then the lines that announce them, then `Exit`.
-                    if code == 0 {
-                        let mut files = std::mem::take(&mut staged);
-                        tokio::task::spawn_blocking(move || files.commit()).await??;
-                    } else {
-                        staged.discard();
-                    }
+                    let ok = code == 0;
+                    let held = {
+                        let mut r = std::mem::take(&mut relay);
+                        tokio::task::spawn_blocking(move || r.finish(ok)).await??
+                    };
                     lock(&self.depgraph).finish(&info.produces, code == 0);
                     self.count(
                         if code == 0 {
@@ -777,7 +854,7 @@ impl Node {
                         },
                         1,
                     );
-                    for m in held.drain(..) {
+                    for m in held {
                         if wrapper.send(m).await.is_err() {
                             let _ = link.send(Message::Cancel).await;
                             return Ok(RemoteEnd::Done);
@@ -956,8 +1033,8 @@ mod tests {
             v
         };
         let mut st = Staged::default();
-        st.add(write_temp(&a, b"rlib").unwrap(), a.clone());
-        st.add(write_temp(&b, b"rmeta").unwrap(), b.clone());
+        st.add(posix("/a"), write_temp(&a, b"rlib").unwrap(), a.clone());
+        st.add(posix("/b"), write_temp(&b, b"rmeta").unwrap(), b.clone());
         assert!(
             !a.exists() && !b.exists(),
             "staged files must not be at their destination"
@@ -972,13 +1049,13 @@ mod tests {
         // Dropping staged files (error path) cleans up as well.
         {
             let mut lost = Staged::default();
-            lost.add(write_temp(&a, b"x").unwrap(), a.clone());
+            lost.add(posix("/a"), write_temp(&a, b"x").unwrap(), a.clone());
         }
         assert!(names(&d.path().join("deps")).is_empty());
         // A good job: both files are moved into place.
         let mut ok = Staged::default();
-        ok.add(write_temp(&a, b"rlib").unwrap(), a.clone());
-        ok.add(write_temp(&b, b"rmeta").unwrap(), b.clone());
+        ok.add(posix("/a"), write_temp(&a, b"rlib").unwrap(), a.clone());
+        ok.add(posix("/b"), write_temp(&b, b"rmeta").unwrap(), b.clone());
         ok.commit().unwrap();
         assert_eq!(std::fs::read(&a).unwrap(), b"rlib");
         assert_eq!(
@@ -987,18 +1064,100 @@ mod tests {
         );
     }
 
+    fn notice(path: &str, emit: &str) -> Message {
+        let line = serde_json::json!({ "artifact": path, "emit": emit }).to_string();
+        Message::Stderr { line }
+    }
+
+    fn stage(r: &mut Relay, dir: &std::path::Path, name: &str, data: &[u8]) -> (PathBuf, String) {
+        let dest = dir.join(name);
+        let client = ClientPath::from_local(&dest, dir).expect("client path");
+        let text = client.path.clone();
+        r.staged
+            .add(client, write_temp(&dest, data).unwrap(), dest.clone());
+        (dest, text)
+    }
+
+    fn style_of(dir: &std::path::Path) -> crate::proto::PathStyle {
+        ClientPath::from_local(dir, dir).expect("client path").style
+    }
+
+    /// CF-16: the metadata is in place and its notice goes out while the job
+    /// is still running; the link artifact and everything after it waits for
+    /// `Exit`, files first.
     #[test]
-    fn artifact_notices_are_recognized() {
-        let n = Message::Stderr {
-            line: r#"{"artifact":"C:\\t\\libx.rmeta","emit":"metadata"}"#.into(),
+    fn clean_metadata_is_relayed_before_exit_and_the_rest_waits() {
+        let d = tempfile::tempdir().unwrap();
+        let style = style_of(d.path());
+        let mut r = Relay::default();
+        let (meta, meta_c) = stage(&mut r, d.path(), "libx.rmeta", b"meta");
+        let (rlib, rlib_c) = stage(&mut r, d.path(), "libx.rlib", b"rlib");
+        assert!(!meta.exists());
+
+        let out = r
+            .offer(notice(&meta_c, "metadata"), style)
+            .unwrap()
+            .expect("metadata notice goes out at once");
+        assert!(out.1, "counted as an early notice");
+        assert_eq!(std::fs::read(&meta).unwrap(), b"meta");
+        assert!(!rlib.exists(), "the link output is still staged");
+
+        // A diagnostic after the metadata keeps its place in line.
+        let w = Message::Stderr {
+            line: "warning: x".into(),
         };
-        assert!(is_artifact_notice(&n));
-        assert!(!is_artifact_notice(&Message::Stderr {
-            line: "warning: unused".into()
-        }));
-        assert!(!is_artifact_notice(&Message::Stdout {
-            line: r#"{"artifact":"x","emit":"link"}"#.into()
-        }));
+        assert!(r.offer(w, style).unwrap().is_some());
+
+        // The link notice is not early: it and later frames are held.
+        assert!(r.offer(notice(&rlib_c, "link"), style).unwrap().is_none());
+        let late = Message::Stderr {
+            line: "warning: y".into(),
+        };
+        assert!(r.offer(late, style).unwrap().is_none());
+        assert!(!rlib.exists());
+
+        let held = r.finish(true).unwrap();
+        assert_eq!(held.len(), 2);
+        assert_eq!(std::fs::read(&rlib).unwrap(), b"rlib");
+    }
+
+    /// A notice whose file is not staged is never relayed early: cargo must
+    /// not see a notice before its file exists.
+    #[test]
+    fn a_notice_without_its_staged_file_is_held() {
+        let d = tempfile::tempdir().unwrap();
+        let style = style_of(d.path());
+        let mut r = Relay::default();
+        let ghost = ClientPath::from_local(&d.path().join("libghost.rmeta"), d.path()).unwrap();
+        assert!(
+            r.offer(notice(&ghost.path, "metadata"), style)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(r.held.len(), 1);
+    }
+
+    /// CF-10 with CF-16: after a taint nothing staged is written and nothing
+    /// held is relayed; only what was committed early stays.
+    #[test]
+    fn taint_after_an_early_metadata_keeps_only_the_clean_early_file() {
+        let d = tempfile::tempdir().unwrap();
+        let style = style_of(d.path());
+        let mut r = Relay::default();
+        let (meta, meta_c) = stage(&mut r, d.path(), "liby.rmeta", b"meta");
+        let (rlib, rlib_c) = stage(&mut r, d.path(), "liby.rlib", b"tainted");
+        assert!(
+            r.offer(notice(&meta_c, "metadata"), style)
+                .unwrap()
+                .is_some()
+        );
+        assert!(r.offer(notice(&rlib_c, "link"), style).unwrap().is_none());
+        r.taint();
+        assert!(meta.exists());
+        assert!(!rlib.exists());
+        assert!(r.held.is_empty());
+        let names: Vec<_> = std::fs::read_dir(d.path()).unwrap().collect();
+        assert_eq!(names.len(), 1, "no temporary file is left");
     }
 
     #[test]

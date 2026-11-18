@@ -113,6 +113,10 @@ pub fn format_status(
         out.push_str(&format!("local because: {}\n", reasons.join(", ")));
     }
     out.push_str(&format!(
+        "pipelining: {} artifact notices relayed before their job ended\n",
+        counter(counters, "early_notices"),
+    ));
+    out.push_str(&format!(
         "traffic: {} up, {} down, {} jobs served for peers\n",
         mib(counter(counters, "bytes_up")),
         mib(counter(counters, "bytes_down")),

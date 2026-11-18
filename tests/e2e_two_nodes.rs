@@ -286,6 +286,27 @@ fn two_nodes_build_the_fixture_remotely() {
         dump()
     );
 
+    // CF-16: metadata notices of remote crates reach cargo while their jobs
+    // still run (the node counts exactly those), so dependents can start early.
+    // A count, not a timing: it only rises on the early relay path.
+    let early: u64 = st
+        .stdout
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("pipelining: ")?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("no pipelining line in status:\n{}", st.stdout));
+    assert!(
+        early >= 3,
+        "no early artifact notices were relayed, pipelining is lost ({early})\n{}\n{}",
+        st.stdout,
+        dump()
+    );
+
     // The warning names the client's file, never a sandbox of the peer.
     let rel = format!(
         "core_lib{}src{}lib.rs",

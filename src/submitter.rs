@@ -24,6 +24,35 @@ const RETRY_WAIT: Duration = Duration::from_secs(60);
 const RESERVE_WAIT: Duration = Duration::from_secs(10);
 /// Uploads smaller than this say nothing about the link speed.
 const MIN_MEASURED_UPLOAD: u64 = 2 * 1024 * 1024;
+/// What one remote job may stage on the submitter (CF-19): a peer that streams
+/// endless or enormous outputs must not fill this disk. Beyond either limit
+/// the job fails and runs locally.
+pub const MAX_OUTPUT_FILES: usize = 10_000;
+pub const MAX_OUTPUT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Running total of the outputs a job has announced so far.
+#[derive(Default)]
+struct OutputBudget {
+    files: usize,
+    bytes: u64,
+}
+
+impl OutputBudget {
+    /// Count one announced output of `size` bytes; an error when the job goes
+    /// over either limit.
+    fn admit(&mut self, size: u64) -> anyhow::Result<()> {
+        if self.files >= MAX_OUTPUT_FILES {
+            bail!("peer sent more than {MAX_OUTPUT_FILES} output files");
+        }
+        let total = self.bytes.saturating_add(size);
+        if total > MAX_OUTPUT_BYTES {
+            bail!("peer sent more than {MAX_OUTPUT_BYTES} bytes of output");
+        }
+        self.files += 1;
+        self.bytes = total;
+        Ok(())
+    }
+}
 
 /// Everything `Submit` carries besides the spec.
 pub struct SubmitInfo {
@@ -782,6 +811,7 @@ impl Node {
         // files, which are applied at their notification line so cargo can
         // pipeline (CF-16). A tainted job leaves no other file behind.
         let mut relay = Relay::default();
+        let mut budget = OutputBudget::default();
         let style = spec.out_dir.style;
         loop {
             let m = tokio::time::timeout(idle, link.recv())
@@ -830,6 +860,7 @@ impl Node {
                     if size > inputs::MAX_TOTAL {
                         bail!("output too large");
                     }
+                    budget.admit(size)?;
                     pending = Some((Assembler::default(), path, hash, size));
                 }
                 Message::BlobChunk {
@@ -1187,6 +1218,26 @@ mod tests {
         assert!(r.held.is_empty());
         let names: Vec<_> = std::fs::read_dir(d.path()).unwrap().collect();
         assert_eq!(names.len(), 1, "no temporary file is left");
+    }
+
+    /// CF-19: a job stages at most `MAX_OUTPUT_FILES` files and
+    /// `MAX_OUTPUT_BYTES` bytes; the first output over a limit ends the job
+    /// (which then reruns locally and leaves nothing staged behind).
+    #[test]
+    fn staged_outputs_are_capped_by_count_and_size() {
+        let mut b = OutputBudget::default();
+        for _ in 0..MAX_OUTPUT_FILES {
+            b.admit(1).unwrap();
+        }
+        assert!(b.admit(0).is_err(), "file number {}", MAX_OUTPUT_FILES + 1);
+
+        let mut b = OutputBudget::default();
+        b.admit(MAX_OUTPUT_BYTES - 10).unwrap();
+        b.admit(10).unwrap();
+        assert!(b.admit(1).is_err(), "one byte over the total");
+        let mut b = OutputBudget::default();
+        assert!(b.admit(u64::MAX).is_err(), "no overflow");
+        assert!(b.admit(MAX_OUTPUT_BYTES + 1).is_err());
     }
 
     #[test]

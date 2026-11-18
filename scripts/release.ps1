@@ -99,9 +99,10 @@ $goesUp = if ($new.Core -ne $old.Core) { $new.Core -gt $old.Core }
           elseif (-not $new.Pre) { $true }          # 0.2.0 ranks above 0.2.0-beta.1
           elseif (-not $old.Pre) { $false }
           else { [string]::CompareOrdinal($new.Pre, $old.Pre) -gt 0 }
-# The first release has nothing to go up from: Cargo.toml still says 0.1.0 and may be released as is.
+# The first release has nothing to go up from: Cargo.toml still says 0.1.0 and may be released as is,
+# or as a prerelease of it (0.1.0-rc.1, the dry run in docs/RELEASING.md).
 $firstRelease = -not (Invoke-Git tag --list 'v*')
-if (-not $goesUp -and -not ($firstRelease -and $Version -eq $current)) {
+if (-not $goesUp -and -not ($firstRelease -and $new.Core -eq $old.Core)) {
     Fail "Version $Version does not go up from $current."
 }
 

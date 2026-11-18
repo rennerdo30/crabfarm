@@ -27,12 +27,23 @@ The script:
 5. commits `Release X.Y.Z` and creates the annotated tag `vX.Y.Z`;
 6. pushes with explicit refs: `git push origin HEAD:refs/heads/main`, then `git push origin refs/tags/vX.Y.Z`.
 
-The first release may use the version already in `Cargo.toml` (0.1.0).
+The first release may use the version already in `Cargo.toml` (0.1.0), or a prerelease of it (`0.1.0-rc.1`, see the dry run below).
+
+## Dry run before the first real release
+
+Run the whole pipeline once with a release candidate tag, so the first public release is not also the first run of `release.yml`:
+
+1. Add a line to `## Unreleased` in `CHANGELOG.md` if it is empty, then `./scripts/release.ps1 -Version 0.1.0-rc.1`. The tag has a `-`, so CI builds all six packages and creates a **draft prerelease** only; nothing is published.
+2. Check the draft: six archives, `SHA256SUMS.txt`, the notes, and `gh attestation verify <archive> --repo rennerdo30/crabfarm`. Unpack one and run `crabfarm --version`.
+3. Delete the draft (GitHub, Releases) and the tag (`git push origin :refs/tags/v0.1.0-rc.1`, then `git tag -d v0.1.0-rc.1`; the owner's yes, since it removes a remote ref). The `Release 0.1.0-rc.1` commit stays on `main`.
+4. Put the fixes the candidate showed into `## Unreleased` and cut `0.1.0` as usual.
+
+Never run the crates.io workflow for a candidate.
 
 ## What CI does ([`release.yml`](../.github/workflows/release.yml))
 
 On the tag push:
-- It checks that the tag matches the `Cargo.toml` version.
+- It checks that the tagged commit is on `main` (`git merge-base --is-ancestor`) and that the tag matches the `Cargo.toml` version.
 - It builds, tests and packages, each natively on a GitHub-hosted runner:
 
   | Target | Runner | Archive |
@@ -45,10 +56,13 @@ On the tag push:
   | `aarch64-apple-darwin` | `macos-latest` | `.tar.gz` |
 
   Each archive is named `crabfarm-<version>-<target>` and holds the binary, `LICENSE` and `README.md`.
+- It attaches signed build provenance to every archive (GitHub artifact attestations, `actions/attest-build-provenance`; the `id-token` and `attestations` permissions exist only in that job). Verify a download with `gh attestation verify <archive> --repo rennerdo30/crabfarm`.
 - It writes one `SHA256SUMS.txt` over all archives and creates a **draft** release with the changelog section as notes.
 - Rerunning it (Actions, release, Run workflow, with the tag) refreshes a draft and never touches a published release.
 
 `macos-15-intel` is the last Intel Mac runner label GitHub offers on the free tier. When it is retired, build `x86_64-apple-darwin` on `macos-latest` after `rustup target add x86_64-apple-darwin`.
+
+Runner labels were checked on 2026-11-19 against GitHub's "GitHub-hosted runners" reference (docs.github.com, Standard runners, free on public repositories). Recheck them before each release; the check date is also in a comment in `release.yml`.
 
 The owner reviews the draft and publishes it.
 

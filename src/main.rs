@@ -51,6 +51,10 @@ enum Cmd {
     Disable {
         #[arg(long)]
         global: bool,
+        /// Only when the entry points at THIS crabfarm executable (the
+        /// uninstaller uses it so another install's entry stays).
+        #[arg(long)]
+        this_install_only: bool,
     },
     /// Create, join or invite to a farm.
     Farm {
@@ -302,11 +306,12 @@ fn enable_cmd(global: bool, jobs: Option<u32>) -> anyhow::Result<i32> {
     Ok(0)
 }
 
-fn disable_cmd(global: bool) -> anyhow::Result<i32> {
+fn disable_cmd(global: bool, this_install_only: bool) -> anyhow::Result<i32> {
     use crabfarm::enable;
     let cwd = std::env::current_dir().context("cannot read the current directory")?;
     let file = enable::target_config(global, &cwd, cargo_home().as_deref())?;
-    let r = enable::disable_file(&file)?;
+    let exe = std::env::current_exe().context("cannot find my own executable")?;
+    let r = enable::disable_file_if(&file, this_install_only.then_some(exe.as_path()))?;
     if !r.was_enabled {
         println!(
             "crabfarm was not enabled in {}; nothing changed.",
@@ -341,7 +346,10 @@ fn real_main() -> anyhow::Result<i32> {
         Cmd::Service { cmd } => service_cmd(cmd),
         Cmd::Path { cmd } => path_cmd(cmd),
         Cmd::Enable { global, jobs } => enable_cmd(global, jobs),
-        Cmd::Disable { global } => disable_cmd(global),
+        Cmd::Disable {
+            global,
+            this_install_only,
+        } => disable_cmd(global, this_install_only),
         Cmd::Farm { cmd } => farm_cmd(cmd),
     }
 }

@@ -860,6 +860,28 @@ impl NodeLock {
     }
 }
 
+impl NodeLock {
+    /// Whether a node holds `<data>/node.lock` right now, without side
+    /// effects: nothing is created (a missing directory or file means no node)
+    /// and the file is only opened to ask for a shared lock. Being denied
+    /// access to the file (a sharing violation) counts as held.
+    pub fn is_held(data_dir: &Path) -> bool {
+        let file = match std::fs::File::open(data_dir.join("node.lock")) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(_) => return true,
+        };
+        match file.try_lock_shared() {
+            Ok(()) => {
+                let _ = file.unlock();
+                false
+            }
+            Err(std::fs::TryLockError::WouldBlock) => true,
+            Err(std::fs::TryLockError::Error(_)) => false,
+        }
+    }
+}
+
 impl Drop for NodeLock {
     fn drop(&mut self) {
         let _ = self.file.unlock();

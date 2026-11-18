@@ -451,6 +451,30 @@ pub fn enable_file(
 /// Undo `enable_file`: give the earlier wrapper and `jobs` back, or remove
 /// what crabfarm added. A file crabfarm is not in is left alone.
 pub fn disable_file(file: &Path) -> anyhow::Result<DisableReport> {
+    disable_file_if(file, None)
+}
+
+/// True when the configured wrapper is exactly `exe` (the same file, or the
+/// same path ignoring case and slash direction on Windows).
+fn wrapper_is_exe(wrapper: &str, exe: &Path) -> bool {
+    if let (Ok(a), Ok(b)) = (std::fs::canonicalize(wrapper), std::fs::canonicalize(exe)) {
+        return a == b;
+    }
+    let norm = |p: &str| {
+        let p = p.replace('\\', "/");
+        if cfg!(windows) {
+            p.to_ascii_lowercase()
+        } else {
+            p
+        }
+    };
+    norm(wrapper) == norm(&exe.to_string_lossy())
+}
+
+/// Like [`disable_file`]; with `only_exe` the file is changed only when its
+/// wrapper IS that executable (the uninstaller must not touch a global entry
+/// that belongs to another crabfarm install).
+pub fn disable_file_if(file: &Path, only_exe: Option<&Path>) -> anyhow::Result<DisableReport> {
     let mut report = DisableReport {
         file: file.to_path_buf(),
         was_enabled: false,
@@ -465,7 +489,10 @@ pub fn disable_file(file: &Path) -> anyhow::Result<DisableReport> {
         .and_then(Item::as_table_like)
         .and_then(|b| b.get("rustc-wrapper"))
         .and_then(Item::as_str)
-        .is_some_and(|w| is_crabfarm(w, None));
+        .is_some_and(|w| match only_exe {
+            Some(exe) => wrapper_is_exe(w, exe),
+            None => is_crabfarm(w, None),
+        });
     if !wrapper_is_ours {
         return Ok(report);
     }
@@ -818,6 +845,26 @@ mod tests {
         assert!(r.was_enabled);
         assert_eq!(parsed(&f)["build"]["rustc-wrapper"].as_str(), Some(""));
         assert!(!parsed(&f).contains_key("env"));
+    }
+
+    #[test]
+    fn this_install_only_leaves_another_installs_entry_alone() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join(".cargo/config.toml");
+        let other = if cfg!(windows) {
+            PathBuf::from(r"C:\other\crabfarm.exe")
+        } else {
+            PathBuf::from("/other/crabfarm")
+        };
+        enable_file(&f, &other, Some(4), 0, None).unwrap();
+        let before = std::fs::read_to_string(&f).unwrap();
+        let r = disable_file_if(&f, Some(&exe())).unwrap();
+        assert!(!r.was_enabled);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), before);
+        // And its own entry (even with another slash style) is removed.
+        let r = disable_file_if(&f, Some(&other)).unwrap();
+        assert!(r.was_enabled);
+        assert_eq!(std::fs::read_to_string(&f).unwrap().trim(), "");
     }
 
     #[test]

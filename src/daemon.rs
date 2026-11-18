@@ -55,13 +55,10 @@ pub fn log_startup_failure(message: &str) {
     }
 }
 
-/// True when a node holds the data directory's lock.
+/// True when a node holds the data directory's lock. A probe only: it never
+/// creates the directory or the lock file.
 pub fn node_running(data_dir: &Path) -> bool {
-    match node::NodeLock::acquire(data_dir) {
-        // We took it, so nobody had it; it is released again on drop.
-        Ok(_) => false,
-        Err(_) => data_dir.join("node.lock").exists(),
-    }
+    node::NodeLock::is_held(data_dir)
 }
 
 /// Ask the node of `data_dir` to shut down and wait until it has released the
@@ -103,6 +100,25 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         assert!(!node_running(d.path()));
         assert!(!stop_node(d.path(), Duration::from_secs(1)).unwrap());
+    }
+
+    #[test]
+    fn the_probe_creates_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let missing = d.path().join("not-yet/data");
+        assert!(!node_running(&missing));
+        assert!(!missing.exists());
+        let empty = d.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert!(!node_running(&empty));
+        assert!(!empty.join("node.lock").exists());
+    }
+
+    #[test]
+    fn a_released_lock_is_not_running() {
+        let d = tempfile::tempdir().unwrap();
+        drop(node::NodeLock::acquire(d.path()).unwrap());
+        assert!(!node_running(d.path()));
     }
 
     #[test]

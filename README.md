@@ -10,10 +10,15 @@ Website: https://crabfarm.renner.dev
 
 ## Install
 
+New here? The [getting-started guide](docs/GETTING-STARTED.md) walks through installing, creating a farm, joining a second machine and using it in a Rust project.
+
+- **Windows:** run `crabfarm-<version>-setup.exe` from the [Releases page](https://github.com/rennerdo30/crabfarm/releases). It installs per user (no admin rights) and offers to add crabfarm to `PATH` and to start the node when you sign in. The `.zip` is the same without an installer.
+- **macOS and Linux:** `curl -fsSL https://github.com/rennerdo30/crabfarm/releases/latest/download/install.sh | sh` (no sudo; checks `SHA256SUMS.txt`; installs into `~/.local/bin`).
+
 - **GitHub Releases:** download the archive for your platform from the [Releases page](https://github.com/rennerdo30/crabfarm/releases) (Windows, Linux and macOS, x86_64 and aarch64), check it against `SHA256SUMS.txt`, unpack it and put `crabfarm` on your `PATH`. The binaries are not code-signed, so Windows SmartScreen or macOS Gatekeeper may warn on the first run. Each archive also has build provenance: `gh attestation verify <archive> --repo rennerdo30/crabfarm`.
 - **From crates.io**, once the first version is published there: `cargo install crabfarm --locked`.
 
-Install it on every machine of the farm.
+Install it on every machine of the farm. The node also runs without a terminal: `crabfarm service install` starts it at login (Windows Run key, macOS LaunchAgent, Linux systemd user service), `crabfarm node --stop` stops it.
 
 ## Quick start
 
@@ -30,6 +35,10 @@ crabfarm node            # keep running (own terminal)
 # Then, instead of `cargo build`, in any Rust project on either machine:
 crabfarm cargo build --release
 crabfarm status          # peers, free slots, how many jobs ran where
+
+# Or switch a project over once, so plain `cargo build` uses the farm:
+crabfarm enable          # writes .cargo/config.toml; `crabfarm disable` undoes it
+crabfarm enable --global # every project on this machine
 ```
 
 - `crabfarm cargo <args>` runs your `cargo` with crabfarm as `RUSTC_WRAPPER` (this replaces a `rustc-wrapper` such as sccache from your cargo config for that run) and, unless you pass `-j`, a job count that covers your slots plus the free slots of the farm. If the node is not running it says so and builds locally.

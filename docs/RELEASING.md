@@ -55,7 +55,8 @@ On the tag push:
   | `x86_64-apple-darwin` | `macos-15-intel` | `.tar.gz` |
   | `aarch64-apple-darwin` | `macos-latest` | `.tar.gz` |
 
-  Each archive is named `crabfarm-<version>-<target>` and holds the binary, `LICENSE` and `README.md`.
+  Each archive is named `crabfarm-<version>-<target>` and holds `crabfarm`, `crabfarmd`, `LICENSE` and `README.md`.
+- The `installer` job (`windows-latest`) builds `crabfarm-<version>-setup.exe` with `scripts/package.ps1` (NSIS 3.13, fetched and hash-checked by `scripts/fetch-nsis.ps1`), runs the full lifecycle (`scripts/test-installer.ps1`: silent install, reinstall over a running node, `node --stop`, uninstall with and without `/DELETEDATA`) and uploads the setup and `scripts/install.sh`. Both are attested and listed in `SHA256SUMS.txt`. The same lifecycle runs on every pull request (`ci.yml`, job `windows installer lifecycle`); it refuses to run outside GitHub Actions.
 - It attaches signed build provenance to every archive (GitHub artifact attestations, `actions/attest-build-provenance`; the `id-token` and `attestations` permissions exist only in that job). Verify a download with `gh attestation verify <archive> --repo rennerdo30/crabfarm`.
 - It writes one `SHA256SUMS.txt` over all archives and creates a **draft** release with the changelog section as notes.
 - Rerunning it (Actions, release, Run workflow, with the tag) refreshes a draft and never touches a published release.
@@ -65,6 +66,10 @@ On the tag push:
 Runner labels were checked on 2026-11-19 against GitHub's "GitHub-hosted runners" reference (docs.github.com, Standard runners, free on public repositories). Recheck them before each release; the check date is also in a comment in `release.yml`.
 
 The owner reviews the draft and publishes it.
+
+## Local test package
+
+`./scripts/package.ps1 -Version 0.1.0-rc.1` compiles and runs `makensis` only; it installs nothing and changes no PATH, registry or autostart. `-Version` names the packages and the version the installer shows; `Cargo.toml` is untouched and the binaries keep reporting its version. Output: `artifacts/installer/` (git-ignored): the setup, the zip and `SHA256SUMS.txt`. Installing it is the tester's decision on the tester's machine.
 
 ## crates.io
 

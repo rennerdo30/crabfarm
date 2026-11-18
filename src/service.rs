@@ -286,6 +286,23 @@ pub fn status(host: &dyn Host, t: &Target) -> anyhow::Result<Status> {
     })
 }
 
+/// After `farm create` / `farm join`: a node that autostart launched before the
+/// machine was in a farm has already exited. launchd and systemd restart it on
+/// their own (a failed start counts as a crash); the Windows Run key does not,
+/// so start it here. Returns a line for the user when it did.
+pub fn start_after_setup(host: &mut dyn Host, t: &Target) -> anyhow::Result<Option<String>> {
+    // Only for the install the Run key points at: a crabfarm that merely
+    // runs from somewhere else (a build tree, the tests) starts nothing.
+    let ours = host
+        .run_key_get()?
+        .is_some_and(|v| v == run_value(&t.daemon));
+    if t.os != Os::Windows || !ours || host.node_running() {
+        return Ok(None);
+    }
+    host.start_detached(&t.daemon)?;
+    Ok(Some("Started the node (autostart is on).".into()))
+}
+
 /// The `crabfarmd` next to this executable.
 pub fn daemon_path(exe: &Path) -> anyhow::Result<PathBuf> {
     let name = if cfg!(windows) {
@@ -622,6 +639,32 @@ mod tests {
             ]
         );
         assert!(h.files.is_empty());
+    }
+
+    #[test]
+    fn a_node_that_left_for_lack_of_a_farm_is_started_after_setup_on_windows() {
+        let t = target(Os::Windows);
+        let mut h = Fake::default();
+        // Autostart off: the user did not ask for a background node.
+        assert!(start_after_setup(&mut h, &t).unwrap().is_none());
+        install(&mut h, &t).unwrap();
+        h.running = false; // it exited: no farm yet
+        h.started.clear();
+        assert!(start_after_setup(&mut h, &t).unwrap().is_some());
+        assert_eq!(h.started.len(), 1);
+        // Autostart points at another install: not ours to start.
+        let mut other = t.clone();
+        other.daemon = PathBuf::from("/elsewhere/crabfarmd");
+        h.running = false;
+        assert!(start_after_setup(&mut h, &other).unwrap().is_none());
+        h.running = true;
+        // Already running: nothing to do. Other systems restart by themselves.
+        assert!(start_after_setup(&mut h, &t).unwrap().is_none());
+        assert!(
+            start_after_setup(&mut Fake::default(), &target(Os::Linux))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

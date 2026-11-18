@@ -218,6 +218,21 @@ fn path_cmd(cmd: PathCmd) -> anyhow::Result<i32> {
     Ok(0)
 }
 
+/// With autostart on, a node that started before this machine had a farm has
+/// exited; start it now (see `service::start_after_setup`).
+fn start_node_after_setup() {
+    use crabfarm::service;
+    let Ok(target) = service::current_target() else {
+        return;
+    };
+    let mut host = service::RealHost::new(target.data_dir.clone());
+    match service::start_after_setup(&mut host, &target) {
+        Ok(Some(line)) => println!("{line}"),
+        Ok(None) => {}
+        Err(e) => eprintln!("crabfarm: could not start the node: {e:#}"),
+    }
+}
+
 fn cargo_home() -> Option<std::path::PathBuf> {
     std::env::var_os("CARGO_HOME")
         .map(std::path::PathBuf::from)
@@ -323,8 +338,9 @@ fn farm_cmd(cmd: FarmCmd) -> anyhow::Result<i32> {
                 id.short_farm_id(),
                 id.node_name
             );
+            start_node_after_setup();
             println!(
-                "Next: run `crabfarm node` here, then `crabfarm farm invite` to add a machine."
+                "Next: make sure the node runs (`crabfarm service status`; `crabfarm node` starts it in this terminal), then `crabfarm farm invite` to add a machine."
             );
             Ok(0)
         }
@@ -367,8 +383,9 @@ fn farm_cmd(cmd: FarmCmd) -> anyhow::Result<i32> {
             book.merge(&known, id.node_id);
             book.save(&data_dir)?;
             println!("Joined farm {} as `{}`.", id.short_farm_id(), id.node_name);
+            start_node_after_setup();
             println!(
-                "Next: run `crabfarm node` here, then `crabfarm cargo build` in a Rust project."
+                "Next: make sure the node runs (`crabfarm service status`; `crabfarm node` starts it in this terminal), then run `crabfarm enable` in a Rust project."
             );
             Ok(0)
         }

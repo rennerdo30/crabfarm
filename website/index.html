@@ -23,6 +23,7 @@
       <a href="#security">Security</a>
       <a class="hide-sm" href="#platforms">Platforms</a>
       <a href="#install">Install</a>
+      <a href="guide.html">Getting started</a>
       <a href="https://github.com/rennerdo30/crabfarm">Source</a>
     </nav>
   </div>
@@ -192,17 +193,21 @@
 <section id="install" class="alt">
   <div class="wrap">
     <h2>Install</h2>
-    <p class="sub">One binary, <code>crabfarm</code>. Put it on every machine of the farm.</p>
+    <p class="sub">Two programs: <code>crabfarm</code> and <code>crabfarmd</code> (the node, without a console window). Put them on every machine of the farm.</p>
     <div class="install">
       <div>
-        <h3>From a GitHub release</h3>
-<pre><span class="c"># Windows, macOS and Linux: x86-64 and ARM</span>
-<span class="c"># 1. Download the archive for your platform:</span>
-<span class="c">#    github.com/rennerdo30/crabfarm/releases/latest</span>
-<span class="c"># 2. Check it against SHA256SUMS.txt</span>
-<span class="c"># 3. Unpack; put crabfarm on your PATH</span>
+        <h3>Windows: the setup</h3>
+<pre><span class="c"># github.com/rennerdo30/crabfarm/releases/latest</span>
+<span class="c"># Run crabfarm-&lt;version&gt;-setup.exe: per user, no admin rights,</span>
+<span class="c"># optional PATH entry and start at sign-in.</span>
+<span class="p">&gt;</span> crabfarm --version</pre>
+        <p>Not code-signed, so SmartScreen asks for confirmation on the first run. A <code>.zip</code> without installer is on the same page.</p>
+      </div>
+      <div>
+        <h3>macOS and Linux</h3>
+<pre><span class="p">$</span> curl -fsSL https://github.com/rennerdo30/crabfarm/releases/latest/download/install.sh | sh
 <span class="p">$</span> crabfarm --version</pre>
-        <p>Archives are <code>.zip</code> on Windows and <code>.tar.gz</code> elsewhere. They are not code-signed, so Windows or macOS may ask for confirmation on the first run.</p>
+        <p>No sudo: it checks the download against <code>SHA256SUMS.txt</code> and installs into <code>~/.local/bin</code>.</p>
       </div>
       <div>
         <h3>With cargo</h3>
@@ -211,6 +216,23 @@
         <p>Builds on your machine, so there is no download prompt. Needs a current stable Rust toolchain.</p>
       </div>
     </div>
+  </div>
+</section>
+
+<section id="getting-started">
+  <div class="wrap">
+    <h2>Getting started</h2>
+    <p class="sub">Install on two machines, create the farm on one, join with the other, then switch a project over.</p>
+<pre><span class="c"># desktop</span>
+<span class="p">&gt;</span> crabfarm farm create --name desktop
+<span class="p">&gt;</span> crabfarm farm invite
+<span class="c"># notebook</span>
+<span class="p">&gt;</span> crabfarm farm join cf1-... --name notebook
+<span class="c"># in a Rust project, on either machine</span>
+<span class="p">&gt;</span> crabfarm enable
+<span class="p">&gt;</span> cargo build --release
+<span class="p">&gt;</span> crabfarm status</pre>
+    <p class="sub" style="margin-top:1.25rem">The <a href="guide.html">step-by-step guide</a> covers the firewall prompt, VPNs such as Tailscale, using it in a project three ways, work repositories and troubleshooting.</p>
   </div>
 </section>
 </main>

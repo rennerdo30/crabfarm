@@ -1,4 +1,5 @@
 /target/
+/artifacts/
 # Machine-local Cargo config (template: .cargo/config.example.toml)
 /.cargo/config.toml
 # Agent worktrees

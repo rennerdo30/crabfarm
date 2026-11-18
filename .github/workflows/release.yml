@@ -105,6 +105,8 @@ jobs:
           case "${{ matrix.target }}" in *windows*) exe=crabfarm.exe ;; esac
           mkdir -p "dist/$dir"
           cp "target/release/$exe" "dist/$dir/"
+          # The node without a console window (autostart and the installer start it).
+          cp "target/release/${exe/crabfarm/crabfarmd}" "dist/$dir/"
           cp LICENSE README.md "dist/$dir/"
           echo "PKG_DIR=$dir" >> "$GITHUB_ENV"
       - name: Archive (tar.gz)
@@ -120,11 +122,53 @@ jobs:
           path: dist/*.${{ matrix.ext }}
           if-no-files-found: error
 
+  # Windows setup (per-user installer) and install.sh, built from the same tag.
+  # The installer lifecycle itself runs in ci.yml; here it is only built and
+  # then installed and removed once more by the same test, on this runner.
+  installer:
+    name: windows setup
+    needs: [verify]
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - run: rustup show active-toolchain
+      - name: Fetch the pinned NSIS
+        shell: pwsh
+        run: |
+          $nsis = ./scripts/fetch-nsis.ps1 -Destination "$env:RUNNER_TEMP/nsis"
+          "CRABFARM_MAKENSIS=$nsis" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build the setup
+        shell: pwsh
+        run: |
+          $v = "$env:RELEASE_TAG".TrimStart('v')
+          ./scripts/package.ps1 -Version $v -Jobs 4
+          "PKG_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Test the setup (install, reinstall, uninstall)
+        shell: pwsh
+        run: ./scripts/test-installer.ps1 -Setup "artifacts/installer/crabfarm-$env:PKG_VERSION-setup.exe" -Version $env:PKG_VERSION
+      - name: Stage files
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "artifacts/installer/crabfarm-$PKG_VERSION-setup.exe" dist/
+          cp scripts/install.sh dist/install.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-setup
+          path: dist/*
+          if-no-files-found: error
+
   # Signed build provenance for every archive (GitHub artifact attestations).
   # The OIDC and attestation permissions live in this job only.
   attest:
     name: build provenance
-    needs: [build]
+    needs: [build, installer]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -138,11 +182,13 @@ jobs:
           merge-multiple: true
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: dist/crabfarm-*
+          subject-path: |
+            dist/crabfarm-*
+            dist/install.sh
 
   draft:
     name: draft release (owner publishes)
-    needs: [build, attest]
+    needs: [build, installer, attest]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -166,11 +212,11 @@ jobs:
           set -euo pipefail
           version="${RELEASE_TAG#v}"
           # One checksum file over every package.
-          (cd dist && sha256sum crabfarm-* > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          (cd dist && sha256sum crabfarm-* install.sh > SHA256SUMS.txt && cat SHA256SUMS.txt)
           awk -v v="$version" '$0 ~ "^## "v"[[:space:]]*$" {on=1; next} /^## / {on=0} on' CHANGELOG.md > notes.md || true
           {
             echo
-            echo "**Install:** unpack the archive for your platform and put \`crabfarm\` on your PATH, or run \`cargo install crabfarm\`."
+            echo "**Install:** on Windows run the \`-setup.exe\` (per user, no admin rights); on macOS and Linux run \`sh install.sh\` (or unpack the archive for your platform and put \`crabfarm\` and \`crabfarmd\` on your PATH); or run \`cargo install crabfarm\`. Guide: https://crabfarm.renner.dev/guide.html"
             echo "Check every download against SHA256SUMS.txt, or verify its provenance with \`gh attestation verify <archive> --repo $GH_REPO\`."
           } >> notes.md
           flags=(--draft --verify-tag --title "crabfarm $RELEASE_TAG" --notes-file notes.md)

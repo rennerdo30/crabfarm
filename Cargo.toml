@@ -20,6 +20,7 @@ include = [
     "/README.md",
     "/CHANGELOG.md",
     "/docs/DESIGN.md",
+    "/docs/GETTING-STARTED.md",
 ]
 
 [[bin]]

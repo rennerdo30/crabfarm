@@ -35,11 +35,15 @@ impl<S> std::fmt::Debug for FramedConn<S> {
     }
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin + Send> FramedConn<S> {
+impl<S> FramedConn<S> {
     pub fn new(stream: S) -> Self {
         FramedConn { stream }
     }
+}
 
+// Reading and writing are separate impls so a connection can be split into
+// halves (`tokio::io::split`) and each half framed on its own.
+impl<S: AsyncWrite + Unpin + Send> FramedConn<S> {
     /// Encode and write one frame (u32 LE length + postcard), flush.
     pub async fn send(&mut self, msg: &Message) -> anyhow::Result<()> {
         let body = postcard::to_stdvec(msg).context("encode frame")?;
@@ -55,6 +59,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> FramedConn<S> {
         Ok(())
     }
 
+}
+
+impl<S: AsyncRead + Unpin + Send> FramedConn<S> {
     /// Read one frame; `Ok(None)` on clean EOF; error above MAX_FRAME.
     /// Not cancel-safe: drop the connection if a `recv` future is dropped
     /// mid-frame (use it inside `timeout` only when the connection is then closed).

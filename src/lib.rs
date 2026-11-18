@@ -20,4 +20,14 @@ pub mod exec;
 pub mod toolchain;
 
 // Package D (integration): node daemon, scheduler, IPC, wrapper flow,
-// `crabfarm cargo`, `crabfarm status`, dependency graph. Not started yet.
+// `crabfarm cargo`, `crabfarm status`, dependency graph.
+pub mod cargo_cmd;
+pub mod depgraph;
+pub mod executor;
+pub mod ipc;
+pub mod link;
+pub mod node;
+pub mod scheduler;
+pub mod status;
+pub mod submitter;
+pub mod wrapper;

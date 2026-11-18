@@ -284,6 +284,12 @@ pub enum Message {
         /// `--extern` files, for the dependency graph (DESIGN section 8).
         produces: Vec<ClientPath>,
         externs: Vec<ClientPath>,
+        /// Added in package D: what the node needs to collect the inputs
+        /// (DESIGN section 8): the primary input file, `-L` dirs with their
+        /// kind, and `-l` libraries (kind, name).
+        input: ClientPath,
+        search_dirs: Vec<(String, ClientPath)>,
+        link_libs: Vec<(String, String)>,
     },
     /// Node -> wrapper: run rustc yourself; keep the IPC connection open
     /// until rustc exits (it holds a local slot), then send `LocalDone`.
@@ -300,5 +306,12 @@ pub enum Message {
         local: Status,
         peers: Vec<(PeerInfo, Option<Status>)>,
         counters: Vec<(String, u64)>,
+    },
+    /// Wrapper -> node (added in package D, appended so older variants keep
+    /// their encoding): the remote result is not accepted (compile error of a
+    /// non-registry crate, `# env-dep:` mismatch). The node answers
+    /// `RunLocal { reason }` once a local slot is free.
+    RetryLocal {
+        reason: LocalReason,
     },
 }

@@ -337,6 +337,7 @@ dependencies = [
  "clap",
  "data-encoding",
  "directories",
+ "if-addrs",
  "jobserver",
  "mdns-sd",
  "postcard",

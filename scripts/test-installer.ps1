@@ -51,7 +51,10 @@ function Test-OnPath { ((Get-UserPath) -split ';') -contains $dir }
 function Assert-PathUntouched($before) {
     $now = Get-RawUserPath
     if ($now[1] -ne $before[1]) { throw "user PATH registry type changed: '$($before[1])' -> '$($now[1])'" }
-    if ($now[0] -cne $before[0]) { throw 'user PATH value differs from before the install' }
+    if ($now[0] -cne $before[0]) {
+        # A disposable runner: the values are shown so a mismatch can be fixed.
+        throw "user PATH value differs from before the install`nbefore ($($before[1])): [$($before[0])]`nafter  ($($now[1])): [$($now[0])]"
+    }
 }
 function Test-Autostart { $null -ne (Get-ItemProperty -LiteralPath $runKey -Name crabfarm -ErrorAction SilentlyContinue) }
 function Test-NodeRunning {

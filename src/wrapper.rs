@@ -56,6 +56,7 @@ pub fn run(rustc: &str, args: &[String]) -> i32 {
     let Ok(cwd) = std::env::current_dir() else {
         return passthrough(rustc, args);
     };
+    let cwd = logical_cwd(cwd);
     let Some(tc) = toolchain_id(rustc, &data_dir, &cwd) else {
         return passthrough(rustc, args);
     };
@@ -75,6 +76,29 @@ pub fn run(rustc: &str, args: &[String]) -> i32 {
         }
         Classified::Remote(cand) => submit(rustc, args, cand, tc, &cfg, &data_dir, &cwd, &expanded),
     }
+}
+
+/// The working directory spelled the way cargo spells its own paths (CF-29).
+/// `current_dir` returns the real path, while cargo's `CARGO_MANIFEST_DIR` and
+/// `--out-dir` keep the symlinked spelling (macOS temp and home folders live
+/// under `/var` and `/private/var`). A relative crate path joined onto the real
+/// cwd then names a different spelling than the package files collected under
+/// the manifest dir, and the peer finds no source file. When an ancestor of the
+/// manifest dir is the same directory as the cwd, that ancestor is used. Only
+/// Unix has such spellings; elsewhere the cwd is returned unchanged.
+fn logical_cwd(cwd: PathBuf) -> PathBuf {
+    if !cfg!(unix) {
+        return cwd;
+    }
+    let Some(manifest) = std::env::var_os("CARGO_MANIFEST_DIR") else {
+        return cwd;
+    };
+    for anc in Path::new(&manifest).ancestors() {
+        if anc.is_absolute() && std::fs::canonicalize(anc).is_ok_and(|c| c == cwd) {
+            return anc.to_path_buf();
+        }
+    }
+    cwd
 }
 
 /// True when the program's file stem is `rustc` (also `rustc.exe`).

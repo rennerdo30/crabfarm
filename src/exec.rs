@@ -550,12 +550,13 @@ fn sandbox_needles(map: &SandboxMap) -> Vec<Vec<u8>> {
 }
 
 /// Debug-symbol files list the object and output paths of the link by design
-/// (a proc-macro `.pdb` always names the sandbox). Nothing loads them at build
-/// or run time, so they are the one kind of output the scan skips.
+/// (a proc-macro `.pdb` always names the sandbox), and so does the export file
+/// `link.exe` leaves next to a proc-macro DLL (`.dll.exp`, CF-29). Nothing loads
+/// them at build or run time, so they are the kinds of output the scan skips.
 fn scan_exempt(path: &ClientPath) -> bool {
     path.path
         .rsplit_once('.')
-        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("pdb"))
+        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("pdb") || ext.eq_ignore_ascii_case("exp"))
 }
 
 fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
@@ -1371,6 +1372,7 @@ fn main() {
             path: s.into(),
         };
         assert!(scan_exempt(&p(r"C:\t\derive_mac-1.PDB")));
+        assert!(scan_exempt(&p(r"C:\t\derive_mac-1.dll.exp")));
         for s in [
             r"C:\t\libx-1.rlib",
             r"C:\t\libx-1.rmeta",

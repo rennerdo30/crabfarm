@@ -622,12 +622,9 @@ pub async fn run(data_dir: PathBuf, shutdown: CancellationToken) -> anyhow::Resu
     for d in ["jobs", "cache", "logs"] {
         std::fs::create_dir_all(data_dir.join(d)).with_context(|| format!("create {d} directory"))?;
     }
-    // Sandboxes left by a crashed node would only waste disk.
-    if let Ok(rd) = std::fs::read_dir(data_dir.join("jobs")) {
-        for e in rd.flatten() {
-            let _ = std::fs::remove_dir_all(e.path());
-        }
-    }
+    // Sandboxes left by a crashed node hold plaintext sources: remove them now,
+    // and keep retrying in the background what cannot be removed yet (CF-9).
+    crate::exec::sweep_jobs(&data_dir.join("jobs"));
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await.with_context(|| format!("listen on {}", cfg.listen))?;
     let listen_addr = listener.local_addr()?;

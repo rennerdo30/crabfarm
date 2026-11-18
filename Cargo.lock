@@ -339,6 +339,7 @@ dependencies = [
  "directories",
  "if-addrs",
  "jobserver",
+ "libc",
  "mdns-sd",
  "postcard",
  "rand",
@@ -358,6 +359,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "walkdir",
+ "windows-sys 0.61.2",
  "x509-parser",
  "zstd",
 ]

@@ -78,8 +78,39 @@ pub fn missing_inputs(ctx: &ExecContext, spec: &JobSpec) -> Vec<BlobHash> {
         .collect()
 }
 
-fn job_hex(id: &JobId) -> String {
-    id.0.iter().map(|b| format!("{b:02x}")).collect()
+/// Directory name of a job: the submitter's node id and the job id (CF-9).
+/// The job id alone is chosen by the submitter, so two submitters (or a
+/// malicious one) could otherwise pick the same name and wipe a running job.
+fn job_hex(owner: NodeId, id: &JobId) -> String {
+    let hex = |b: &[u8; 16]| b.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    format!("{}-{}", hex(&owner.0), hex(&id.0))
+}
+
+/// Jobs running in this process, by `(jobs dir, owner, job id)`: a second
+/// request for the same key is refused instead of deleting the first one's
+/// sandbox (CF-9).
+fn running_jobs() -> &'static std::sync::Mutex<std::collections::HashSet<(PathBuf, NodeId, JobId)>> {
+    static RUNNING: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(PathBuf, NodeId, JobId)>>> = std::sync::OnceLock::new();
+    RUNNING.get_or_init(Default::default)
+}
+
+struct RunningGuard((PathBuf, NodeId, JobId));
+
+impl RunningGuard {
+    fn claim(ctx: &ExecContext, spec: &JobSpec) -> anyhow::Result<RunningGuard> {
+        let key = (ctx.jobs_dir.clone(), ctx.owner, spec.job_id);
+        let mut set = running_jobs().lock().unwrap_or_else(|e| e.into_inner());
+        if !set.insert(key.clone()) {
+            bail!("job is already running on this node");
+        }
+        Ok(RunningGuard(key))
+    }
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        running_jobs().lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
+    }
 }
 
 /// Build-related variables the node must not leak into a job: the job gets
@@ -145,29 +176,96 @@ fn sandbox_path(map: &SandboxMap, p: &ClientPath) -> anyhow::Result<PathBuf> {
     map.to_sandbox(p).context("path cannot be mapped into the sandbox")
 }
 
+/// Background removal: first retry after `BASE`, doubling up to `CAP`, at most
+/// `ATTEMPTS` tries (about ten minutes with the defaults).
+const CLEANUP_ATTEMPTS: u32 = 20;
+const CLEANUP_BASE: std::time::Duration = std::time::Duration::from_secs(1);
+const CLEANUP_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Try to remove `dir` until it is gone; `true` when it is. Logs the first
+/// failure and the end, never file names inside the directory.
+fn retry_remove(dir: &Path, attempts: u32, base: std::time::Duration, cap: std::time::Duration) -> bool {
+    let mut delay = base;
+    for attempt in 0..attempts {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => {
+                if attempt > 0 {
+                    tracing::info!("job directory {} removed after {attempt} retries", dir.display());
+                }
+                return true;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(e) => {
+                if attempt == 0 {
+                    tracing::warn!("could not delete job directory {} yet: {e}; retrying in the background", dir.display());
+                }
+            }
+        }
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(cap);
+    }
+    let gone = std::fs::remove_dir_all(dir).is_ok() || !dir.exists();
+    if !gone {
+        tracing::error!("job directory {} still exists after {attempts} attempts; it holds job sources and must be deleted by hand", dir.display());
+    }
+    gone
+}
+
+/// Retry the removal of `dir` on a thread of its own, bounded and logged. A
+/// directory that cannot be removed holds plaintext sources of another
+/// machine, so giving up after one second is not acceptable (CF-9).
+pub fn spawn_cleanup(dir: PathBuf) {
+    let spawned = std::thread::Builder::new()
+        .name("crabfarm-cleanup".into())
+        .spawn({
+            let dir = dir.clone();
+            move || {
+                retry_remove(&dir, CLEANUP_ATTEMPTS, CLEANUP_BASE, CLEANUP_CAP);
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::error!("could not start the cleanup of {}: {e}", dir.display());
+    }
+}
+
 /// Deletes the job directory when dropped. The normal path calls
-/// `remove_job_dir` explicitly (with retries); this covers a dropped future.
+/// `remove_job_dir` explicitly; this covers a dropped future.
 struct DirGuard(PathBuf);
 
 impl Drop for DirGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        match std::fs::remove_dir_all(&self.0) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => spawn_cleanup(self.0.clone()),
+        }
     }
 }
 
 /// Remove the job directory, retrying briefly: on Windows a file stays locked
 /// for a moment after its process exited (virus scanner, handle teardown).
+/// Whatever is still there after that goes to the background cleanup.
 async fn remove_job_dir(dir: &Path) {
-    for attempt in 0..10 {
+    for _ in 0..10 {
         match std::fs::remove_dir_all(dir) {
             Ok(()) => return,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-            Err(e) => {
-                if attempt == 9 {
-                    tracing::warn!("could not delete job directory {}: {e}", dir.display());
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+        }
+    }
+    spawn_cleanup(dir.to_path_buf());
+}
+
+/// Delete everything below `<data>/jobs`: sandboxes a crashed node left
+/// behind. Directories that cannot be removed yet are retried in the
+/// background. Call at node start, before any job runs.
+pub fn sweep_jobs(jobs_dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(jobs_dir) else { return };
+    for e in rd.flatten() {
+        let path = e.path();
+        let removed = if e.file_type().is_ok_and(|t| t.is_dir()) { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+        if removed.is_err() && path.exists() {
+            spawn_cleanup(path);
         }
     }
 }
@@ -330,10 +428,13 @@ pub async fn run(
     events: tokio::sync::mpsc::Sender<ExecEvent>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
-    let job_dir = ctx.jobs_dir.join(job_hex(&spec.job_id));
+    let job_dir = ctx.jobs_dir.join(job_hex(ctx.owner, &spec.job_id));
     let map = SandboxMap::new(job_dir.join("root"));
     validate_spec(spec)?;
     validate_paths(spec, &map)?;
+    // Claimed before anything is deleted: a duplicate (owner, id) must not wipe
+    // the sandbox of the job that is running.
+    let _running = RunningGuard::claim(ctx, spec)?;
     let _guard = DirGuard(job_dir.clone());
     // A directory left by a crashed run would leak old files into this job.
     let _ = std::fs::remove_dir_all(&job_dir);
@@ -421,9 +522,18 @@ async fn run_in_sandbox(
     }
     // After the environment: configure() sets the MAKEFLAGS family.
     ctx.jobserver.client.configure(&mut cmd);
+    crate::proctree::configure(&mut cmd);
     let mut cmd = tokio::process::Command::from(cmd);
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     let mut child = cmd.spawn().with_context(|| format!("spawn rustc for {}", spec.crate_name))?;
+    // Everything rustc starts (linker, cc) is killed with it.
+    let mut tree = match crate::proctree::ProcessTree::adopt(&child) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = child.kill().await;
+            return Err(e.context("track the rustc process tree"));
+        }
+    };
     let stdout = child.stdout.take().context("no stdout pipe")?;
     let stderr = child.stderr.take().context("no stderr pipe")?;
     let (tx, mut rx) = mpsc::channel::<Line>(64);
@@ -458,7 +568,8 @@ async fn run_in_sandbox(
     let status = match outcome {
         Ok(s) => s,
         Err(e) => {
-            // Kill only the child this call spawned.
+            // Kill only the tree of the child this call spawned.
+            tree.kill();
             let _ = child.kill().await;
             for r in &readers {
                 r.abort();
@@ -466,6 +577,7 @@ async fn run_in_sandbox(
             return Err(e);
         }
     };
+    tree.finished();
     let code = status.code().unwrap_or(-1);
 
     // 4. Outputs. After a failed compile the out-dir only holds partial files
@@ -680,7 +792,7 @@ mod tests {
                 assert_eq!(f.store.get(OWNER, &KEY, hash).unwrap(), *data);
             }
         }
-        assert!(!f.jobs.join(job_hex(&spec.job_id)).exists(), "sandbox not deleted");
+        assert!(!f.jobs.join(job_hex(OWNER, &spec.job_id)).exists(), "sandbox not deleted");
     }
 
     #[tokio::test]
@@ -737,7 +849,7 @@ mod tests {
         assert!(matches!(evs.last(), Some(ExecEvent::Exit(code)) if *code != 0), "{evs:?}");
         assert!(evs.iter().any(|e| matches!(e, ExecEvent::Stderr(l) if l.contains("error"))));
         assert!(!evs.iter().any(|e| matches!(e, ExecEvent::Output { .. })), "outputs after a failed compile");
-        assert!(!f.jobs.join(job_hex(&spec.job_id)).exists());
+        assert!(!f.jobs.join(job_hex(OWNER, &spec.job_id)).exists());
     }
 
     /// A stand-in "rustc" that just sleeps: a tiny program compiled with the
@@ -760,6 +872,171 @@ mod tests {
         Installed { rustc: exe, ..f.tc.clone() }
     }
 
+    /// A stand-in "rustc" that starts a sleeping grandchild (like rustc starting
+    /// a linker) and records its pid in the file named by CARGO_CRABFARM_PIDFILE.
+    fn fake_with_grandchild(f: &Fixture) -> Installed {
+        let dir = f._tmp.path().join("fakegc");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("parent.rs");
+        std::fs::write(
+            &src,
+            r#"
+use std::process::{Command, Stdio};
+fn main() {
+    if std::env::args().any(|a| a == "--grandchild") {
+        std::thread::sleep(std::time::Duration::from_secs(120));
+        return;
+    }
+    let exe = std::env::current_exe().unwrap();
+    let child = Command::new(exe).arg("--grandchild").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    std::fs::write(std::env::var("CARGO_CRABFARM_PIDFILE").unwrap(), child.id().to_string()).unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(120));
+}
+"#,
+        )
+        .unwrap();
+        let exe = dir.join(if cfg!(windows) { "parent.exe" } else { "parent" });
+        let st = std::process::Command::new(&f.tc.rustc).arg(&src).arg("-o").arg(&exe).stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap();
+        assert!(st.success());
+        Installed { rustc: exe, ..f.tc.clone() }
+    }
+
+    #[cfg(windows)]
+    fn pid_alive(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        // SAFETY: plain Win32 queries on a handle opened and closed here.
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return false;
+            }
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(h, &mut code);
+            CloseHandle(h);
+            ok != 0 && code == 259 // STILL_ACTIVE
+        }
+    }
+
+    #[cfg(unix)]
+    fn pid_alive(pid: u32) -> bool {
+        // SAFETY: signal 0 only checks existence.
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+
+    /// CF-9: on timeout the whole process tree ends, not only rustc, and the
+    /// sandbox is removed.
+    #[tokio::test]
+    async fn timeout_kills_grandchildren_and_removes_the_sandbox() {
+        let f = fixture();
+        let fake = fake_with_grandchild(&f);
+        let pidfile = f._tmp.path().join("grandchild.pid");
+        let mut spec = lib_spec(&f, SRC, false);
+        spec.env.push(("CARGO_CRABFARM_PIDFILE".into(), EnvValue::Plain(pidfile.to_string_lossy().into_owned())));
+        let c = ctx(&f, Duration::from_millis(3000));
+        let (res, _evs) = collect(&c, &spec, &fake, CancellationToken::new()).await;
+        let err = res.unwrap_err();
+        assert_eq!(err.downcast_ref::<ExecAborted>(), Some(&ExecAborted::Timeout), "{err:#}");
+        let pid: u32 = std::fs::read_to_string(&pidfile).expect("the fake rustc started its grandchild").trim().parse().unwrap();
+        let mut alive = true;
+        for _ in 0..50 {
+            alive = pid_alive(pid);
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if alive {
+            // Clean up our own recorded grandchild before failing the test.
+            #[cfg(windows)]
+            let _ = std::process::Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+        }
+        assert!(!alive, "the grandchild survived the timeout");
+        assert!(!f.jobs.join(job_hex(OWNER, &spec.job_id)).exists(), "sandbox not deleted");
+    }
+
+    /// CF-9: a second request with the same (owner, job id) is refused and must
+    /// not wipe the running job's sandbox; another owner with the same id is fine.
+    #[tokio::test]
+    async fn duplicate_job_is_refused_without_touching_the_running_one() {
+        let f = fixture();
+        let fake = fake_sleeper(&f);
+        let spec = lib_spec(&f, SRC, false);
+        let dir = f.jobs.join(job_hex(OWNER, &spec.job_id));
+        assert_ne!(job_hex(OWNER, &spec.job_id), job_hex(NodeId([8; 16]), &spec.job_id));
+
+        let cancel = CancellationToken::new();
+        let first = {
+            let c = ctx(&f, Duration::from_secs(120));
+            let (spec, fake, cancel) = (spec.clone(), fake.clone(), cancel.clone());
+            let (tx, _rx) = mpsc::channel(1024);
+            async move { run(&c, &spec, &fake, tx, cancel).await }
+        };
+        let canceller = async {
+            // Wait until the first job has its sandbox, then try the duplicate.
+            for _ in 0..100 {
+                if dir.join("root").exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(dir.join("root").exists(), "first job never started");
+            let marker = dir.join("root").join("marker");
+            std::fs::write(&marker, b"alive").unwrap();
+            let c = ctx(&f, Duration::from_secs(120));
+            let (res, evs) = collect(&c, &spec, &fake, CancellationToken::new()).await;
+            let msg = format!("{:#}", res.expect_err("duplicate must be refused"));
+            assert!(msg.contains("already running"), "{msg}");
+            assert!(evs.is_empty());
+            assert!(marker.exists(), "the duplicate wiped the running job's sandbox");
+            cancel.cancel();
+        };
+        let (res, ()) = tokio::join!(first, canceller);
+        assert_eq!(res.unwrap_err().downcast_ref::<ExecAborted>(), Some(&ExecAborted::Cancelled));
+        assert!(!dir.exists());
+    }
+
+    /// CF-9: a directory that cannot be removed at once is retried until it can.
+    #[cfg(windows)]
+    #[test]
+    fn locked_directory_is_removed_once_the_lock_goes() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("job");
+        std::fs::create_dir_all(&dir).unwrap();
+        // share_mode(0): nobody may delete or open the file while this handle lives.
+        let held = std::fs::OpenOptions::new().write(true).create(true).truncate(true).share_mode(0).open(dir.join("locked.rs")).unwrap();
+        assert!(std::fs::remove_dir_all(&dir).is_err(), "the lock must block the removal");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            drop(held);
+        });
+        assert!(retry_remove(&dir, 20, Duration::from_millis(100), Duration::from_millis(200)));
+        assert!(!dir.exists());
+        releaser.join().unwrap();
+        // And it gives up (returns false) while the lock stays.
+        let dir2 = d.path().join("job2");
+        std::fs::create_dir_all(&dir2).unwrap();
+        let _held = std::fs::OpenOptions::new().write(true).create(true).truncate(true).share_mode(0).open(dir2.join("locked.rs")).unwrap();
+        assert!(!retry_remove(&dir2, 3, Duration::from_millis(10), Duration::from_millis(10)));
+        assert!(dir2.exists());
+    }
+
+    #[test]
+    fn sweep_removes_leftover_sandboxes() {
+        let d = tempfile::tempdir().unwrap();
+        let jobs = d.path().join("jobs");
+        std::fs::create_dir_all(jobs.join("aa-bb").join("root").join("C")).unwrap();
+        std::fs::write(jobs.join("aa-bb").join("root").join("C").join("secret.rs"), b"plaintext").unwrap();
+        std::fs::write(jobs.join("stray-file"), b"x").unwrap();
+        sweep_jobs(&jobs);
+        assert_eq!(std::fs::read_dir(&jobs).unwrap().count(), 0);
+    }
+
     #[tokio::test]
     async fn timeout_kills_child_and_cleans_up() {
         let f = fixture();
@@ -773,7 +1050,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(30));
         assert!(matches!(evs.first(), Some(ExecEvent::Started)));
         assert!(!evs.iter().any(|e| matches!(e, ExecEvent::Exit(_))));
-        assert!(!f.jobs.join(job_hex(&spec.job_id)).exists(), "sandbox not deleted after timeout");
+        assert!(!f.jobs.join(job_hex(OWNER, &spec.job_id)).exists(), "sandbox not deleted after timeout");
     }
 
     #[tokio::test]
@@ -791,7 +1068,7 @@ mod tests {
         let (res, _evs) = collect(&c, &spec, &fake, cancel).await;
         let err = res.unwrap_err();
         assert_eq!(err.downcast_ref::<ExecAborted>(), Some(&ExecAborted::Cancelled));
-        assert!(!f.jobs.join(job_hex(&spec.job_id)).exists());
+        assert!(!f.jobs.join(job_hex(OWNER, &spec.job_id)).exists());
     }
 
     #[test]

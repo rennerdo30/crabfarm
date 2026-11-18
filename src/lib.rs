@@ -18,6 +18,7 @@ pub mod transport;
 pub mod cas;
 pub mod exec;
 pub mod guard;
+pub mod proctree;
 pub mod toolchain;
 
 // Package D (integration): node daemon, scheduler, IPC, wrapper flow,

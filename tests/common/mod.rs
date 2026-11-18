@@ -33,6 +33,9 @@ pub enum Behavior {
     PeerCompileError { stderr_line: String },
     /// Accept the `Submit` and never say anything again.
     Silent,
+    /// Like `Silent`, and note whether `watch` already existed when the wrapper
+    /// closed its connection (CF-25: it must close before its rustc writes).
+    SilentWatching { watch: PathBuf },
 }
 
 pub struct Submitted {
@@ -44,6 +47,9 @@ pub struct FakeNode {
     pub submits: Arc<Mutex<Vec<Submitted>>>,
     /// How many `RetryLocal` frames the wrapper sent.
     pub retries: Arc<std::sync::atomic::AtomicUsize>,
+    /// For `SilentWatching`: per closed connection, whether the watched file
+    /// existed at that moment.
+    pub closed_with_file: Arc<Mutex<Vec<bool>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -69,6 +75,8 @@ impl FakeNode {
         let log = submits.clone();
         let retries: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
         let retry_count = retries.clone();
+        let closed_with_file: Arc<Mutex<Vec<bool>>> = Arc::default();
+        let closed_log = closed_with_file.clone();
         let task = tokio::spawn(async move {
             let mut held: Vec<FramedConn<TcpStream>> = Vec::new();
             loop {
@@ -134,12 +142,21 @@ impl FakeNode {
                         }
                     }
                     Behavior::Silent => held.push(conn),
+                    Behavior::SilentWatching { watch } => {
+                        let closed_log = closed_log.clone();
+                        tokio::spawn(async move {
+                            // A silent node that notices the wrapper leaving.
+                            while let Ok(Some(_)) = conn.recv().await {}
+                            closed_log.lock().unwrap().push(watch.exists());
+                        });
+                    }
                 }
             }
         });
         FakeNode {
             submits,
             retries,
+            closed_with_file,
             task,
         }
     }
@@ -222,6 +239,7 @@ pub fn run_wrapper(home: &Path, work: &Path, env: &[(&str, &str)], secs: u64) ->
             || up.starts_with("RUSTC")
             || up == "RUSTFLAGS"
             || up == "CRABFARM_LOG"
+            || up == "CRABFARM_INNER_WRAPPER"
             || up.ends_with("_TOKEN")
         {
             c.env_remove(k);

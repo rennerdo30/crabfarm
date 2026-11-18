@@ -624,11 +624,22 @@ fn submit(
             // it into place early): remove it, so that what is read after the
             // run was certainly written by the local rustc.
             let _ = std::fs::remove_file(&dep_file);
+            // No `RunLocal`: the node did not hand over a slot, so it is silent,
+            // hung or gone. Close the connection BEFORE rustc starts (CF-25):
+            // a node that was only stalled and resumes sees the closed
+            // connection and writes no remote output onto the files this local
+            // rustc is about to write.
+            let mut conn = if reason.is_some() {
+                Some(conn)
+            } else {
+                rt.block_on(close_ipc(conn));
+                None
+            };
             let code = passthrough_skipping(rustc, args, &relayed_notices);
             if code == 0 {
                 learn_env_deps(data_dir, &cand.crate_name, &dep_file, &forwarded);
             }
-            if reason.is_some() {
+            if let Some(conn) = conn.as_mut() {
                 // Releases the local slot the node reserved for this run.
                 let _ = rt.block_on(conn.send(&Message::LocalDone {
                     code,
@@ -638,6 +649,14 @@ fn submit(
             code
         }
     }
+}
+
+/// Shut the IPC connection down and drop it, so the node sees end-of-file now
+/// (bounded: a socket that will not close must not hold the build up).
+async fn close_ipc(mut conn: crate::transport::FramedConn<tokio::net::TcpStream>) {
+    use tokio::io::AsyncWriteExt;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), conn.stream.shutdown()).await;
+    drop(conn);
 }
 
 /// Identity of an artifact notice that survives path rewriting: its emit kind

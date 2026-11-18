@@ -197,7 +197,15 @@ impl Drop for RemoteScope<'_> {
     }
 }
 
+/// How long the node listens for the wrapper's end-of-file before it commits
+/// anything to the client's directories (CF-25).
+const WRAPPER_CHECK: Duration = Duration::from_millis(10);
+
 enum RemoteEnd {
+    /// The wrapper closed its connection (it fell back to a local rustc after
+    /// the node looked silent) or the node is stopping: no output of this job
+    /// is written, the peer was told to stop.
+    WrapperGone,
     /// The final `Exit` was relayed to the wrapper.
     Done,
     /// Nothing usable came back; run locally. The text is for debug logs.
@@ -630,6 +638,14 @@ impl Node {
                 self.local_phase(wrapper, LocalReason::RemoteFailed, &info, live)
                     .await;
             }
+            RemoteEnd::WrapperGone => {
+                tracing::debug!(
+                    crate_name = plan.spec.crate_name.as_str(),
+                    "the wrapper went local, outputs of the remote job dropped"
+                );
+                self.count("wrapper_gone", 1);
+                lock(&self.depgraph).finish(&info.produces, false);
+            }
             RemoteEnd::Tainted => {
                 tracing::info!(
                     crate_name = plan.spec.crate_name.as_str(),
@@ -870,7 +886,7 @@ impl Node {
 
     async fn run_remote(
         self: &Arc<Self>,
-        wrapper: &Link,
+        wrapper: &mut Link,
         plan: &Plan,
         info: &SubmitInfo,
         live: &Liveness,
@@ -901,7 +917,7 @@ impl Node {
     /// Run the job on one open job connection and apply what comes back.
     async fn drive_remote(
         self: &Arc<Self>,
-        wrapper: &Link,
+        wrapper: &mut Link,
         mut link: Link,
         plan: &Plan,
         info: &SubmitInfo,
@@ -926,7 +942,7 @@ impl Node {
 
     async fn drive_remote_inner(
         self: &Arc<Self>,
-        wrapper: &Link,
+        wrapper: &mut Link,
         link: &mut Link,
         plan: &Plan,
         info: &SubmitInfo,
@@ -966,6 +982,13 @@ impl Node {
                 Message::Stderr { line } => {
                     if pending.is_some() {
                         bail!("stderr inside an output transfer");
+                    }
+                    // An early notice moves a staged file into the client's
+                    // directory: only for a wrapper that is still waiting.
+                    if crate::rewrite::artifact(&line).is_some() && self.wrapper_gone(wrapper).await
+                    {
+                        let _ = link.send(Message::Cancel).await;
+                        return Ok(RemoteEnd::WrapperGone);
                     }
                     if let Some((m, early)) = relay.offer(Message::Stderr { line }, style)? {
                         if early {
@@ -1038,6 +1061,10 @@ impl Node {
                         bail!("exit inside an output transfer");
                     }
                     // Files first, then the lines that announce them, then `Exit`.
+                    if self.wrapper_gone(wrapper).await {
+                        let _ = link.send(Message::Cancel).await;
+                        return Ok(RemoteEnd::WrapperGone);
+                    }
                     let ok = code == 0;
                     let held = {
                         let mut r = std::mem::take(&mut relay);
@@ -1076,6 +1103,15 @@ impl Node {
                 _ => bail!("unexpected message from the peer"),
             }
         }
+    }
+
+    /// The wrapper that submitted this job went away (it ran rustc itself after
+    /// a silence, or died), or the node is shutting down. Checked immediately
+    /// before anything is written to the client's directories: a node that was
+    /// only stalled and resumes must not rename remote outputs onto files the
+    /// wrapper's local rustc is writing (CF-25).
+    async fn wrapper_gone(&self, wrapper: &mut Link) -> bool {
+        self.shutdown.is_cancelled() || wrapper.peer_gone(WRAPPER_CHECK).await
     }
 
     async fn upload_blobs(

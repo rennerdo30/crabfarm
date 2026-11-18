@@ -961,6 +961,7 @@ mod tests {
                 executable: false,
             }],
             extra_env: Vec::new(),
+            build_env: Vec::new(),
             dirs: vec![cp(&out)],
             out_dir: cp(&out),
             crate_name: "fixture".into(),

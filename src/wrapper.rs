@@ -259,19 +259,68 @@ pub fn forwarded_env(
     out
 }
 
-// ------------------------------------------------------------- crate kinds
+// ------------------------------------------------------ build-script output
 
-/// True when the crate's source lies under `CARGO_HOME` (registry, git
-/// checkouts): its errors are authoritative (DESIGN section 10).
-pub fn is_registry_crate(input: &ClientPath, cargo_home: Option<&ClientPath>) -> bool {
-    cargo_home.is_some_and(|h| input.starts_with(h))
+/// Names a build script asked cargo to set for rustc (CF-21).
+///
+/// Syntax, from the cargo book, "Build Scripts" > "Outputs of the Build Script"
+/// (doc.rust-lang.org/cargo/reference/build-scripts.html#outputs-of-the-build-script):
+/// `cargo::rustc-env=VAR=VALUE` (and the older single-colon spelling
+/// `cargo:rustc-env=VAR=VALUE`) sets `VAR` to `VALUE` for the crate's rustc and
+/// `env!`. Only the NAME is taken: the value is whatever cargo put into this
+/// wrapper's own environment, so nothing read from the file is ever sent.
+///
+/// The text comes from a file in the user's target directory, so it is capped
+/// (names, count) and every name is validated like the executor does
+/// (`guard::build_env_name_ok`); malformed lines are ignored.
+pub fn parse_build_env_names(stdout: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in stdout.lines() {
+        let rest = line
+            .strip_prefix("cargo::rustc-env=")
+            .or_else(|| line.strip_prefix("cargo:rustc-env="));
+        let Some((name, _value)) = rest.and_then(|r| r.split_once('=')) else {
+            continue;
+        };
+        if crate::guard::build_env_name_ok(name) && !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
+            if out.len() == crate::guard::MAX_BUILD_ENV {
+                break;
+            }
+        }
+    }
+    out
 }
 
-fn cargo_home() -> Option<ClientPath> {
-    let p = std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| directories::BaseDirs::new().map(|b| b.home_dir().join(".cargo")))?;
-    ClientPath::from_local(&p, Path::new("."))
+/// The output file cargo wrote for the build script run of the package whose
+/// `OUT_DIR` is `out_dir`, or `None` when it is not there. Layouts:
+/// - current: `<build>/<pkg>/<hash>/out`, output in `<build>/<pkg>/<hash>/run/stdout`;
+/// - older: `<build>/<pkg>-<hash>/out`, output in `<build>/<pkg>-<hash>/output`.
+///
+/// Both files are written by cargo from the build script's stdout. Nothing is
+/// guessed: any other shape of `OUT_DIR` yields `None`.
+pub fn build_script_output_file(out_dir: &Path) -> Option<PathBuf> {
+    if out_dir.file_name()? != "out" {
+        return None;
+    }
+    let unit = out_dir.parent()?;
+    [unit.join("run").join("stdout"), unit.join("output")]
+        .into_iter()
+        .find(|p| p.is_file())
+}
+
+/// Largest build-script output read; anything bigger is ignored.
+const MAX_BUILD_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Names the local build-script output declares with `rustc-env`. `None` when
+/// the file cannot be found or read while `OUT_DIR` is set.
+fn build_env_names_from_out_dir(out_dir: &Path) -> Option<Vec<String>> {
+    let file = build_script_output_file(out_dir)?;
+    if std::fs::metadata(&file).ok()?.len() > MAX_BUILD_OUTPUT_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(&file).ok()?;
+    Some(parse_build_env_names(&String::from_utf8_lossy(&bytes)))
 }
 
 /// `-C extra-filename=X` in any of the spellings cargo and users write.
@@ -349,11 +398,8 @@ pub fn missing_env_deps(
 enum Verdict {
     /// Finished; exit with this code.
     Exit(i32),
-    /// Run rustc here. `printed` is true when remote stderr was already shown.
-    Local {
-        printed: bool,
-        reason: Option<LocalReason>,
-    },
+    /// Run rustc here (nothing of the remote diagnostics was printed).
+    Local { reason: Option<LocalReason> },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -382,7 +428,27 @@ fn submit(
 
     // Only what cargo sets for rustc and what the user listed travels (CF-18).
     // Names recorded from an earlier local build of this crate are NOT added.
-    let env = forwarded_env(std::env::vars(), &cfg.forward_env);
+    //
+    // Names the crate's own build script emitted as `rustc-env` (CF-21) travel
+    // too, found in the output cargo wrote locally for this package.
+    let build_names = match std::env::var_os("OUT_DIR") {
+        Some(out_dir) => {
+            let names = build_env_names_from_out_dir(Path::new(&out_dir));
+            if names.is_none() && std::env::var_os("CRABFARM_LOG").is_some() {
+                // Not guessed: a missing name makes the remote compile fail and
+                // the local rerun (DESIGN section 10) builds the crate.
+                eprintln!(
+                    "crabfarm: stat build_script_output_missing {}",
+                    cand.crate_name
+                );
+            }
+            names.unwrap_or_default()
+        }
+        None => Vec::new(),
+    };
+    let mut allowed = cfg.forward_env.clone();
+    allowed.extend(build_names.iter().cloned());
+    let env = forwarded_env(std::env::vars(), &allowed);
     let forwarded: HashSet<String> = env.iter().map(|(k, _)| k.to_ascii_uppercase()).collect();
     // A variable this crate was seen to read (from a `.d` file the local rustc
     // wrote) that is set now but would not reach the peer: build locally.
@@ -390,17 +456,22 @@ fn submit(
         std::env::var_os(n).is_some()
     })
     .is_empty();
-    // Names beyond DESIGN section 9; the executor accepts only these.
-    let extra_env: Vec<String> = env
+    // Names beyond DESIGN section 9; the executor accepts only these. A name the
+    // build script declared is `build_env` (source-stamped), everything else
+    // beyond the allow-list came from `forward_env`.
+    let is_build = |k: &str| build_names.iter().any(|b| b.eq_ignore_ascii_case(k));
+    let beyond: Vec<String> = env
         .iter()
         .map(|(k, _)| k.clone())
         .filter(|k| !crate::guard::design_env(k))
         .collect();
+    let build_env: Vec<String> = beyond.iter().filter(|k| is_build(k)).cloned().collect();
+    let extra_env: Vec<String> = beyond.into_iter().filter(|k| !is_build(k)).collect();
     // A job that stays local carries no environment at all.
-    let (env, extra_env) = if force_local {
-        (Vec::new(), Vec::new())
+    let (env, extra_env, build_env) = if force_local {
+        (Vec::new(), Vec::new(), Vec::new())
     } else {
-        (env, extra_env)
+        (env, extra_env, build_env)
     };
     let spec = JobSpec {
         job_id: JobId({
@@ -413,6 +484,7 @@ fn submit(
         args: cand.args.clone(),
         cwd: cwd_client,
         extra_env,
+        build_env,
         env,
         inputs: Vec::new(),
         dirs: Vec::new(),
@@ -435,10 +507,11 @@ fn submit(
         return passthrough(rustc, args);
     }
 
-    let registry = is_registry_crate(&cand.input, cargo_home().as_ref());
     let dep_file = dep_info_file(&cand, expanded);
+    // Diagnostics of every crate stay buffered until the remote result is known
+    // (CF-21): any remote failure is judged by a local run, registry crates
+    // included (they compile with `--cap-lints allow`, so little is buffered).
     let mut buffered: Vec<(bool, String)> = Vec::new();
-    let mut printed = false;
     let mut local_retry_allowed = true;
     // Artifact notices cargo has already seen for this job (CF-16): a local
     // rerun rewrites the files but must not announce them a second time.
@@ -453,17 +526,13 @@ fn submit(
         let msg = match rt.block_on(ipc::recv_within(&mut conn, ipc::NODE_SILENCE_LIMIT)) {
             Some(m) => m,
             None => {
-                break Verdict::Local {
-                    printed,
-                    reason: None,
-                };
+                break Verdict::Local { reason: None };
             }
         };
         match msg {
             Message::Keepalive => {}
             Message::RunLocal { reason } => {
                 break Verdict::Local {
-                    printed,
                     reason: Some(reason),
                 };
             }
@@ -491,29 +560,18 @@ fn submit(
                     }
                     if !stale_early {
                         relayed_notices.insert(notice_key(&file, &emit));
-                        printed |= registry;
                         write_line(false, &line);
                     }
                 }
-                _ if registry => {
-                    printed = true;
-                    write_line(false, &line);
-                }
                 _ => buffered.push((false, line)),
             },
-            Message::Stdout { line } => {
-                if registry {
-                    printed = true;
-                    write_line(true, &line);
-                } else {
-                    buffered.push((true, line));
-                }
-            }
+            Message::Stdout { line } => buffered.push((true, line)),
             Message::Exit { code } => {
-                if code != 0 && !registry && local_retry_allowed {
-                    // A path or git crate may fail remotely for reasons that
-                    // are not real (inputs outside the package directory):
-                    // judge it by a local run (DESIGN section 10).
+                if code != 0 && local_retry_allowed {
+                    // A crate may fail remotely for reasons that are not real
+                    // (inputs outside the package directory, an environment
+                    // variable that did not travel): judge it by a local run,
+                    // for registry and path crates alike (DESIGN section 10).
                     buffered.clear();
                     if rt
                         .block_on(conn.send(&Message::RetryLocal {
@@ -521,10 +579,7 @@ fn submit(
                         }))
                         .is_err()
                     {
-                        break Verdict::Local {
-                            printed: false,
-                            reason: None,
-                        };
+                        break Verdict::Local { reason: None };
                     }
                     local_retry_allowed = false;
                     continue;
@@ -544,10 +599,7 @@ fn submit(
                             }))
                             .is_err()
                         {
-                            break Verdict::Local {
-                                printed: false,
-                                reason: None,
-                            };
+                            break Verdict::Local { reason: None };
                         }
                         local_retry_allowed = false;
                         continue;
@@ -560,20 +612,14 @@ fn submit(
             }
             // A node that answers with anything else is not one to rely on.
             _ => {
-                break Verdict::Local {
-                    printed,
-                    reason: None,
-                };
+                break Verdict::Local { reason: None };
             }
         }
     };
 
     match verdict {
         Verdict::Exit(code) => code,
-        Verdict::Local { printed, reason } => {
-            if printed {
-                eprintln!("crabfarm: remote job failed, rerunning locally");
-            }
+        Verdict::Local { reason } => {
             // The dep-info at this path may be the peer's (the submitter moves
             // it into place early): remove it, so that what is read after the
             // run was certainly written by the local rustc.
@@ -660,7 +706,6 @@ fn write_line(stdout: bool, line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::PathStyle;
 
     fn v(s: &str) -> String {
         s.to_string()
@@ -838,17 +883,86 @@ mod tests {
     }
 
     #[test]
-    fn registry_detection_uses_cargo_home() {
-        let home = ClientPath::parse(PathStyle::Posix, "/home/u/.cargo").unwrap();
-        let reg = ClientPath::parse(
-            PathStyle::Posix,
-            "/home/u/.cargo/registry/src/x/serde/src/lib.rs",
-        )
-        .unwrap();
-        let own = ClientPath::parse(PathStyle::Posix, "/home/u/proj/src/lib.rs").unwrap();
-        assert!(is_registry_crate(&reg, Some(&home)));
-        assert!(!is_registry_crate(&own, Some(&home)));
-        assert!(!is_registry_crate(&reg, None));
+    fn build_script_output_names_both_syntaxes() {
+        let out = "\
+cargo:rerun-if-changed=build.rs\n\
+cargo:rustc-env=CF_BUILT=yes\n\
+cargo::rustc-env=CF_NEW=a=b\n\
+cargo:rustc-cfg=foo\n\
+cargo:rustc-env=CF_BUILT=again\r\n\
+cargo::rustc-env=CF_CRLF=1\r\n";
+        assert_eq!(
+            parse_build_env_names(out),
+            vec![v("CF_BUILT"), v("CF_NEW"), v("CF_CRLF")]
+        );
+    }
+
+    #[test]
+    fn build_script_output_malformed_lines_are_ignored() {
+        let out = "\
+cargo:rustc-env=NOVALUE\n\
+cargo:rustc-env==x\n\
+cargo:rustc-env=1BAD=x\n\
+cargo:rustc-env=A-B=x\n\
+cargo:rustc-env=PATH=/evil\n\
+cargo:rustc-env=RUSTC_WRAPPER=x\n\
+cargo:rustc-env=CARGO_HOME=x\n\
+cargo:rustc-env=LD_PRELOAD=x\n\
+\x20cargo:rustc-env=INDENTED=x\n\
+cargo:rustc-envFOO=x\n\
+cargo:rustc-cdylib-link-arg=X=1\n\
+cargo:warning=rustc-env=W=1\n\
+cargo:rustc-env=OK_NAME=\n";
+        assert_eq!(parse_build_env_names(out), vec![v("OK_NAME")]);
+    }
+
+    #[test]
+    fn build_script_output_caps_names() {
+        let long = "A".repeat(crate::guard::MAX_BUILD_ENV_NAME + 1);
+        let fits = "B".repeat(crate::guard::MAX_BUILD_ENV_NAME);
+        let mut out = format!("cargo:rustc-env={long}=x\ncargo:rustc-env={fits}=x\n");
+        for i in 0..200 {
+            out.push_str(&format!("cargo:rustc-env=V{i}=x\n"));
+        }
+        let names = parse_build_env_names(&out);
+        assert_eq!(names.len(), crate::guard::MAX_BUILD_ENV);
+        assert_eq!(names[0], fits);
+        assert!(!names.contains(&long));
+    }
+
+    #[test]
+    fn build_script_output_is_found_in_both_cargo_layouts() {
+        let t = tempfile::tempdir().unwrap();
+        // Current layout: <build>/<pkg>/<hash>/out with run/stdout.
+        let unit = t.path().join("pkg").join("abc123");
+        std::fs::create_dir_all(unit.join("out")).unwrap();
+        std::fs::create_dir_all(unit.join("run")).unwrap();
+        assert_eq!(build_script_output_file(&unit.join("out")), None);
+        std::fs::write(unit.join("run").join("stdout"), "cargo:rustc-env=NEW_L=1\n").unwrap();
+        assert_eq!(
+            build_script_output_file(&unit.join("out")),
+            Some(unit.join("run").join("stdout"))
+        );
+        assert_eq!(
+            build_env_names_from_out_dir(&unit.join("out")),
+            Some(vec![v("NEW_L")])
+        );
+        // Older layout: <build>/<pkg>-<hash>/out with `output`.
+        let old = t.path().join("pkg-def456");
+        std::fs::create_dir_all(old.join("out")).unwrap();
+        assert_eq!(build_script_output_file(&old.join("out")), None);
+        std::fs::write(old.join("output"), "cargo:rustc-env=OLD_L=1\n").unwrap();
+        assert_eq!(
+            build_script_output_file(&old.join("out")),
+            Some(old.join("output"))
+        );
+        assert_eq!(
+            build_env_names_from_out_dir(&old.join("out")),
+            Some(vec![v("OLD_L")])
+        );
+        // An OUT_DIR of any other shape is not guessed at.
+        assert_eq!(build_script_output_file(&unit), None);
+        assert_eq!(build_script_output_file(&t.path().join("elsewhere")), None);
     }
 
     #[test]

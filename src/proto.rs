@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bump on any incompatible change to these types.
-pub const PROTO_VERSION: u16 = 3;
+pub const PROTO_VERSION: u16 = 4;
 /// Maximum encoded frame size in bytes.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// Blob transfer chunk size (plaintext bytes before compression).
@@ -129,6 +129,13 @@ pub struct JobSpec {
     /// executor accepts only the fixed list plus these (and never `PATH`,
     /// loader or wrapper variables, even when listed). Added with CF-8.
     pub extra_env: Vec<String>,
+    /// Added in protocol 4 (CF-21): names in `env` that the crate's own build
+    /// script emitted as `cargo:rustc-env=NAME=VALUE` (read by the wrapper from
+    /// the build-script output cargo wrote locally; values are cargo's own,
+    /// taken from the wrapper's environment). The executor accepts them without
+    /// `accept_env` because their source is stamped, but never on the
+    /// never-list (`guard::build_env_name_ok`).
+    pub build_env: Vec<String>,
     pub inputs: Vec<InputFile>,
     /// Directories that must exist (out-dir, OUT_DIR, -L dirs).
     pub dirs: Vec<ClientPath>,
@@ -585,6 +592,7 @@ mod tests {
             no_retain: false,
             needs_host: false,
             extra_env: vec![],
+            build_env: vec![],
         };
         let job = format!(
             "{:?}",

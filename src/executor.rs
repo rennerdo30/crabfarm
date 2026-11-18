@@ -303,6 +303,7 @@ mod tests {
             cwd: p.clone(),
             env: Vec::new(),
             extra_env: Vec::new(),
+            build_env: Vec::new(),
             inputs: vec![InputFile {
                 path: p.clone(),
                 hash,

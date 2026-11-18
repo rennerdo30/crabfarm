@@ -63,6 +63,7 @@ fn spec(dir: &Path) -> JobSpec {
         cwd: p.clone(),
         env: Vec::new(),
         extra_env: Vec::new(),
+        build_env: Vec::new(),
         inputs: Vec::new(),
         dirs: Vec::new(),
         out_dir: p,

@@ -309,9 +309,24 @@ fn two_nodes_build_the_fixture_remotely() {
         dump()
     );
 
+    // CF-21: `util` reads `env!("CF_BUILT")`, which its build script sets with
+    // `cargo:rustc-env`. The name travels with the job, so the peer compiles it.
+    assert_eq!(
+        lines.next(),
+        Some("built=yes"),
+        "env! of a build-script variable broke\n{}",
+        dump()
+    );
+
     let mut c = crabfarm(&home1);
     c.arg("status");
     let st = run(c, 20);
+    assert!(
+        !st.stdout.contains("RemoteCompileErrorRetry"),
+        "a crate failed remotely and was rerun locally (the build-script env did not travel?):\n{}\n{}",
+        st.stdout,
+        dump()
+    );
     assert!(
         st.stdout.contains("SandboxPathInOutput 1"),
         "exactly one job (embed) should be rerun for its sandbox path:\n{}\n{}",

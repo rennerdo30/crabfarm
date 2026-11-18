@@ -516,10 +516,12 @@ fn never_forward(name: &str) -> bool {
         || up.starts_with("RUSTDOC")
         || up.starts_with("RUSTUP")
         || up.starts_with("CARGO_MAKEFLAGS")
+        || up.starts_with("CARGO_REGISTR")
         || matches!(
             up.as_str(),
             "PATH"
                 | "PATHEXT"
+                | "CARGO_HOME"
                 | "RUSTFLAGS"
                 | "MAKEFLAGS"
                 | "MFLAGS"
@@ -550,6 +552,25 @@ pub fn extra_env_name_ok(name: &str) -> bool {
     !never_forward(name)
 }
 
+/// Most names a job may declare in `build_env` (CF-21), on both sides.
+pub const MAX_BUILD_ENV: usize = 64;
+/// Longest `build_env` name.
+pub const MAX_BUILD_ENV_NAME: usize = 128;
+
+/// A name the wrapper may declare in `build_env` and the executor accepts:
+/// environment-variable syntax (`[A-Za-z_][A-Za-z0-9_]*`, at most
+/// [`MAX_BUILD_ENV_NAME`] bytes) and not on the never-list. The same function
+/// runs on both sides, so what the wrapper sends is what the executor accepts.
+pub fn build_env_name_ok(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.len() <= MAX_BUILD_ENV_NAME
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !never_forward(name)
+}
+
 /// What the executing node decides on its own, never what the job says.
 pub struct Policy<'a> {
     /// Host triple of the toolchain that would run the job.
@@ -564,9 +585,11 @@ pub struct Policy<'a> {
     pub case_insensitive: bool,
 }
 
-/// Check the job environment (CF-8, CF-18, CF-19).
+/// Check the job environment (CF-8, CF-18, CF-19, CF-21).
 ///
-/// Every variable must be on the allow-list (`design_env`) or be declared in
+/// Every variable must be on the allow-list (`design_env`), be declared in
+/// `build_env` (names the crate's own build script emitted; accepted without
+/// operator listing, subject to the never-list), or be declared in
 /// `extra_env` AND listed in the operator's `accept_env`; the hard floor
 /// (`never_forward`: `PATH`, loader, wrapper and machine variables) holds even
 /// then, and a declared name may not override a variable of the peer's own
@@ -584,11 +607,22 @@ pub fn validate_env(spec: &JobSpec, policy: &Policy) -> Result<(), String> {
             return Err("job declares a variable this node does not accept".into());
         }
     }
+    if spec.build_env.len() > MAX_BUILD_ENV {
+        return Err("job declares too many build-script variables".into());
+    }
+    for n in &spec.build_env {
+        // Same rule as for `extra_env`: a declared name never overrides what
+        // the peer itself has set (the job then runs on the submitter).
+        if !build_env_name_ok(n) || (policy.node_has)(n) {
+            return Err("job declares a build-script variable this node does not accept".into());
+        }
+    }
     for (k, v) in &spec.env {
         if never_forward(k) && !k.eq_ignore_ascii_case("RUSTC_BOOTSTRAP") {
             return Err("job sets a variable the farm does not forward".into());
         }
-        let declared = spec.extra_env.iter().any(|e| e.eq_ignore_ascii_case(k));
+        let declared = spec.extra_env.iter().any(|e| e.eq_ignore_ascii_case(k))
+            || spec.build_env.iter().any(|e| e.eq_ignore_ascii_case(k));
         if !design_env(k) && !declared {
             return Err("job sets a variable that is not forwarded".into());
         }
@@ -773,6 +807,7 @@ mod tests {
             cwd: cp(r"C:\w"),
             env: env.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
             extra_env: extra.iter().map(|s| s.to_string()).collect(),
+            build_env: Vec::new(),
             inputs: Vec::new(),
             dirs: Vec::new(),
             out_dir: cp(r"C:\w\target\deps"),
@@ -848,6 +883,69 @@ mod tests {
                 &Policy {
                     peer_host: "h",
                     accept_env: &none_accepted,
+                    node_has: &has,
+                    case_insensitive: false,
+                }
+            )
+            .is_err()
+        );
+    }
+
+    /// CF-21: names the crate's build script emitted travel in `build_env` and
+    /// need no `accept_env`; the never-list and the cap still hold, and nothing
+    /// outside allow-list + declared names gets through.
+    #[test]
+    fn build_env_names_are_accepted_by_source_not_by_operator_list() {
+        let mut ok = spec(
+            vec![("CF_BUILT", plain("yes")), ("CARGO_PKG_NAME", plain("x"))],
+            &[],
+        );
+        // Not declared anywhere: refused.
+        assert!(ve(&ok, &[]).is_err());
+        ok.build_env = vec!["CF_BUILT".into()];
+        assert_eq!(ve(&ok, &[]), Ok(()));
+        // A name in env that is not declared stays refused next to a declared one.
+        ok.env.push(("OTHER".into(), plain("v")));
+        assert!(ve(&ok, &[]).is_err());
+        // The never-list holds even when declared.
+        for bad in [
+            "PATH",
+            "Path",
+            "RUSTC_WRAPPER",
+            "RUSTDOCFLAGS",
+            "CARGO_HOME",
+            "CARGO_REGISTRY_TOKEN",
+            "CARGO_REGISTRIES_X_TOKEN",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "MAKEFLAGS",
+            "CARGO_MAKEFLAGS",
+        ] {
+            let mut s = spec(vec![(bad, plain("x"))], &[]);
+            s.build_env = vec![bad.into()];
+            assert!(ve(&s, &[bad]).is_err(), "{bad} declared in build_env");
+        }
+        // Syntax and caps.
+        for bad in ["", "1X", "A-B", "A=B", "A B", &"A".repeat(129)] {
+            let mut s = spec(vec![], &[]);
+            s.build_env = vec![bad.into()];
+            assert!(ve(&s, &[]).is_err(), "{bad:?}");
+        }
+        let mut s = spec(vec![], &[]);
+        s.build_env = (0..=MAX_BUILD_ENV).map(|i| format!("V{i}")).collect();
+        assert!(ve(&s, &[]).is_err(), "count cap");
+        s.build_env.truncate(MAX_BUILD_ENV);
+        assert_eq!(ve(&s, &[]), Ok(()));
+        // A declared name never overrides the peer's own variable.
+        let mut s = spec(vec![("CF_BUILT", plain("yes"))], &[]);
+        s.build_env = vec!["CF_BUILT".into()];
+        let has = |n: &str| n == "CF_BUILT";
+        assert!(
+            validate_env(
+                &s,
+                &Policy {
+                    peer_host: "h",
+                    accept_env: &[],
                     node_has: &has,
                     case_insensitive: false,
                 }

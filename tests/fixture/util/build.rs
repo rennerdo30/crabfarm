@@ -8,4 +8,6 @@ fn main() {
     let generated = "pub const GENERATED: &str = \"from-build-script\";\nfn generated_but_unused() {}\n";
     std::fs::write(out.join("generated.rs"), generated).expect("write generated.rs");
     println!("cargo:rerun-if-changed=build.rs");
+    // CF-21: a value the crate reads with `env!`; it only exists because of this line.
+    println!("cargo:rustc-env=CF_BUILT=yes");
 }

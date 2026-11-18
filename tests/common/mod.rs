@@ -28,6 +28,9 @@ pub enum Behavior {
         dep_file_name: String,
         dep_info: String,
     },
+    /// Pretend a peer failed to compile: send `stderr_line` as a diagnostic and
+    /// `Exit { code: 1 }`, and serve a `RetryLocal` with `RunLocal`.
+    PeerCompileError { stderr_line: String },
     /// Accept the `Submit` and never say anything again.
     Silent,
 }
@@ -39,6 +42,8 @@ pub struct Submitted {
 
 pub struct FakeNode {
     pub submits: Arc<Mutex<Vec<Submitted>>>,
+    /// How many `RetryLocal` frames the wrapper sent.
+    pub retries: Arc<std::sync::atomic::AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -62,6 +67,8 @@ impl FakeNode {
         std::fs::write(home.join("ipc.port"), port.to_string()).expect("port");
         let submits: Arc<Mutex<Vec<Submitted>>> = Arc::default();
         let log = submits.clone();
+        let retries: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+        let retry_count = retries.clone();
         let task = tokio::spawn(async move {
             let mut held: Vec<FramedConn<TcpStream>> = Vec::new();
             loop {
@@ -113,11 +120,28 @@ impl FakeNode {
                             drain(&mut conn).await;
                         }
                     }
+                    Behavior::PeerCompileError { stderr_line } => {
+                        let _ = conn.send(&Message::Stderr { line: stderr_line }).await;
+                        let _ = conn.send(&Message::Exit { code: 1 }).await;
+                        if let Ok(Some(Message::RetryLocal { .. })) = conn.recv().await {
+                            retry_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let _ = conn
+                                .send(&Message::RunLocal {
+                                    reason: LocalReason::RemoteCompileErrorRetry,
+                                })
+                                .await;
+                            drain(&mut conn).await;
+                        }
+                    }
                     Behavior::Silent => held.push(conn),
                 }
             }
         });
-        FakeNode { submits, task }
+        FakeNode {
+            submits,
+            retries,
+            task,
+        }
     }
 
     pub fn submitted(&self) -> usize {

@@ -166,7 +166,13 @@ async fn start_farm(
                 else {
                     return;
                 };
-                let mut tick = tokio::time::interval(Duration::from_secs(5));
+                // `interval` ticks at once; that pushed a status frame onto a job
+                // connection before `Reserved` and made the node give up on this
+                // peer (the cause of this file's flakiness, CF-27). First push later.
+                let mut tick = tokio::time::interval_at(
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                    Duration::from_secs(5),
+                );
                 loop {
                     tokio::select! {
                         m = conn.recv() => match m {
@@ -312,7 +318,15 @@ async fn answer_after_wrapper(keep_wrapper: bool) -> (PathBuf, bool) {
     conn.send(&submit_for(&work, &tc)).await.unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     while !peer.job_seen.load(Ordering::SeqCst) {
-        assert!(Instant::now() < deadline, "the job never reached the peer");
+        assert!(
+            Instant::now() < deadline,
+            "the job never reached the peer
+{}
+--- node.log ---
+{}",
+            String::from_utf8_lossy(&crabfarm(&home).arg("status").output().unwrap().stdout),
+            std::fs::read_to_string(home.join("logs").join("node.log")).unwrap_or_default()
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let target = work.join("out").join("libx-abc.rlib");

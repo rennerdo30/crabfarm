@@ -695,7 +695,9 @@ impl Node {
                 }
             }
             RemoteEnd::Fallback(why) => {
-                tracing::debug!(
+                // Info, not debug: a fallback is counted and its reason is what
+                // anyone investigating `RemoteFailed` needs (CF-27).
+                tracing::info!(
                     crate_name = plan.spec.crate_name.as_str(),
                     "remote job failed: {why}"
                 );
@@ -953,14 +955,25 @@ impl Node {
                 let me = me.clone();
                 async move {
                     let (pid, _hello, conn) =
-                        crate::transport::connect(&me.tls, &me.id, &a).await.ok()?;
-                    (pid == peer).then_some(conn)
+                        match crate::transport::connect(&me.tls, &me.id, &a).await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::info!("job link to a peer address failed: {e:#}");
+                                return None;
+                            }
+                        };
+                    if pid != peer {
+                        tracing::info!("job link reached another node than the one asked for");
+                        return None;
+                    }
+                    Some(conn)
                 }
             },
         );
         while let Some((addr, conn)) = race.next().await {
             let mut link = Link::new(conn);
-            if link.send(Message::Reserve { job_id }).await.is_err() {
+            if let Err(e) = link.send(Message::Reserve { job_id }).await {
+                tracing::info!("could not send Reserve: {e:#}");
                 continue;
             }
             let wait = deadline.min(tokio::time::Instant::now() + RESERVE_WAIT);
@@ -974,7 +987,10 @@ impl Node {
                     return Some(link);
                 }
                 Ok(Some(Message::Busy { .. })) => return None,
-                _ => continue,
+                _ => {
+                    tracing::info!("no Reserved from the peer (closed, too slow or another frame)");
+                    continue;
+                }
             }
         }
         None

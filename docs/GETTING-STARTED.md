@@ -1,6 +1,6 @@
 # Getting started
 
-Build Rust projects on your notebook with the cores of your desktop. This guide takes you from nothing to a working farm in about ten minutes. Everything here is per user: no admin rights are needed, except the optional firewall command in step 4.
+Build Rust projects on your notebook with the cores of your desktop. This guide takes you from nothing to a working farm in about ten minutes. Everything here is per user: no admin rights are needed, except the Windows Firewall rule in step 4, which only the desktop needs.
 
 You need: two or more machines you own, on the same network (or a VPN), and Rust installed on each (`rustup`).
 
@@ -49,7 +49,7 @@ The first line should say `farm: 1 of 1 peers online` and show the desktop's fre
 
 ## 4. The Windows Firewall question
 
-The first time the node listens on the network, Windows asks whether to allow `crabfarmd`. Tick **Private networks** only and allow it. Do this on the desktop at least (it is the machine that works for the others).
+The first time the node listens on the network, Windows asks whether to allow `crabfarmd`. Tick **Private networks** only and allow it. Do this on the desktop (it is the machine that works for the others). Answering the prompt needs **administrator rights**: on a managed notebook where you are a standard user you cannot.
 
 If the prompt never appeared, or you are on a Public network profile, an administrator can add the rule once (admin PowerShell):
 
@@ -57,7 +57,13 @@ If the prompt never appeared, or you are on a Public network profile, an adminis
 netsh advfirewall firewall add rule name="crabfarm" dir=in action=allow program="%LOCALAPPDATA%\Programs\crabfarm\crabfarmd.exe" protocol=TCP localport=47070 profile=private
 ```
 
-The notebook only needs outgoing connections if it just sends work to the desktop, but allowing the rule on both is simplest.
+A notebook that only SENDS work needs no firewall rule: it connects outward to the desktop (every job connection and the control connection are opened by the machine that wants the work done, and the nodes dial each other, so one direction is enough). On such a notebook, put this in its `config.toml` (step 5 shows where) so it never accepts jobs from others:
+
+```toml
+accept_remote_jobs = false
+```
+
+If you also want to avoid the prompt entirely, let the notebook listen on the loopback address only (`listen = "127.0.0.1:47070"`); nothing then listens on the network. The notebook must still reach the desktop: add it under `peers` (step 5), because discovery on the local network may be blocked by the notebook's firewall too. (Checked in the code: job and control connections to a peer are opened outbound by the submitting node; not tried on a managed Windows notebook.)
 
 ## 5. VPN, Tailscale or another network
 
@@ -88,15 +94,17 @@ Pick one of three ways. Try A first, then use B.
 crabfarm cargo build --release
 ```
 
+`cargo crabfarm build --release` does exactly the same (cargo runs the `cargo-crabfarm` program the installer puts next to `crabfarm`).
+
 **B. Per project (recommended).** In the project folder:
 
 ```powershell
 crabfarm enable
 ```
 
-This adds two lines to `.cargo/config.toml` of that project (`rustc-wrapper` and `jobs`, nothing else is changed, your comments stay). From then on plain `cargo build`, `cargo check` and `cargo test` use the farm. It prints the `jobs` value it chose (your cores plus the free cores in the farm) and how to change it: `crabfarm enable --jobs 40`. Undo with `crabfarm disable`.
+This adds two lines to `.cargo/config.toml` of that project (`rustc-wrapper` and `jobs`; three when you already use a wrapper such as `sccache`, which is kept on a line of its own, see below; nothing else is changed, your comments stay). From then on plain `cargo build`, `cargo check` and `cargo test` use the farm. It prints the `jobs` value it chose (your cores plus the free cores in the farm) and how to change it: `crabfarm enable --jobs 40`. Undo with `crabfarm disable`.
 
-Run it in the folder that holds the project's `Cargo.toml`; for a workspace, run it in the workspace root. If you already use a wrapper such as `sccache`, crabfarm keeps it for the compiles that happen on your own machine and restores your setting on `crabfarm disable`.
+Run it anywhere inside the project: in a workspace it writes to the workspace root (cargo ignores a `.cargo/config.toml` inside a member), and it prints which directory it chose. If you already use a wrapper such as `sccache` (in the project, a parent folder or `%USERPROFILE%\.cargo\config.toml`), crabfarm keeps it for the compiles that happen on your own machine and restores your setting on `crabfarm disable`. If the environment variable `RUSTC_WRAPPER` or `CARGO_BUILD_RUSTC_WRAPPER` is set, cargo uses that instead of the config file: `enable` warns, and crabfarm is not used until you unset it.
 
 Commit the file or not: it contains the path of `crabfarm.exe` on your machine, so most people add `.cargo/config.toml` to `.gitignore` instead of sharing it.
 
@@ -152,7 +160,7 @@ local because: NoPeer 2, ...
 - **`the node is not running`**: run `crabfarm service status`. If autostart is off: `crabfarm service install`. Or start it by hand in a terminal with `crabfarm node` and read what it says.
 - **Everything runs locally (`NoPeer`)**: the machines do not see each other. Check the firewall (step 4), that both are on the same network, or add `peers` (step 5).
 - **First build is slow**: the first time, the desktop may have to install the Rust version your project needs (via `rustup`). That can take a few minutes once.
-- **Version mismatch**: an error like `peer speaks protocol 3, this node speaks 4` means two machines run different crabfarm versions. Install the same version on both.
+- **Version mismatch**: an error like `peer speaks protocol 4, this node speaks 5` means two machines run different crabfarm versions. Install the same version on both.
 - **The log**: `%APPDATA%\renner\crabfarm\data\logs\node.log`. If the node does not start at all, the reason is the last lines of that file. It holds crate names, sizes and timings, never your code.
 - **Stop the node**: `crabfarm node --stop`.
 
@@ -160,7 +168,7 @@ local because: NoPeer 2, ...
 
 Settings, then Apps, then crabfarm, then Uninstall (or run `uninstall.exe` in `%LOCALAPPDATA%\Programs\crabfarm`). It stops the node, turns autostart off and removes crabfarm from PATH. Your farm identity and cache stay unless you tick **Also delete my farm identity and cache** on the uninstall page; keeping them lets a reinstall rejoin the same farm.
 
-Run `crabfarm disable` (or `crabfarm disable --global`) in projects where you used `crabfarm enable` first, otherwise cargo will complain that the wrapper `crabfarm.exe` is gone.
+The uninstaller removes a global entry (`crabfarm enable --global`) that points at this install. Entries made with `crabfarm enable` **inside projects** are not found by it: run `crabfarm disable` in each of those projects BEFORE uninstalling (or install crabfarm again and run it then), otherwise cargo complains that the wrapper `crabfarm.exe` is gone.
 
 ---
 
@@ -172,4 +180,4 @@ Install from a terminal. It never uses sudo and puts the programs in `~/.local/b
 curl -fsSL https://github.com/rennerdo30/crabfarm/releases/latest/download/install.sh | sh
 ```
 
-(or download `install.sh` and the archive, then `sh install.sh ./crabfarm-<version>-<target>.tar.gz`). Make sure `~/.local/bin` is on your `PATH`: `crabfarm path add` prints the line to add to your shell profile. Then follow the same steps as above; `crabfarm service install` makes the node start at login (a LaunchAgent on macOS, a systemd user service on Linux). Paths differ: the config is `~/.local/share/crabfarm/config.toml` on Linux and `~/Library/Application Support/dev.renner.crabfarm/config.toml` on macOS.
+(or download `install.sh` and the archive, then `sh install.sh ./crabfarm-<version>-<target>.tar.gz`). `cargo crabfarm` works too (`cargo-crabfarm` is installed next to `crabfarm`). Make sure `~/.local/bin` is on your `PATH`: `crabfarm path add` prints the line to add to your shell profile. Then follow the same steps as above; `crabfarm service install` makes the node start at login (a LaunchAgent on macOS, a systemd user service on Linux). Paths differ: the config is `~/.local/share/crabfarm/config.toml` on Linux and `~/Library/Application Support/dev.renner.crabfarm/config.toml` on macOS.

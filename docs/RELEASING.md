@@ -4,17 +4,18 @@ Every release needs the owner's yes. The script prepares and tags the commit, CI
 
 ## Versions
 
-One version, `version` under `[package]` in `Cargo.toml`, following SemVer.
-- Prereleases look like `0.2.0-beta.1`. Their tags have a `-` and become GitHub prereleases.
-- A stable `0.2.0` ranks above every `0.2.0-...`.
+One version, `version` under `[package]` in `Cargo.toml`, following SemVer. The first release is **1.0.0** (owner, 2026-11-19).
+- Prereleases look like `1.1.0-beta.1`. Their tags have a `-` and become GitHub prereleases.
+- A stable `1.1.0` ranks above every `1.1.0-...`.
+- The tag name must match `^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$`; `release.yml` refuses anything else, including a `workflow_dispatch` input.
 
 ## Cutting a release
 
 From a clean checkout of `main` that matches `origin/main`:
 
 ```powershell
-./scripts/release.ps1 -Version 0.2.0 -DryRun   # reports what would stop it; changes nothing
-./scripts/release.ps1 -Version 0.2.0
+./scripts/release.ps1 -Version 1.0.0 -DryRun   # reports what would stop it; changes nothing
+./scripts/release.ps1 -Version 1.0.0
 ```
 
 Set the public commit identity in the environment first (`GIT_AUTHOR_*` and `GIT_COMMITTER_*`; the script never writes Git config and refuses anything but a GitHub noreply address).
@@ -27,16 +28,16 @@ The script:
 5. commits `Release X.Y.Z` and creates the annotated tag `vX.Y.Z`;
 6. pushes with explicit refs: `git push origin HEAD:refs/heads/main`, then `git push origin refs/tags/vX.Y.Z`.
 
-The first release may use the version already in `Cargo.toml` (0.1.0), or a prerelease of it (`0.1.0-rc.1`, see the dry run below).
+The first release is 1.0.0, the version already in `Cargo.toml`, or a prerelease of it (`1.0.0-rc.1`, see the dry run below).
 
 ## Dry run before the first real release
 
 Run the whole pipeline once with a release candidate tag, so the first public release is not also the first run of `release.yml`:
 
-1. Add a line to `## Unreleased` in `CHANGELOG.md` if it is empty, then `./scripts/release.ps1 -Version 0.1.0-rc.1`. The tag has a `-`, so CI builds all six packages and creates a **draft prerelease** only; nothing is published.
-2. Check the draft: six archives, `SHA256SUMS.txt`, the notes, and `gh attestation verify <archive> --repo rennerdo30/crabfarm`. Unpack one and run `crabfarm --version`.
-3. Delete the draft (GitHub, Releases) and the tag (`git push origin :refs/tags/v0.1.0-rc.1`, then `git tag -d v0.1.0-rc.1`; the owner's yes, since it removes a remote ref). The `Release 0.1.0-rc.1` commit stays on `main`.
-4. Put the fixes the candidate showed into `## Unreleased` and cut `0.1.0` as usual.
+1. Add a line to `## Unreleased` in `CHANGELOG.md` if it is empty, then `./scripts/release.ps1 -Version 1.0.0-rc.1`. The tag has a `-`, so CI builds all six packages and creates a **draft prerelease** only; nothing is published.
+2. Check the draft: six archives, `SHA256SUMS.txt`, the notes, and `gh attestation verify <archive> --repo rennerdo30/crabfarm`. Unpack one and run `crabfarm --version` and `cargo-crabfarm crabfarm --version`.
+3. Delete the draft (GitHub, Releases) and the tag (`git push origin :refs/tags/v1.0.0-rc.1`, then `git tag -d v1.0.0-rc.1`; the owner's yes, since it removes a remote ref). The `Release 1.0.0-rc.1` commit stays on `main`.
+4. Put the fixes the candidate showed into `## Unreleased` and cut `1.0.0` as usual.
 
 Never run the crates.io workflow for a candidate.
 
@@ -55,10 +56,11 @@ On the tag push:
   | `x86_64-apple-darwin` | `macos-15-intel` | `.tar.gz` |
   | `aarch64-apple-darwin` | `macos-latest` | `.tar.gz` |
 
-  Each archive is named `crabfarm-<version>-<target>` and holds `crabfarm`, `crabfarmd`, `LICENSE` and `README.md`.
-- The `installer` job (`windows-latest`) builds `crabfarm-<version>-setup.exe` with `scripts/package.ps1` (NSIS 3.13, fetched and hash-checked by `scripts/fetch-nsis.ps1`), runs the full lifecycle (`scripts/test-installer.ps1`: silent install, reinstall over a running node, `node --stop`, uninstall with and without `/DELETEDATA`) and uploads the setup and `scripts/install.sh`. Both are attested and listed in `SHA256SUMS.txt`. The same lifecycle runs on every pull request (`ci.yml`, job `windows installer lifecycle`); it refuses to run outside GitHub Actions.
+  Each archive is named `crabfarm-<version>-<target>` and holds `crabfarm`, `crabfarmd`, `cargo-crabfarm`, `LICENSE` and `README.md`.
+- The `installer` job (`windows-latest`) builds `crabfarm-<version>-setup.exe` with `scripts/package.ps1` (NSIS 3.13, fetched and hash-checked by `scripts/fetch-nsis.ps1`), runs the full lifecycle (`scripts/test-installer.ps1`: silent install, reinstall over a running node, uninstall with the node running, an upgrade while another process holds `crabfarm.exe` open, uninstall with and without `/DELETEDATA`, and the user PATH value and type identical before and after) and uploads the setup and `scripts/install.sh`. Both are attested and listed in `SHA256SUMS.txt`. The same lifecycle runs on every pull request (`ci.yml`, job `windows installer lifecycle`); it refuses to run anywhere but a GitHub-hosted runner (`GITHUB_ACTIONS=true` and `RUNNER_ENVIRONMENT=github-hosted`) and when crabfarm is already installed there.
 - It attaches signed build provenance to every archive (GitHub artifact attestations, `actions/attest-build-provenance`; the `id-token` and `attestations` permissions exist only in that job). Verify a download with `gh attestation verify <archive> --repo rennerdo30/crabfarm`.
 - It writes one `SHA256SUMS.txt` over all archives and creates a **draft** release with the changelog section as notes.
+- Before the draft is created the tag is resolved again and compared with the verified commit; a tag that moved in between stops the release.
 - Rerunning it (Actions, release, Run workflow, with the tag) refreshes a draft and never touches a published release.
 
 `macos-15-intel` is the last Intel Mac runner label GitHub offers on the free tier. When it is retired, build `x86_64-apple-darwin` on `macos-latest` after `rustup target add x86_64-apple-darwin`.
@@ -69,7 +71,7 @@ The owner reviews the draft and publishes it.
 
 ## Local test package
 
-`./scripts/package.ps1 -Version 0.1.0-rc.1` compiles and runs `makensis` only; it installs nothing and changes no PATH, registry or autostart. `-Version` names the packages and the version the installer shows; `Cargo.toml` is untouched and the binaries keep reporting its version. Output: `artifacts/installer/` (git-ignored): the setup, the zip and `SHA256SUMS.txt`. Installing it is the tester's decision on the tester's machine.
+`./scripts/package.ps1 -Version 1.0.0-rc.1` compiles and runs `makensis` only (it needs `-MakeNsis <makensis.exe>` or the environment variable `CRABFARM_MAKENSIS`; without either it fetches the pinned NSIS into the git-ignored `artifacts/tools` cache); it installs nothing and changes no PATH, registry or autostart. `-Version` names the packages and the version the installer shows; `Cargo.toml` is untouched and the binaries keep reporting its version. Output: `artifacts/installer/` (git-ignored): the setup, the zip and `SHA256SUMS.txt`. Installing it is the tester's decision on the tester's machine.
 
 ## crates.io
 

@@ -36,6 +36,15 @@ jobs:
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
     steps:
+      # Before anything uses the name: only a version tag is accepted, whether
+      # it came from a tag push or from the workflow_dispatch input.
+      - name: Tag name is a version tag
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$RELEASE_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "Tag name is not vX.Y.Z or vX.Y.Z-pre.N; refusing to build it." >&2
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ env.RELEASE_TAG }}
@@ -125,6 +134,8 @@ jobs:
           cp "target/release/$exe" "dist/$dir/"
           # The node without a console window (autostart and the installer start it).
           cp "target/release/${exe/crabfarm/crabfarmd}" "dist/$dir/"
+          # `cargo crabfarm <args>` = `crabfarm cargo <args>`.
+          cp "target/release/${exe/crabfarm/cargo-crabfarm}" "dist/$dir/"
           cp LICENSE README.md "dist/$dir/"
           echo "PKG_DIR=$dir" >> "$GITHUB_ENV"
       - name: Archive (tar.gz)
@@ -222,6 +233,20 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: The tag still points at the verified commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERIFIED_SHA: ${{ needs.verify.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Resolve the tag again (annotated tags included) and compare: a tag
+          # moved after the verify job must not get a release with these files.
+          now=$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)
+          if [ "$now" != "$VERIFIED_SHA" ]; then
+            echo "Tag $RELEASE_TAG moved since it was verified (${VERIFIED_SHA:0:7} -> ${now:0:7}); no draft created." >&2
+            exit 1
+          fi
       - name: Create or refresh the draft
         env:
           GH_TOKEN: ${{ github.token }}
@@ -234,7 +259,7 @@ jobs:
           awk -v v="$version" '$0 ~ "^## "v"[[:space:]]*$" {on=1; next} /^## / {on=0} on' CHANGELOG.md > notes.md || true
           {
             echo
-            echo "**Install:** on Windows run the \`-setup.exe\` (per user, no admin rights); on macOS and Linux run \`sh install.sh\` (or unpack the archive for your platform and put \`crabfarm\` and \`crabfarmd\` on your PATH); or run \`cargo install crabfarm\`. Guide: https://crabfarm.renner.dev/guide.html"
+            echo "**Install:** on Windows run the \`-setup.exe\` (per user, no admin rights); on macOS and Linux run \`sh install.sh\` (or unpack the archive for your platform and put \`crabfarm\`, \`crabfarmd\` and \`cargo-crabfarm\` on your PATH); or run \`cargo install crabfarm\`. Guide: https://crabfarm.renner.dev/guide.html"
             echo "Check every download against SHA256SUMS.txt, or verify its provenance with \`gh attestation verify <archive> --repo $GH_REPO\`."
           } >> notes.md
           flags=(--draft --verify-tag --title "crabfarm $RELEASE_TAG" --notes-file notes.md)

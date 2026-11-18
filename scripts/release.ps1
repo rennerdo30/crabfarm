@@ -23,9 +23,9 @@
     what the script would refuse, and prints the planned edits.
 
 .EXAMPLE
-    ./scripts/release.ps1 -Version 0.1.0 -DryRun
+    ./scripts/release.ps1 -Version 1.0.0-rc.1 -DryRun
 .EXAMPLE
-    ./scripts/release.ps1 -Version 0.1.0
+    ./scripts/release.ps1 -Version 1.0.0
 #>
 [CmdletBinding()]
 param(
@@ -110,8 +110,8 @@ $goesUp = if ($new.Core -ne $old.Core) { $new.Core -gt $old.Core }
           elseif (-not $new.Pre) { $true }          # 0.2.0 ranks above 0.2.0-beta.1
           elseif (-not $old.Pre) { $false }
           else { [string]::CompareOrdinal($new.Pre, $old.Pre) -gt 0 }
-# The first release has nothing to go up from: Cargo.toml still says 0.1.0 and may be released as is,
-# or as a prerelease of it (0.1.0-rc.1, the dry run in docs/RELEASING.md).
+# The first release has nothing to go up from: Cargo.toml says 1.0.0 and may be released as is,
+# or as a prerelease of it (1.0.0-rc.1, the dry run in docs/RELEASING.md).
 $firstRelease = -not (Invoke-Git tag --list 'v*')
 if (-not $goesUp -and -not ($firstRelease -and $new.Core -eq $old.Core)) {
     Fail "Version $Version does not go up from $current."

@@ -41,7 +41,7 @@
         <a class="btn primary" href="#install">Install</a>
         <a class="btn" href="https://github.com/rennerdo30/crabfarm">View the source</a>
       </div>
-      <p class="status"><strong>Early version.</strong> The first release distributes builds between Windows machines. Mixed-OS farms and proc macros on other systems are planned; see <a href="#platforms">Platforms</a>.</p>
+      <p class="status"><strong>crabfarm 1.0</strong> distributes builds between Windows machines. Mixed-OS farms (without proc macros) and proc macros on other systems are planned; see <a href="#platforms">Platforms</a>.</p>
     </div>
 
     <figure class="diagram">
@@ -182,7 +182,7 @@
     <table>
       <thead><tr><th>Phase</th><th>What works</th><th>Status</th></tr></thead>
       <tbody>
-        <tr><td>1</td><td>Windows to Windows farms: discovery, join, TLS, distributed library crates, fallback to local</td><td><span class="tag now">first release</span></td></tr>
+        <tr><td>1</td><td>Windows to Windows farms: discovery, join, TLS, distributed library crates, fallback to local</td><td><span class="tag now">1.0</span></td></tr>
         <tr><td>2</td><td>Jobs across operating systems (without proc macros), result cache, live status, opt-in autostart</td><td><span class="tag">planned</span></td></tr>
         <tr><td>3</td><td>Proc macros compiled for the machine that runs the job</td><td><span class="tag">planned</span></td></tr>
       </tbody>
@@ -194,7 +194,7 @@
 <section id="install" class="alt">
   <div class="wrap">
     <h2>Install</h2>
-    <p class="sub">Two programs: <code>crabfarm</code> and <code>crabfarmd</code> (the node, without a console window). Put them on every machine of the farm.</p>
+    <p class="sub">Three programs: <code>crabfarm</code>, <code>crabfarmd</code> (the node, without a console window) and <code>cargo-crabfarm</code> (so that <code>cargo crabfarm build</code> works like <code>crabfarm cargo build</code>). Put them on every machine of the farm.</p>
     <div class="install">
       <div>
         <h3>Windows: the setup</h3>

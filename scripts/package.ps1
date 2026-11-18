@@ -8,7 +8,7 @@
 #
 # -Version names the packages and the version the installer shows (Installed
 # apps, the setup's title). It defaults to the version in Cargo.toml. A test
-# package such as 0.1.0-rc.1 is built from a 0.1.0 tree this way: only the
+# package such as 1.0.0-rc.1 is built from a 1.0.0 tree this way: only the
 # package name and the installer text change, the binaries still report the
 # Cargo.toml version, and Cargo.toml itself is never touched.
 #

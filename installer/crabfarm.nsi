@@ -1,6 +1,6 @@
 ; crabfarm per-user Windows setup (NSIS 3). Built by scripts/package.ps1:
-;   makensis /DVERSION=0.1.0 /DVI_VERSION=0.1.0.0 /DSRC=<dir> /DOUTFILE=<file> installer\crabfarm.nsi
-; SRC holds crabfarm.exe, crabfarmd.exe, crabfarm.ico, LICENSE.txt and
+;   makensis /DVERSION=1.0.0 /DVI_VERSION=1.0.0.0 /DSRC=<dir> /DOUTFILE=<file> installer\crabfarm.nsi
+; SRC holds crabfarm.exe, crabfarmd.exe, cargo-crabfarm.exe, crabfarm.ico, LICENSE.txt and
 ; GETTING-STARTED.md.
 ;
 ; Installs to %LOCALAPPDATA%\Programs\crabfarm without admin rights, with an

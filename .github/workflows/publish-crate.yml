@@ -10,7 +10,7 @@ name: publish-crate
 # --no-verify so no compiled code ever runs next to the token.
 # crates.io Trusted Publishing (OIDC, no stored token) needs the crate to
 # exist already (Rust blog, 2025-07-11: publish the first release manually);
-# docs/RELEASING.md describes the switch after 0.1.0.
+# docs/RELEASING.md describes the switch after 1.0.0.
 on:
   workflow_dispatch:
     inputs:

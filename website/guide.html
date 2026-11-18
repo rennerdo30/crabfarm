@@ -24,7 +24,7 @@
 <div class="wrap">
 <main>
   <h1>Getting started</h1>
-  <p>Build Rust projects on your notebook with the cores of your desktop. This takes about ten minutes. Everything is per user: no admin rights, except the optional firewall command in step 4. You need two or more machines you own, on the same network or a VPN, with Rust (<code>rustup</code>) on each.</p>
+  <p>Build Rust projects on your notebook with the cores of your desktop. This takes about ten minutes. Everything is per user: no admin rights, except the Windows Firewall rule in step 4, which only the desktop needs. You need two or more machines you own, on the same network or a VPN, with Rust (<code>rustup</code>) on each.</p>
 
   <h2>1. Install on the desktop</h2>
   <ol>
@@ -46,8 +46,9 @@ crabfarm status</pre>
   <p>The first line of <code>status</code> should say <code>farm: 1 of 1 peers online</code>.</p>
 
   <h2>4. The Windows Firewall question</h2>
-  <p>The first time the node listens on the network Windows asks whether to allow <code>crabfarmd</code>. Tick <em>Private networks</em> only. If the prompt never appeared, an administrator can add the rule once (admin PowerShell):</p>
+  <p>The first time the node listens on the network Windows asks whether to allow <code>crabfarmd</code>. Tick <em>Private networks</em> only. Answering it needs administrator rights, which a standard user on a managed notebook does not have. If the prompt never appeared, an administrator can add the rule once (admin PowerShell):</p>
 <pre>netsh advfirewall firewall add rule name="crabfarm" dir=in action=allow program="%LOCALAPPDATA%\Programs\crabfarm\crabfarmd.exe" protocol=TCP localport=47070 profile=private</pre>
+  <p>A notebook that only <em>sends</em> work needs no rule: it connects outward to the desktop. Put <code>accept_remote_jobs = false</code> in its <code>config.toml</code> (step 5 shows where) so it never accepts jobs from others, and add the desktop under <code>peers</code>. To avoid the prompt entirely, also set <code>listen = "127.0.0.1:47070"</code> on the notebook. (Checked in the code; not tried on a managed Windows notebook.)</p>
 
   <h2>5. VPN, Tailscale or another network</h2>
   <p>On one local network the machines find each other. Across a VPN, list the others in <code>%APPDATA%\renner\crabfarm\data\config.toml</code>:</p>
@@ -56,14 +57,15 @@ crabfarm status</pre>
 
   <h2>6. Use it in a project</h2>
   <h3>A. One command, nothing changed</h3>
-<pre>crabfarm cargo build --release</pre>
+<pre>crabfarm cargo build --release
+cargo crabfarm build --release   # the same</pre>
   <h3>B. Per project (recommended)</h3>
 <pre>crabfarm enable</pre>
-  <p>Adds <code>rustc-wrapper</code> and <code>jobs</code> to the project's <code>.cargo/config.toml</code>, keeps your comments and other settings, and prints the <code>jobs</code> value it chose with how to change it (<code>crabfarm enable --jobs 40</code>). Plain <code>cargo build</code>, <code>check</code> and <code>test</code> then use the farm. An existing wrapper such as <code>sccache</code> keeps working for local compiles and comes back on <code>crabfarm disable</code>. The file holds the path of <code>crabfarm.exe</code> on your machine, so most people git-ignore it.</p>
+  <p>Adds <code>rustc-wrapper</code> and <code>jobs</code> (three lines when you already use a wrapper such as <code>sccache</code>, which is kept on its own line) to the <code>.cargo/config.toml</code> of the project, or of the workspace root when you run it in a member (it prints the folder it chose), keeps your comments and other settings, and prints the <code>jobs</code> value it chose with how to change it (<code>crabfarm enable --jobs 40</code>). Plain <code>cargo build</code>, <code>check</code> and <code>test</code> then use the farm. An existing wrapper such as <code>sccache</code> keeps working for local compiles and comes back on <code>crabfarm disable</code>. The file holds the path of <code>crabfarm.exe</code> on your machine, so most people git-ignore it.</p>
   <h3>C. Everywhere</h3>
 <pre>crabfarm enable --global</pre>
   <p>Same, in <code>%USERPROFILE%\.cargo\config.toml</code>; undo with <code>crabfarm disable --global</code>. Without a running node, builds simply run locally.</p>
-  <p><strong>IDE:</strong> with B or C, rust-analyzer's background <code>cargo check</code> also runs with crabfarm as the wrapper. If an editor misbehaves, run <code>crabfarm disable</code> in the project. Tools that set <code>RUSTC_WRAPPER</code> themselves override the config file; crabfarm is then simply not used.</p>
+  <p><strong>IDE:</strong> with B or C, rust-analyzer's background <code>cargo check</code> also runs with crabfarm as the wrapper. If an editor misbehaves, run <code>crabfarm disable</code> in the project. If <code>RUSTC_WRAPPER</code> or <code>CARGO_BUILD_RUSTC_WRAPPER</code> is set in the environment it overrides the config file: <code>enable</code> warns and crabfarm is not used until you unset it.</p>
 
   <h2>7. Work repositories</h2>
   <p>crabfarm sends your project's source to your own machines to compile it. It is encrypted and only farm members can connect, but a peer sees the plaintext source it compiles and runs the proc macros, so every member must be a machine you control. If your employer restricts where code may be copied, check that a second company machine is allowed; a private desktop at home is not.</p>
@@ -84,12 +86,12 @@ sensitive  = ['C:\Work']                  # sent, but peers delete it after each
     <li><strong>The node is not running:</strong> <code>crabfarm service status</code>; <code>crabfarm service install</code> to turn autostart on and start it, or <code>crabfarm node</code> in a terminal to see what it says.</li>
     <li><strong>Everything runs locally (<code>NoPeer</code>):</strong> the machines do not see each other. Check the firewall (step 4), the network, or add <code>peers</code> (step 5).</li>
     <li><strong>The first build is slow:</strong> the desktop may have to install the Rust version your project needs, once.</li>
-    <li><strong>Version mismatch</strong> (<code>peer speaks protocol 3, this node speaks 4</code>): install the same crabfarm version on both machines.</li>
+    <li><strong>Version mismatch</strong> (<code>peer speaks protocol 4, this node speaks 5</code>): install the same crabfarm version on both machines.</li>
     <li><strong>The log:</strong> <code>%APPDATA%\renner\crabfarm\data\logs\node.log</code> holds crate names, sizes and timings, never your code.</li>
   </ul>
 
   <h2>10. Uninstall</h2>
-  <p>Run <code>crabfarm disable</code> in projects where you used <code>enable</code>, then Settings, Apps, crabfarm, Uninstall. It stops the node, turns autostart off and removes crabfarm from PATH. Your farm identity and cache stay unless you tick <em>Also delete my farm identity and cache</em>.</p>
+  <p>Run <code>crabfarm disable</code> in every project where you used <code>crabfarm enable</code> first (the uninstaller only removes a global entry that points at this install), then Settings, Apps, crabfarm, Uninstall. It stops the node, turns autostart off and removes crabfarm from PATH. Your farm identity and cache stay unless you tick <em>Also delete my farm identity and cache</em>.</p>
 
   <h2>macOS and Linux</h2>
 <pre>curl -fsSL https://github.com/rennerdo30/crabfarm/releases/latest/download/install.sh | sh</pre>

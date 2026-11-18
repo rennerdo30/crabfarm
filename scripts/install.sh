@@ -3,11 +3,11 @@
 # ~/.local/bin (override: CRABFARM_BIN_DIR). Edits no shell profile, no PATH.
 #
 #   sh install.sh                      latest release from GitHub
-#   sh install.sh ./crabfarm-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+#   sh install.sh ./crabfarm-1.0.0-x86_64-unknown-linux-gnu.tar.gz
 #                                      a local archive (SHA256SUMS.txt next to it is checked)
 #
 # Environment (all optional):
-#   CRABFARM_VERSION        release to download, for example 0.1.0 (default: latest)
+#   CRABFARM_VERSION        release to download, for example 1.0.0 (default: latest)
 #   CRABFARM_BIN_DIR        where to install (default: $HOME/.local/bin)
 #   CRABFARM_TARGET         override the detected target triple
 #   CRABFARM_SKIP_VERIFY=1  install a local archive without a SHA256SUMS.txt
@@ -108,11 +108,13 @@ mkdir "$tmp/x"
 tar -xzf "$archive" -C "$tmp/x" || die "could not unpack $archive"
 cli=$(find "$tmp/x" -type f -name crabfarm | head -n 1)
 daemon=$(find "$tmp/x" -type f -name crabfarmd | head -n 1)
+sub=$(find "$tmp/x" -type f -name cargo-crabfarm | head -n 1)
 [ -n "$cli" ] || die "the archive has no crabfarm program"
 [ -n "$daemon" ] || die "the archive has no crabfarmd program (a release older than the installer?)"
+[ -n "$sub" ] || die "the archive has no cargo-crabfarm program (a release older than 1.0?)"
 
 mkdir -p "$bin_dir" || die "cannot create $bin_dir"
-for pair in "$cli:crabfarm" "$daemon:crabfarmd"; do
+for pair in "$cli:crabfarm" "$daemon:crabfarmd" "$sub:cargo-crabfarm"; do
   src=${pair%%:*}
   dst="$bin_dir/${pair##*:}"
   # Copy beside, then rename: a running node keeps its old file until it restarts.
@@ -120,7 +122,7 @@ for pair in "$cli:crabfarm" "$daemon:crabfarmd"; do
 done
 
 say ""
-say "Installed crabfarm and crabfarmd into $bin_dir"
+say "Installed crabfarm, crabfarmd and cargo-crabfarm into $bin_dir"
 case ":$PATH:" in
   *":$bin_dir:"*) ;;
   *) say "$bin_dir is not on your PATH yet. Add this line to ~/.profile, ~/.zshrc or ~/.bashrc:"
@@ -131,5 +133,6 @@ say "Next steps:"
 say "  crabfarm farm create          on the first machine (or: crabfarm farm join <code> on the others)"
 say "  crabfarm service install      start the node at login (no sudo)"
 say "  crabfarm enable               in a Rust project, so plain cargo build uses the farm"
+say "  cargo crabfarm build          the same as crabfarm cargo build, without enable"
 say "Guide: https://crabfarm.renner.dev/guide.html"
 say "If a node is already running from an older install, restart it: crabfarm node --stop, then crabfarm service install"

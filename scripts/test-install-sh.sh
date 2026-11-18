@@ -17,6 +17,7 @@ sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' '
 mkdir -p "$tmp/rel/$name"
 printf '#!/bin/sh\necho crabfarm 9.9.9\n' > "$tmp/rel/$name/crabfarm"
 printf '#!/bin/sh\necho crabfarmd\n' > "$tmp/rel/$name/crabfarmd"
+printf '#!/bin/sh\necho cargo-crabfarm\n' > "$tmp/rel/$name/cargo-crabfarm"
 tar -C "$tmp/rel" -czf "$tmp/rel/$name.tar.gz" "$name"
 rm -rf "$tmp/rel/$name"
 printf '%s  %s\n' "$(sha "$tmp/rel/$name.tar.gz")" "$name.tar.gz" > "$tmp/rel/SHA256SUMS.txt"
@@ -25,7 +26,7 @@ run() { CRABFARM_TARGET=$target CRABFARM_BIN_DIR="$tmp/bin" sh "$here/install.sh
 
 echo "1. local archive with checksum"
 run "$tmp/rel/$name.tar.gz" > "$tmp/out1" 2>&1 || { cat "$tmp/out1"; fail "install failed"; }
-[ -x "$tmp/bin/crabfarm" ] && [ -x "$tmp/bin/crabfarmd" ] || fail "programs not installed"
+[ -x "$tmp/bin/crabfarm" ] && [ -x "$tmp/bin/crabfarmd" ] && [ -x "$tmp/bin/cargo-crabfarm" ] || fail "programs not installed"
 [ "$("$tmp/bin/crabfarm")" = "crabfarm 9.9.9" ] || fail "wrong program installed"
 grep -q "not on your PATH" "$tmp/out1" || fail "no PATH hint"
 

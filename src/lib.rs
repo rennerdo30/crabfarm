@@ -8,6 +8,7 @@ pub mod inputs;
 pub mod paths;
 pub mod rewrite;
 pub mod rustc_args;
+pub mod secfile;
 
 // Package B: identity, transport, discovery.
 pub mod discovery;

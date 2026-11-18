@@ -25,26 +25,9 @@ pub fn token_path(data_dir: &Path) -> PathBuf {
     data_dir.join("ipc.token")
 }
 
-/// Write a file other users must not read (Unix: 0600 from creation; Windows
-/// inherits the per-user data directory ACL).
+/// Write a file other users must not read (see `secfile`).
 pub fn write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
-    use std::io::Write;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts
-        .open(path)
-        .with_context(|| format!("create {}", path.display()))?;
-    f.write_all(data)
-        .with_context(|| format!("write {}", path.display()))?;
-    Ok(())
+    crate::secfile::write_private(path, data)
 }
 
 /// Server side: bind a loopback port, generate a fresh token and publish both.

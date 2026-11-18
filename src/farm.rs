@@ -84,34 +84,9 @@ fn random_bytes<const N: usize>() -> [u8; N] {
 
 // ---------------------------------------------------------------- files
 
-/// Write a secret file owner-only. Unix: mode 0600 from creation. Windows:
-/// the file lives in the per-user data dir and inherits the profile ACL;
-/// explicit ACL hardening is P2. The content goes to a temp file first so a
-/// crash never leaves a truncated key under the real name.
+/// Write a secret file for the current user only (see `secfile`).
 fn write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
-    use std::io::Write;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    let mut tmp_name = path.file_name().context("file name")?.to_os_string();
-    tmp_name.push(".tmp");
-    let tmp = path.with_file_name(tmp_name);
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts
-        .open(&tmp)
-        .with_context(|| format!("create {}", tmp.display()))?;
-    f.write_all(data)
-        .with_context(|| format!("write {}", tmp.display()))?;
-    f.sync_all().ok();
-    drop(f);
-    std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
-    Ok(())
+    crate::secfile::write_private(path, data)
 }
 
 fn read_opt(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {

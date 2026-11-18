@@ -4,6 +4,7 @@
 //! wrapper a local slot.
 
 use crate::cas::{self, Assembler};
+use crate::ccache::{self, CacheKey, Captured, EntryOutput};
 use crate::depgraph::is_proc_macro_lib;
 use crate::inputs::{self, CollectError};
 use crate::link::Link;
@@ -25,19 +26,25 @@ const RESERVE_WAIT: Duration = Duration::from_secs(10);
 /// Everything up to "slot reserved" (connect, handshake, reserve) for one job,
 /// over all addresses and both targets (CF-27).
 const OPEN_DEADLINE: Duration = Duration::from_secs(12);
+/// Asking the farm for a cache entry (DESIGN section 16): the whole ask, the
+/// peers asked, asks in flight, and the pause for a peer that did not answer.
+const CACHE_ASK_DEADLINE: Duration = Duration::from_millis(300);
+const CACHE_ASK_PEERS: usize = 8;
+pub(crate) const CACHE_ASK_CONCURRENCY: usize = 16;
+const CACHE_SLOW_PAUSE: Duration = Duration::from_secs(30);
 /// The address that worked last time gets this head start over the others.
 const ADDR_HEAD_START: Duration = Duration::from_millis(300);
 
 /// Connects to several addresses at once and hands out the successes in the
 /// order they finish. Dropping it cancels the connects that are still running.
-struct Race<T> {
+pub(crate) struct Race<T> {
     set: tokio::task::JoinSet<Option<(String, T)>>,
     deadline: tokio::time::Instant,
 }
 
 impl<T: 'static> Race<T> {
     /// The next success, or `None` when all failed or the deadline passed.
-    async fn next(&mut self) -> Option<(String, T)> {
+    pub(crate) async fn next(&mut self) -> Option<(String, T)> {
         loop {
             match tokio::time::timeout_at(self.deadline, self.set.join_next()).await {
                 Ok(Some(Ok(Some(found)))) => return Some(found),
@@ -253,13 +260,44 @@ impl Drop for RemoteScope<'_> {
 /// anything to the client's directories (CF-25).
 const WRAPPER_CHECK: Duration = Duration::from_millis(10);
 
+/// What a finished remote job or cache replay hands back (DESIGN section 16).
+#[derive(Default)]
+struct DoneInfo {
+    /// The result, ready to become a cache entry once the wrapper has accepted it.
+    capture: Option<Captured>,
+    /// Output bytes that were applied.
+    bytes: u64,
+}
+
+/// Where the frames of a run come from.
+enum Source<'a> {
+    /// A job on a peer.
+    Job { plan: &'a Plan, target: NodeId },
+    /// A cache entry, replayed as if a peer had run the job.
+    Cache(Origin),
+}
+
+/// Whose cache a hit came from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    Local,
+    Farm,
+}
+
+/// A job whose result may enter the compile cache: its key and the spec the
+/// key was made from (with the inputs).
+struct CacheCtx {
+    key: CacheKey,
+    spec: JobSpec,
+}
+
 enum RemoteEnd {
     /// The wrapper closed its connection (it fell back to a local rustc after
     /// the node looked silent) or the node is stopping: no output of this job
     /// is written, the peer was told to stop.
     WrapperGone,
     /// The final `Exit` was relayed to the wrapper.
-    Done,
+    Done(DoneInfo),
     /// Nothing usable came back; run locally. The text is for debug logs.
     Fallback(String),
     /// An output embeds the peer's sandbox path (CF-10): nothing was written;
@@ -463,6 +501,18 @@ fn env_path(spec: &JobSpec, name: &str) -> Option<ClientPath> {
             EnvValue::Path(p) => Some(p.clone()),
             EnvValue::Plain(_) => None,
         })
+}
+
+/// A job with its inputs collected.
+struct Prepared {
+    spec: JobSpec,
+    files: HashMap<BlobHash, PathBuf>,
+}
+
+/// The primary input file must be one of the hashed inputs: a source outside
+/// the package directory is not in the key (DESIGN section 16).
+fn covers_input(spec: &JobSpec, input: &ClientPath) -> bool {
+    spec.inputs.iter().any(|i| i.path == *input)
 }
 
 struct Built {
@@ -670,29 +720,48 @@ impl Node {
         lock(&self.depgraph).begin(&info.produces, &info.externs);
         if force_local {
             // The wrapper knows a variable this crate reads is not forwarded
-            // (CF-18): no peer is tried, no inputs are collected.
-            self.local_phase(wrapper, LocalReason::EnvDependency, &info, live)
+            // (CF-18): no peer is tried, no inputs are collected, and nothing
+            // of this run may enter the compile cache (the variable is not in
+            // its key).
+            self.local_phase(wrapper, LocalReason::EnvDependency, &info, live, None)
                 .await;
             return;
         }
-        let plan = match self.plan(spec, &info).await {
+        // Compile cache (DESIGN section 16): the inputs are collected before
+        // anything else, because the key needs their hashes, and a hit is the
+        // cheapest way to run the job.
+        let mut prepared: Option<Result<Prepared, LocalReason>> = None;
+        let mut ctx: Option<Arc<CacheCtx>> = None;
+        if self.cache_enabled() && !self.paths_forbid_cache(&spec, &info) {
+            let r = self.prepare(spec.clone(), &info, false).await;
+            if let Ok(p) = &r
+                && covers_input(&p.spec, &info.input)
+                && !ccache::target_is_file(&p.spec.target)
+            {
+                ctx = Some(Arc::new(CacheCtx {
+                    key: ccache::cache_key(&p.spec),
+                    spec: p.spec.clone(),
+                }));
+            }
+            prepared = Some(r);
+        }
+        if let Some(c) = &ctx
+            && self.try_cache(wrapper, &info, c, live).await
+        {
+            return;
+        }
+        let plan = match self.plan(spec, &info, prepared).await {
             Ok(p) => p,
             Err(reason) => {
-                self.local_phase(wrapper, reason, &info, live).await;
+                self.local_phase(wrapper, reason, &info, live, ctx.as_deref())
+                    .await;
                 return;
             }
         };
         match self.run_remote(wrapper, &plan, &info, live).await {
-            RemoteEnd::Done => {
-                // The wrapper may reject the result (compile error of a
-                // non-registry crate, env-dep mismatch) and ask for a slot.
-                if let Ok(Some(Message::RetryLocal { reason })) =
-                    tokio::time::timeout(RETRY_WAIT, wrapper.recv()).await
-                {
-                    // It waits for a slot now and needs to hear that we live.
-                    live.stopped.store(false, Ordering::Release);
-                    self.local_phase(wrapper, reason, &info, live).await;
-                }
+            RemoteEnd::Done(done) => {
+                self.after_done(wrapper, &info, live, ctx.as_deref(), done, None)
+                    .await;
             }
             RemoteEnd::Fallback(why) => {
                 // Info, not debug: a fallback is counted and its reason is what
@@ -702,8 +771,14 @@ impl Node {
                     "remote job failed: {why}"
                 );
                 self.count("remote_failed", 1);
-                self.local_phase(wrapper, LocalReason::RemoteFailed, &info, live)
-                    .await;
+                self.local_phase(
+                    wrapper,
+                    LocalReason::RemoteFailed,
+                    &info,
+                    live,
+                    ctx.as_deref(),
+                )
+                .await;
             }
             RemoteEnd::WrapperGone => {
                 tracing::debug!(
@@ -718,9 +793,274 @@ impl Node {
                     crate_name = plan.spec.crate_name.as_str(),
                     "remote output embeds the sandbox path, rerunning locally"
                 );
-                self.local_phase(wrapper, LocalReason::SandboxPathInOutput, &info, live)
-                    .await;
+                self.local_phase(
+                    wrapper,
+                    LocalReason::SandboxPathInOutput,
+                    &info,
+                    live,
+                    ctx.as_deref(),
+                )
+                .await;
             }
+        }
+    }
+
+    /// The wrapper has its answer. It speaks again only to reject the result
+    /// (compile error of a non-registry crate, env-dep mismatch): then it
+    /// waits for a local slot. Its closing the connection is the acceptance:
+    /// only now is a hit counted and a fresh result stored.
+    async fn after_done(
+        self: &Arc<Self>,
+        wrapper: &mut Link,
+        info: &SubmitInfo,
+        live: &Liveness,
+        ctx: Option<&CacheCtx>,
+        done: DoneInfo,
+        hit: Option<Origin>,
+    ) {
+        match tokio::time::timeout(RETRY_WAIT, wrapper.recv()).await {
+            Ok(Some(Message::RetryLocal { reason })) => {
+                // It waits for a slot now and needs to hear that we live.
+                live.stopped.store(false, Ordering::Release);
+                if hit.is_some() {
+                    self.count("cache_rejected", 1);
+                }
+                self.local_phase(wrapper, reason, info, live, ctx).await;
+            }
+            Ok(None) => {
+                match hit {
+                    Some(Origin::Local) => self.count("cache_hit_local", 1),
+                    Some(Origin::Farm) => self.count("cache_hit_farm", 1),
+                    None => {}
+                }
+                if hit.is_some() {
+                    self.count("cache_bytes_saved", done.bytes);
+                }
+                // A local hit is stored already; everything else is new here.
+                if hit != Some(Origin::Local)
+                    && let (Some(c), Some(cap)) = (ctx, done.capture)
+                {
+                    self.store_capture(c, cap).await;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ---------------------------------------------------------------- cache
+
+    fn cache_enabled(&self) -> bool {
+        self.ccache.is_some() && self.cfg.retain_blobs
+    }
+
+    /// `local_only` and `sensitive` paths never enter the cache, in either
+    /// direction (DESIGN sections 10 and 16).
+    fn paths_forbid_cache(&self, spec: &JobSpec, info: &SubmitInfo) -> bool {
+        let manifest = env_path(spec, "CARGO_MANIFEST_DIR");
+        let mut roots = vec![&info.input];
+        roots.extend(manifest.as_ref());
+        roots
+            .iter()
+            .any(|p| under_prefix(&self.cfg.local_only, p) || under_prefix(&self.cfg.sensitive, p))
+    }
+
+    /// Look the job up in this node's cache, then in the farm's. True when a
+    /// hit answered the wrapper (it may still ask for a local run afterwards).
+    async fn try_cache(
+        self: &Arc<Self>,
+        wrapper: &mut Link,
+        info: &SubmitInfo,
+        ctx: &Arc<CacheCtx>,
+        live: &Liveness,
+    ) -> bool {
+        let node = self.clone();
+        let key = ctx.key;
+        let local = tokio::task::spawn_blocking(move || {
+            let cc = node.ccache.as_ref()?;
+            let e = cc.lookup(&key)?;
+            // Everything is read and verified before the first frame goes out.
+            match cc.load(&e) {
+                Ok(files) => Some((e, files)),
+                Err(err) => {
+                    tracing::info!("cache entry unusable, running normally: {err:#}");
+                    cc.forget(&key);
+                    None
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some((entry, files)) = local {
+            let (a, b) = tokio::io::duplex(1 << 20);
+            let feeder = tokio::spawn(async move {
+                let link = Link::new(crate::transport::FramedConn::new(a));
+                let _ = crate::executor::replay_entry(&link, &entry, &files).await;
+                link.close().await;
+            });
+            let link = Link::new(crate::transport::FramedConn::new(b));
+            let end = self
+                .drive_remote(
+                    wrapper,
+                    link,
+                    &ctx.spec,
+                    info,
+                    Source::Cache(Origin::Local),
+                    false,
+                    live,
+                )
+                .await;
+            feeder.abort();
+            if self
+                .finish_hit(wrapper, info, live, ctx, end, Origin::Local)
+                .await
+            {
+                return true;
+            }
+        }
+        if let Some(link) = self.farm_lookup(&ctx.key).await {
+            let end = self
+                .drive_remote(
+                    wrapper,
+                    link,
+                    &ctx.spec,
+                    info,
+                    Source::Cache(Origin::Farm),
+                    true,
+                    live,
+                )
+                .await;
+            if self
+                .finish_hit(wrapper, info, live, ctx, end, Origin::Farm)
+                .await
+            {
+                return true;
+            }
+        }
+        self.count("cache_miss", 1);
+        false
+    }
+
+    /// After a replay: true when the wrapper was answered (or is gone).
+    async fn finish_hit(
+        self: &Arc<Self>,
+        wrapper: &mut Link,
+        info: &SubmitInfo,
+        live: &Liveness,
+        ctx: &CacheCtx,
+        end: RemoteEnd,
+        origin: Origin,
+    ) -> bool {
+        match end {
+            RemoteEnd::Done(done) => {
+                self.after_done(wrapper, info, live, Some(ctx), done, Some(origin))
+                    .await;
+                true
+            }
+            RemoteEnd::WrapperGone => {
+                self.count("wrapper_gone", 1);
+                lock(&self.depgraph).finish(&info.produces, false);
+                true
+            }
+            RemoteEnd::Fallback(why) => {
+                // Nothing is applied before every frame is known good, so the
+                // job simply runs the normal way.
+                tracing::info!(
+                    crate_name = ctx.spec.crate_name.as_str(),
+                    "cache entry not used: {why}"
+                );
+                self.count("cache_error", 1);
+                false
+            }
+            RemoteEnd::Tainted => false,
+        }
+    }
+
+    /// Keep a result that came from a peer (or from a farm hit) as a local entry.
+    async fn store_capture(self: &Arc<Self>, ctx: &CacheCtx, cap: Captured) {
+        let node = self.clone();
+        let (key, spec) = (ctx.key, ctx.spec.clone());
+        let stored = tokio::task::spawn_blocking(move || {
+            let cc = node.ccache.as_ref()?;
+            let e = ccache::entry_from(&spec, &key, cap, ccache::Ccache::now())?;
+            cc.store(&key, &e).ok()
+        })
+        .await
+        .ok()
+        .flatten();
+        if stored.is_some() {
+            self.count("cache_stored", 1);
+        }
+    }
+
+    /// Store what a LOCAL rustc run left behind. Only when the inputs are still
+    /// what the key says (the user may have saved a file while rustc ran).
+    async fn store_local(
+        self: &Arc<Self>,
+        ctx: &CacheCtx,
+        info: &SubmitInfo,
+        capture: crate::proto::LocalCapture,
+    ) {
+        let node = self.clone();
+        let key = ctx.key;
+        let spec = ctx.spec.clone();
+        let produces = info.produces.clone();
+        let stored = tokio::task::spawn_blocking(move || {
+            let cc = node.ccache.as_ref()?;
+            for i in &spec.inputs {
+                let now = lock(&node.hashes).hash(&i.path, &i.path.to_local()).ok()?;
+                if now.0 != i.hash {
+                    return None;
+                }
+            }
+            let plain: Vec<String> = spec
+                .args
+                .iter()
+                .filter_map(|a| match a {
+                    crate::proto::Arg::Plain(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+            let extra = crate::wrapper::extra_filename(&plain);
+            let files = ccache::local_output_files(&spec, &produces, &extra)?;
+            let mut outputs = Vec::new();
+            let mut dep_info = None;
+            let mut total = 0u64;
+            for f in files {
+                let data = std::fs::read(f.to_local()).ok()?;
+                total += data.len() as u64;
+                if total > ccache::MAX_ENTRY_BYTES {
+                    return None;
+                }
+                let hash = BlobHash::of(&data);
+                cc.put_blob(&hash, &data).ok()?;
+                let size = data.len() as u64;
+                if f.path.ends_with(".d") {
+                    dep_info = String::from_utf8(data).ok();
+                }
+                outputs.push(EntryOutput {
+                    path: f,
+                    hash,
+                    size,
+                });
+            }
+            let e = ccache::entry_from(
+                &spec,
+                &key,
+                Captured {
+                    outputs,
+                    lines: capture.lines,
+                    dep_info,
+                },
+                ccache::Ccache::now(),
+            )?;
+            cc.store(&key, &e).ok()
+        })
+        .await
+        .ok()
+        .flatten();
+        if stored.is_some() {
+            self.count("cache_stored", 1);
         }
     }
 
@@ -732,6 +1072,7 @@ impl Node {
         reason: LocalReason,
         info: &SubmitInfo,
         live: &Liveness,
+        ctx: Option<&CacheCtx>,
     ) {
         self.count_local(reason);
         lock(&self.depgraph).begin(&info.produces, &info.externs);
@@ -745,15 +1086,24 @@ impl Node {
         }
         // The wrapper reads nothing more until it is done with rustc.
         live.stopped.store(true, Ordering::Release);
+        let mut capture = None;
         let ok = loop {
             match wrapper.recv().await {
-                Some(Message::LocalDone { code, .. }) => break code == 0,
+                Some(Message::LocalDone {
+                    code, capture: c, ..
+                }) => {
+                    capture = c;
+                    break code == 0;
+                }
                 Some(_) => continue,
                 None => break false,
             }
         };
         lock(&self.depgraph).finish(&info.produces, ok);
         drop(permit);
+        if ok && let (Some(c), Some(cap)) = (ctx, capture) {
+            self.store_local(c, info, cap).await;
+        }
     }
 
     // ----------------------------------------------------------------- plan
@@ -792,10 +1142,56 @@ impl Node {
         (views, any)
     }
 
-    async fn plan(
+    /// Collect and hash the inputs of a job and complete its spec with them
+    /// (DESIGN section 8). Shared by the scheduler and the compile cache, whose
+    /// key needs the same hashes.
+    async fn prepare(
         self: &Arc<Self>,
         mut spec: JobSpec,
         info: &SubmitInfo,
+        sensitive: bool,
+    ) -> Result<Prepared, LocalReason> {
+        // Inputs cost disk and CPU.
+        let _prep = self
+            .prep_sem
+            .acquire()
+            .await
+            .map_err(|_| LocalReason::NotEligible)?;
+        let node = self.clone();
+        let spec_for_build = spec.clone();
+        let info_for_build = SubmitInfo {
+            produces: Vec::new(),
+            externs: info.externs.clone(),
+            input: info.input.clone(),
+            search_dirs: info.search_dirs.clone(),
+            link_libs: info.link_libs.clone(),
+        };
+        let built = tokio::task::spawn_blocking(move || {
+            build_inputs(&node, &spec_for_build, &info_for_build)
+        })
+        .await
+        .map_err(|_| LocalReason::NotEligible)??;
+
+        spec.needs_host |= built.has_proc_macro;
+        spec.no_retain = !self.cfg.retain_blobs || sensitive;
+        let mut dirs: Vec<ClientPath> = vec![spec.out_dir.clone()];
+        dirs.extend(info.search_dirs.iter().map(|(_, p)| p.clone()));
+        dirs.extend(env_path(&spec, "OUT_DIR"));
+        dirs.sort();
+        dirs.dedup();
+        spec.dirs = dirs;
+        spec.inputs = built.inputs;
+        Ok(Prepared {
+            spec,
+            files: built.files,
+        })
+    }
+
+    async fn plan(
+        self: &Arc<Self>,
+        spec: JobSpec,
+        info: &SubmitInfo,
+        prepared: Option<Result<Prepared, LocalReason>>,
     ) -> Result<Plan, LocalReason> {
         // DESIGN section 10: configured prefixes never leave the machine.
         let manifest = env_path(&spec, "CARGO_MANIFEST_DIR");
@@ -828,36 +1224,12 @@ impl Node {
             return Err(LocalReason::LocalSlotFree);
         }
 
-        // Inputs cost disk and CPU; only now that a peer looks better.
-        let _prep = self
-            .prep_sem
-            .acquire()
-            .await
-            .map_err(|_| LocalReason::NotEligible)?;
-        let node = self.clone();
-        let spec_for_build = spec.clone();
-        let info_for_build = SubmitInfo {
-            produces: Vec::new(),
-            externs: info.externs.clone(),
-            input: info.input.clone(),
-            search_dirs: info.search_dirs.clone(),
-            link_libs: info.link_libs.clone(),
+        // Inputs cost disk and CPU; only now that a peer looks better (unless
+        // the compile cache collected them already).
+        let Prepared { spec, files } = match prepared {
+            Some(r) => r?,
+            None => self.prepare(spec, info, sensitive).await?,
         };
-        let built = tokio::task::spawn_blocking(move || {
-            build_inputs(&node, &spec_for_build, &info_for_build)
-        })
-        .await
-        .map_err(|_| LocalReason::NotEligible)??;
-
-        spec.needs_host |= built.has_proc_macro;
-        spec.no_retain = !self.cfg.retain_blobs || sensitive;
-        let mut dirs: Vec<ClientPath> = vec![spec.out_dir.clone()];
-        dirs.extend(info.search_dirs.iter().map(|(_, p)| p.clone()));
-        dirs.extend(env_path(&spec, "OUT_DIR"));
-        dirs.sort();
-        dirs.dedup();
-        spec.dirs = dirs;
-        spec.inputs = built.inputs;
 
         // Second round: the proc-macro closure may have narrowed the peers, and
         // the upload is known now.
@@ -907,7 +1279,7 @@ impl Node {
         Ok(Plan {
             spec,
             targets: targets.clone(),
-            files: built.files,
+            files,
             pending: std::sync::Mutex::new(Some(PendingGuard {
                 node: self.clone(),
                 peer: targets[0],
@@ -917,17 +1289,14 @@ impl Node {
 
     // --------------------------------------------------------------- remote
 
-    /// Open the job connection to `peer` and reserve a slot, all before
-    /// `deadline`. The peer's addresses are tried at the same time and the
+    /// Connect to `peer`: its addresses are tried at the same time and the
     /// first one that answers wins (CF-27): one dead address must not cost
     /// seconds per target. The winner is remembered and goes first next time.
-    async fn open_job_link(
+    pub(crate) async fn connect_peer(
         self: &Arc<Self>,
         peer: NodeId,
-        job_id: JobId,
-        live: &Liveness,
         deadline: tokio::time::Instant,
-    ) -> Option<Link> {
+    ) -> Option<Race<crate::transport::FramedConn<crate::transport::ClientStream>>> {
         let (mut addrs, good) = {
             let peers = lock(&self.peers);
             let p = peers.get(&peer)?;
@@ -943,7 +1312,7 @@ impl Node {
             head_start = true;
         }
         let me = self.clone();
-        let mut race = race_first(
+        Some(race_first(
             addrs,
             deadline,
             if head_start {
@@ -958,18 +1327,30 @@ impl Node {
                         match crate::transport::connect(&me.tls, &me.id, &a).await {
                             Ok(c) => c,
                             Err(e) => {
-                                tracing::info!("job link to a peer address failed: {e:#}");
+                                tracing::info!("link to a peer address failed: {e:#}");
                                 return None;
                             }
                         };
                     if pid != peer {
-                        tracing::info!("job link reached another node than the one asked for");
+                        tracing::info!("link reached another node than the one asked for");
                         return None;
                     }
                     Some(conn)
                 }
             },
-        );
+        ))
+    }
+
+    /// Open the job connection to `peer` and reserve a slot, all before
+    /// `deadline`.
+    async fn open_job_link(
+        self: &Arc<Self>,
+        peer: NodeId,
+        job_id: JobId,
+        live: &Liveness,
+        deadline: tokio::time::Instant,
+    ) -> Option<Link> {
+        let mut race = self.connect_peer(peer, deadline).await?;
         while let Some((addr, conn)) = race.next().await {
             let mut link = Link::new(conn);
             if let Err(e) = link.send(Message::Reserve { job_id }).await {
@@ -996,6 +1377,73 @@ impl Node {
         None
     }
 
+    /// Ask the peers whether one of them holds the cache entry for `key`
+    /// (DESIGN section 16): one short connection per online peer, all at once,
+    /// all within [`CACHE_ASK_DEADLINE`], at most [`CACHE_ASK_PEERS`] peers and
+    /// [`CACHE_ASK_CONCURRENCY`] asks in flight on this node. A peer that did
+    /// not answer in time is not asked again for [`CACHE_SLOW_PAUSE`]. The
+    /// first `CacheHave` wins; its connection is returned, ready for
+    /// `CacheFetch`.
+    pub(crate) async fn farm_lookup(self: &Arc<Self>, key: &CacheKey) -> Option<Link> {
+        let now = Instant::now();
+        let peers: Vec<NodeId> = {
+            let book = lock(&self.peers);
+            let mut ids: Vec<NodeId> = book
+                .iter()
+                .filter(|(_, p)| p.conns > 0 && p.status.is_some())
+                .filter(|(_, p)| p.cache_slow_until.is_none_or(|t| t <= now))
+                .map(|(id, _)| *id)
+                .collect();
+            ids.sort();
+            ids.truncate(CACHE_ASK_PEERS);
+            ids
+        };
+        if peers.is_empty() {
+            return None;
+        }
+        // No permit: the node is already asking a lot; this job is a miss.
+        let permit = self.cache_ask_sem.clone().try_acquire_owned().ok()?;
+        let deadline = tokio::time::Instant::now() + CACHE_ASK_DEADLINE;
+        let mut set = tokio::task::JoinSet::new();
+        for peer in &peers {
+            let (me, peer, key) = (self.clone(), *peer, key.0);
+            set.spawn(async move {
+                let mut race = me.connect_peer(peer, deadline).await?;
+                let (_, conn) = race.next().await?;
+                let mut link = Link::new(conn);
+                link.send(Message::CacheQuery { key }).await.ok()?;
+                match tokio::time::timeout_at(deadline, link.recv()).await {
+                    Ok(Some(Message::CacheHave { .. })) => Some((peer, Some(link))),
+                    Ok(_) => Some((peer, None)),
+                    Err(_) => None,
+                }
+            });
+        }
+        self.count("cache_farm_asks", peers.len() as u64);
+        let mut answered: HashSet<NodeId> = HashSet::new();
+        let mut found: Option<Link> = None;
+        while let Ok(Some(joined)) = tokio::time::timeout_at(deadline, set.join_next()).await {
+            if let Ok(Some((peer, link))) = joined {
+                answered.insert(peer);
+                if link.is_some() {
+                    found = link;
+                    break;
+                }
+            }
+        }
+        drop(set);
+        drop(permit);
+        if found.is_none() {
+            let mut book = lock(&self.peers);
+            for peer in peers.iter().filter(|p| !answered.contains(p)) {
+                if let Some(p) = book.get_mut(peer) {
+                    p.cache_slow_until = Some(Instant::now() + CACHE_SLOW_PAUSE);
+                }
+            }
+        }
+        found
+    }
+
     async fn run_remote(
         self: &Arc<Self>,
         wrapper: &mut Link,
@@ -1018,9 +1466,20 @@ impl Node {
             lock(&plan.pending).take();
             let started = Instant::now();
             let end = self
-                .drive_remote(wrapper, link, plan, info, *target, live)
+                .drive_remote(
+                    wrapper,
+                    link,
+                    &plan.spec,
+                    info,
+                    Source::Job {
+                        plan,
+                        target: *target,
+                    },
+                    self.cache_enabled(),
+                    live,
+                )
                 .await;
-            if matches!(end, RemoteEnd::Done) {
+            if matches!(end, RemoteEnd::Done(_)) {
                 tracing::debug!(
                     crate_name = plan.spec.crate_name.as_str(),
                     ms = started.elapsed().as_millis() as u64,
@@ -1032,18 +1491,22 @@ impl Node {
         RemoteEnd::Fallback("no peer accepted the job".into())
     }
 
-    /// Run the job on one open job connection and apply what comes back.
+    /// Run the job on one open job connection (or replay a cache entry from
+    /// one) and apply what comes back. `record`: keep the result for the
+    /// compile cache.
+    #[allow(clippy::too_many_arguments)]
     async fn drive_remote(
         self: &Arc<Self>,
         wrapper: &mut Link,
         mut link: Link,
-        plan: &Plan,
+        spec: &JobSpec,
         info: &SubmitInfo,
-        target: NodeId,
+        source: Source<'_>,
+        record: bool,
         live: &Liveness,
     ) -> RemoteEnd {
         match self
-            .drive_remote_inner(wrapper, &mut link, plan, info, target, live)
+            .drive_remote_inner(wrapper, &mut link, spec, info, source, record, live)
             .await
         {
             Ok(end) => {
@@ -1058,21 +1521,40 @@ impl Node {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn drive_remote_inner(
         self: &Arc<Self>,
         wrapper: &mut Link,
         link: &mut Link,
-        plan: &Plan,
+        spec: &JobSpec,
         info: &SubmitInfo,
-        target: NodeId,
+        source: Source<'_>,
+        record: bool,
         live: &Liveness,
     ) -> anyhow::Result<RemoteEnd> {
-        let spec = &plan.spec;
-        link.send(Message::JobRequest {
-            spec: spec.clone(),
-            blob_key: self.id.blob_key,
-        })
-        .await?;
+        match &source {
+            Source::Job { .. } => {
+                link.send(Message::JobRequest {
+                    spec: spec.clone(),
+                    blob_key: self.id.blob_key,
+                })
+                .await?
+            }
+            Source::Cache(Origin::Farm) => {
+                let key = ccache::cache_key(spec);
+                link.send(Message::CacheFetch { key: key.0 }).await?;
+            }
+            Source::Cache(Origin::Local) => {}
+        }
+        let mut capture = Captured {
+            outputs: Vec::new(),
+            lines: Vec::new(),
+            dep_info: None,
+        };
+        // A result that cannot be recorded in full is not recorded at all.
+        let mut record = record;
+        let mut line_bytes = 0usize;
+        let mut applied = 0u64;
         // One deadline for the whole attempt: a peer that trickles stderr lines
         // is "alive" to the idle limit but cannot keep the job past this.
         let job_deadline =
@@ -1091,8 +1573,11 @@ impl Node {
             live.touch();
             match m {
                 Message::NeedBlobs { hashes } => {
+                    let Source::Job { plan, target } = &source else {
+                        bail!("a cache entry asked for blobs");
+                    };
                     // The upload has its own deadline; its chunks count as progress.
-                    self.upload_blobs(link, plan, target, &hashes, upload_deadline, live)
+                    self.upload_blobs(link, plan, *target, &hashes, upload_deadline, live)
                         .await?
                 }
                 // The executor's heartbeat: the job is alive, nothing to apply.
@@ -1108,13 +1593,21 @@ impl Node {
                         let _ = link.send(Message::Cancel).await;
                         return Ok(RemoteEnd::WrapperGone);
                     }
+                    if record {
+                        line_bytes += line.len() + 1;
+                        if line_bytes > ccache::MAX_LINES_BYTES {
+                            record = false;
+                        } else {
+                            capture.lines.push((false, line.clone()));
+                        }
+                    }
                     if let Some((m, early)) = relay.offer(Message::Stderr { line }, style)? {
                         if early {
                             self.count("early_notices", 1);
                         }
                         if wrapper.send(m).await.is_err() {
                             let _ = link.send(Message::Cancel).await;
-                            return Ok(RemoteEnd::Done);
+                            return Ok(RemoteEnd::Done(DoneInfo::default()));
                         }
                     }
                 }
@@ -1122,11 +1615,19 @@ impl Node {
                     if pending.is_some() {
                         bail!("stdout inside an output transfer");
                     }
+                    if record {
+                        line_bytes += line.len() + 1;
+                        if line_bytes > ccache::MAX_LINES_BYTES {
+                            record = false;
+                        } else {
+                            capture.lines.push((true, line.clone()));
+                        }
+                    }
                     if let Some((m, _)) = relay.offer(Message::Stdout { line }, style)?
                         && wrapper.send(m).await.is_err()
                     {
                         let _ = link.send(Message::Cancel).await;
-                        return Ok(RemoteEnd::Done);
+                        return Ok(RemoteEnd::Done(DoneInfo::default()));
                     }
                 }
                 Message::Output { path, hash, size } => {
@@ -1161,10 +1662,42 @@ impl Node {
                         let dest = path.to_local();
                         let n = plain.len() as u64;
                         let to = dest.clone();
-                        let tmp =
-                            tokio::task::spawn_blocking(move || write_temp(&to, &plain)).await??;
+                        let node = self.clone();
+                        let hash = *want;
+                        let keep = record;
+                        let (tmp, kept, dep) = tokio::task::spawn_blocking(move || {
+                            let tmp = write_temp(&to, &plain)?;
+                            // The compile cache keeps what it can verify later.
+                            let kept = keep
+                                && node
+                                    .ccache
+                                    .as_ref()
+                                    .is_some_and(|c| c.put_blob(&hash, &plain).is_ok());
+                            let dep = (keep && to.extension().is_some_and(|e| e == "d"))
+                                .then(|| String::from_utf8(plain).ok())
+                                .flatten();
+                            anyhow::Ok((tmp, kept, dep))
+                        })
+                        .await??;
                         relay.staged.add(path.clone(), tmp, dest);
-                        self.count("bytes_down", n);
+                        if !matches!(source, Source::Cache(Origin::Local)) {
+                            self.count("bytes_down", n);
+                        }
+                        applied += n;
+                        if record {
+                            if kept {
+                                capture.outputs.push(EntryOutput {
+                                    path: path.clone(),
+                                    hash,
+                                    size: n,
+                                });
+                                if dep.is_some() {
+                                    capture.dep_info = dep;
+                                }
+                            } else {
+                                record = false;
+                            }
+                        }
                         pending = None;
                     }
                 }
@@ -1189,23 +1722,27 @@ impl Node {
                         tokio::task::spawn_blocking(move || r.finish(ok)).await??
                     };
                     lock(&self.depgraph).finish(&info.produces, code == 0);
-                    self.count(
-                        if code == 0 {
-                            "remote_ok"
-                        } else {
-                            "remote_exit_nonzero"
-                        },
-                        1,
-                    );
+                    if let Source::Job { .. } = &source {
+                        self.count(
+                            if code == 0 {
+                                "remote_ok"
+                            } else {
+                                "remote_exit_nonzero"
+                            },
+                            1,
+                        );
+                    }
                     for m in held {
                         if wrapper.send(m).await.is_err() {
                             let _ = link.send(Message::Cancel).await;
-                            return Ok(RemoteEnd::Done);
+                            return Ok(RemoteEnd::Done(DoneInfo::default()));
                         }
                     }
-                    if !spec.no_retain {
+                    if let Source::Job { target, .. } = &source
+                        && !spec.no_retain
+                    {
                         let mut peers = lock(&self.peers);
-                        if let Some(p) = peers.get_mut(&target) {
+                        if let Some(p) = peers.get_mut(target) {
                             if p.sent.len() > crate::node::MAX_SENT_HASHES {
                                 p.sent.clear();
                             }
@@ -1217,7 +1754,10 @@ impl Node {
                     // for a local retry, and `handle_submit` resumes the
                     // keepalives then.
                     live.stopped.store(true, Ordering::Release);
-                    return Ok(RemoteEnd::Done);
+                    return Ok(RemoteEnd::Done(DoneInfo {
+                        capture: (record && code == 0).then_some(capture),
+                        bytes: applied,
+                    }));
                 }
                 Message::Error { message } => {
                     bail!("peer reported: {}", crate::proto::log_safe(&message))

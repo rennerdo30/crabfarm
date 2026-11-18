@@ -17,6 +17,7 @@ pub mod transport;
 
 // Package C: executing peer.
 pub mod cas;
+pub mod ccache;
 pub mod exec;
 pub mod guard;
 pub mod proctree;

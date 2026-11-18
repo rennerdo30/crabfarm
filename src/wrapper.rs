@@ -377,14 +377,21 @@ fn blocked_env(
 /// Record the env dependencies of the `.d` file the LOCAL rustc just wrote
 /// (never one that came from a peer) so the crate stays local while they are
 /// set (CF-18). Recording does not forward anything.
-fn learn_env_deps(data_dir: &Path, crate_name: &str, dep_file: &Path, forwarded: &HashSet<String>) {
+/// True when the dep-info was read and lists no such variable.
+fn learn_env_deps(
+    data_dir: &Path,
+    crate_name: &str,
+    dep_file: &Path,
+    forwarded: &HashSet<String>,
+) -> bool {
     let Ok(text) = std::fs::read_to_string(dep_file) else {
-        return;
+        return false;
     };
     let missing = missing_env_deps(&text, forwarded, |n| std::env::var_os(n).is_some());
     if !missing.is_empty() {
         let _ = crate::envlearn::remember(data_dir, crate_name, &missing);
     }
+    missing.is_empty()
 }
 
 /// Names a freshly written `.d` file lists as env dependencies that are set
@@ -645,16 +652,25 @@ fn submit(
                 rt.block_on(close_ipc(conn));
                 None
             };
-            let code = passthrough_skipping(rustc, args, &relayed_notices);
+            let (code, printed) = run_local_capturing(rustc, args, &relayed_notices);
+            // The compile cache (DESIGN section 16) may keep this run only when
+            // it read nothing the cache key does not cover: no variable the
+            // dep-info lists was set here without being part of the job.
+            let mut cacheable = false;
             if code == 0 {
-                learn_env_deps(data_dir, &cand.crate_name, &dep_file, &forwarded);
+                cacheable = learn_env_deps(data_dir, &cand.crate_name, &dep_file, &forwarded);
             }
             if let Some(conn) = conn.as_mut() {
                 // Releases the local slot the node reserved for this run.
-                let _ = rt.block_on(conn.send(&Message::LocalDone {
-                    code,
-                    produces: cand.produces.clone(),
-                }));
+                let _ = rt.block_on(
+                    conn.send(&Message::LocalDone {
+                        code,
+                        produces: cand.produces.clone(),
+                        capture: (cacheable && relayed_notices.is_empty() && cfg.cache)
+                            .then_some(printed)
+                            .flatten(),
+                    }),
+                );
             }
             code
         }
@@ -681,42 +697,94 @@ fn is_skipped_notice(line: &str, skip: &HashSet<(String, String)>) -> bool {
     rewrite::artifact(line).is_some_and(|(f, e)| skip.contains(&notice_key(&f, &e)))
 }
 
-/// `passthrough`, except that artifact notices cargo already got from the
-/// remote attempt are dropped from rustc's stderr (cargo must see each notice
-/// once: a repeated metadata notice would release dependents twice).
-fn passthrough_skipping(rustc: &str, args: &[String], skip: &HashSet<(String, String)>) -> i32 {
-    use std::io::BufRead;
-    if skip.is_empty() {
-        return passthrough(rustc, args);
-    }
-    let mut child = match local_command(rustc, args).stderr(Stdio::piped()).spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("crabfarm: could not run {rustc}: {e}");
-            return 1;
+/// Everything rustc printed, kept while it is passed on.
+struct Tee {
+    lines: Vec<(bool, String)>,
+    bytes: usize,
+    /// Every line was valid text and the total stayed within the cache's limit.
+    valid: bool,
+}
+
+/// Pass the lines of one of rustc's streams on, byte for byte and one write
+/// per line, and keep them in `tee`. Artifact notices in `skip` are dropped.
+fn pump(
+    mut reader: impl std::io::BufRead,
+    stdout: bool,
+    skip: &HashSet<(String, String)>,
+    tee: &std::sync::Mutex<Tee>,
+) {
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
         }
-    };
-    if let Some(err) = child.stderr.take() {
-        let mut reader = std::io::BufReader::new(err);
-        let mut buf = Vec::new();
-        loop {
-            buf.clear();
-            match reader.read_until(b'\n', &mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
+        let text = String::from_utf8_lossy(&buf);
+        let line = text.trim_end_matches(['\r', '\n']);
+        if !skip.is_empty() && is_skipped_notice(line, skip) {
+            continue;
+        }
+        {
+            let mut t = tee.lock().unwrap_or_else(|e| e.into_inner());
+            t.bytes += buf.len();
+            if t.bytes > crate::ccache::MAX_LINES_BYTES || std::str::from_utf8(&buf).is_err() {
+                t.valid = false;
+            } else if t.valid {
+                t.lines.push((stdout, line.to_string()));
             }
-            let text = String::from_utf8_lossy(&buf);
-            if is_skipped_notice(text.trim_end_matches(['\r', '\n']), skip) {
-                continue;
-            }
-            // One write per line, bytes untouched.
+        }
+        if stdout {
+            let mut o = std::io::stdout().lock();
+            let _ = o.write_all(&buf);
+            let _ = o.flush();
+        } else {
             let _ = std::io::stderr().lock().write_all(&buf);
         }
     }
-    match child.wait() {
+}
+
+/// Run rustc locally and pass its output on as it comes, like inherited
+/// stdio would, while keeping it for the compile cache. Artifact notices cargo
+/// already got from the remote attempt (`skip`) are dropped: cargo must see
+/// each notice once, a repeated metadata notice would release dependents
+/// twice. The capture is `None` when the output cannot be replayed exactly
+/// (not text, too long) or a notice was dropped.
+fn run_local_capturing(
+    rustc: &str,
+    args: &[String],
+    skip: &HashSet<(String, String)>,
+) -> (i32, Option<crate::proto::LocalCapture>) {
+    let mut cmd = local_command(rustc, args);
+    let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("crabfarm: could not run {rustc}: {e}");
+            return (1, None);
+        }
+    };
+    let tee = std::sync::Mutex::new(Tee {
+        lines: Vec::new(),
+        bytes: 0,
+        valid: true,
+    });
+    std::thread::scope(|sc| {
+        if let Some(out) = child.stdout.take() {
+            let tee = &tee;
+            sc.spawn(move || pump(std::io::BufReader::new(out), true, &HashSet::new(), tee));
+        }
+        if let Some(err) = child.stderr.take() {
+            pump(std::io::BufReader::new(err), false, skip, &tee);
+        }
+    });
+    let code = match child.wait() {
         Ok(s) => s.code().unwrap_or(1),
         Err(_) => 1,
-    }
+    };
+    let t = tee.into_inner().unwrap_or_else(|e| e.into_inner());
+    let capture =
+        (t.valid && skip.is_empty()).then_some(crate::proto::LocalCapture { lines: t.lines });
+    (code, capture)
 }
 
 fn write_line(stdout: bool, line: &str) {

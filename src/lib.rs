@@ -35,3 +35,12 @@ pub mod scheduler;
 pub mod status;
 pub mod submitter;
 pub mod wrapper;
+
+// CF-22: install and setup commands (`node --stop`, `service`, `path`,
+// `enable`/`disable`) and the console-less node binary's shared code.
+pub mod daemon;
+pub mod enable;
+pub mod pathenv;
+pub mod service;
+#[cfg(windows)]
+pub mod winreg;

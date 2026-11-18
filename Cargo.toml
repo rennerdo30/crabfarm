@@ -22,6 +22,16 @@ include = [
     "/docs/DESIGN.md",
 ]
 
+[[bin]]
+name = "crabfarm"
+path = "src/main.rs"
+
+# The node without a console window on Windows; the same as `crabfarm node`
+# elsewhere (autostart and the installer start this one).
+[[bin]]
+name = "crabfarmd"
+path = "src/bin/crabfarmd.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 blake3 = "1.8.7"
@@ -45,6 +55,7 @@ tokio = { version = "1.54.1", features = ["full"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
 tokio-util = "0.7.20"
 toml = "1.2.1"
+toml_edit = "0.25.19"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 if-addrs = "0.15"
@@ -53,7 +64,7 @@ x509-parser = "0.18.1"
 zstd = "0.14.4"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.191"

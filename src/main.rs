@@ -23,7 +23,35 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Run the node daemon (serves peers and local builds).
-    Node,
+    Node {
+        /// Ask the running node to shut down cleanly, then exit.
+        #[arg(long)]
+        stop: bool,
+    },
+    /// Start the node when you sign in (per user, no admin rights).
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
+    },
+    /// Put crabfarm on your PATH (Windows; elsewhere prints the line to add).
+    Path {
+        #[command(subcommand)]
+        cmd: PathCmd,
+    },
+    /// Make plain `cargo build` use the farm in this project (or everywhere).
+    Enable {
+        /// Write to `$CARGO_HOME/config.toml` instead of this project.
+        #[arg(long)]
+        global: bool,
+        /// `build.jobs` to write (default: local slots plus free remote slots).
+        #[arg(long)]
+        jobs: Option<u32>,
+    },
+    /// Undo `crabfarm enable`.
+    Disable {
+        #[arg(long)]
+        global: bool,
+    },
     /// Create, join or invite to a farm.
     Farm {
         #[command(subcommand)]
@@ -34,6 +62,24 @@ enum Cmd {
     Cargo { args: Vec<String> },
     /// Show peers, slots, running jobs and counters.
     Status,
+}
+
+#[derive(Subcommand)]
+enum ServiceCmd {
+    /// Turn autostart on (and start the node now if it is not running).
+    Install,
+    /// Turn autostart off.
+    Uninstall,
+    /// Show whether autostart is on and the node is running.
+    Status,
+}
+
+#[derive(Subcommand)]
+enum PathCmd {
+    /// Add the crabfarm folder to your PATH.
+    Add,
+    /// Remove it again.
+    Remove,
 }
 
 #[derive(Subcommand)]
@@ -83,6 +129,163 @@ fn main() {
     std::process::exit(code);
 }
 
+fn stop_cmd() -> anyhow::Result<i32> {
+    let data_dir = config::data_dir()?;
+    if crabfarm::daemon::stop_node(&data_dir, crabfarm::daemon::STOP_TIMEOUT)? {
+        println!("The node has stopped.");
+    } else {
+        println!("No node is running.");
+    }
+    Ok(0)
+}
+
+fn service_cmd(cmd: ServiceCmd) -> anyhow::Result<i32> {
+    use crabfarm::service;
+    let target = service::current_target()?;
+    let mut host = service::RealHost::new(target.data_dir.clone());
+    match cmd {
+        ServiceCmd::Install => {
+            for l in service::install(&mut host, &target)? {
+                println!("{l}");
+            }
+        }
+        ServiceCmd::Uninstall => {
+            for l in service::uninstall(&mut host, &target)? {
+                println!("{l}");
+            }
+        }
+        ServiceCmd::Status => {
+            let st = service::status(&host, &target)?;
+            println!(
+                "autostart: {}{}",
+                if st.autostart { "on" } else { "off" },
+                if st.stale {
+                    " (points at another crabfarm install; run `crabfarm service install` to fix)"
+                } else {
+                    ""
+                }
+            );
+            println!(
+                "node: {}",
+                if st.node_running {
+                    "running"
+                } else {
+                    "not running"
+                }
+            );
+        }
+    }
+    Ok(0)
+}
+
+fn path_cmd(cmd: PathCmd) -> anyhow::Result<i32> {
+    let exe = std::env::current_exe().context("cannot find my own executable")?;
+    let dir = exe.parent().context("crabfarm has no parent directory")?;
+    #[cfg(windows)]
+    {
+        use crabfarm::pathenv::{self, Change};
+        let dir = dir.to_string_lossy().into_owned();
+        let mut env = pathenv::RegistryEnv;
+        let (changed, done, already) = match cmd {
+            PathCmd::Add => (
+                pathenv::add(&mut env, &dir)?,
+                "Added to your PATH",
+                "Already on your PATH",
+            ),
+            PathCmd::Remove => (
+                pathenv::remove(&mut env, &dir)?,
+                "Removed from your PATH",
+                "Was not on your PATH",
+            ),
+        };
+        match changed {
+            Change::Changed => println!("{done}: {dir}\nOpen a new terminal to see it."),
+            Change::Unchanged => println!("{already}: {dir}"),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let line = crabfarm::pathenv::shell_line(dir);
+        match cmd {
+            PathCmd::Add => println!(
+                "crabfarm does not edit shell profiles. Add this line to your shell profile (~/.profile, ~/.zshrc or ~/.bashrc):\n  {line}"
+            ),
+            PathCmd::Remove => println!(
+                "crabfarm never edited a shell profile. Remove this line from yours if you added it:\n  {line}"
+            ),
+        }
+    }
+    Ok(0)
+}
+
+fn cargo_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("CARGO_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|b| b.home_dir().join(".cargo")))
+}
+
+fn enable_cmd(global: bool, jobs: Option<u32>) -> anyhow::Result<i32> {
+    use crabfarm::enable;
+    let cwd = std::env::current_dir().context("cannot read the current directory")?;
+    let file = enable::target_config(global, &cwd, cargo_home().as_deref())?;
+    let exe = std::env::current_exe().context("cannot find my own executable")?;
+    let data_dir = config::data_dir()?;
+    let cfg = Config::load(&data_dir).unwrap_or_default();
+    let status = cargo_cmd::query_status(&data_dir);
+    let peers = match &status {
+        Some(crabfarm::proto::Message::FarmStatus { peers, .. }) => Some(peers.as_slice()),
+        _ => None,
+    };
+    let default = enable::default_jobs(cfg.local_slots, peers);
+    let r = enable::enable_file(&file, &exe, jobs, default)?;
+    println!("crabfarm is now the rustc wrapper in {}", r.file.display());
+    if let Some(w) = &r.inner {
+        println!(
+            "Your earlier wrapper `{w}` stays in use for local compiles (kept as [env] {}).",
+            cargo_cmd::INNER_WRAPPER_ENV
+        );
+    }
+    match r.jobs {
+        Some((n, true)) => println!(
+            "build.jobs = {n} ({}). Change it with `crabfarm enable --jobs N` or edit that line.",
+            if jobs.is_some() {
+                "your choice"
+            } else if status.is_some() {
+                "your local slots plus the free slots in the farm right now"
+            } else {
+                "twice your local slots; the node is not running, so the farm size is unknown"
+            }
+        ),
+        Some((n, false)) => println!(
+            "build.jobs = {n} is your own value and was left alone; `crabfarm enable --jobs N` replaces it."
+        ),
+        None => {}
+    }
+    println!(
+        "Plain `cargo build` in this scope now goes through the farm. Undo with `crabfarm disable`."
+    );
+    Ok(0)
+}
+
+fn disable_cmd(global: bool) -> anyhow::Result<i32> {
+    use crabfarm::enable;
+    let cwd = std::env::current_dir().context("cannot read the current directory")?;
+    let file = enable::target_config(global, &cwd, cargo_home().as_deref())?;
+    let r = enable::disable_file(&file)?;
+    if !r.was_enabled {
+        println!(
+            "crabfarm was not enabled in {}; nothing changed.",
+            r.file.display()
+        );
+    } else {
+        println!("crabfarm is off in {}.", r.file.display());
+        if let Some(w) = r.restored {
+            println!("Your earlier wrapper `{w}` is back.");
+        }
+    }
+    Ok(0)
+}
+
 fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -95,24 +298,15 @@ fn real_main() -> anyhow::Result<i32> {
     match cli.cmd {
         Cmd::Cargo { args } => Ok(cargo_cmd::run(&args)),
         Cmd::Status => Ok(status::run()),
-        Cmd::Node => {
-            let data_dir = config::data_dir()?;
-            // First, before logging, the job sweep or any port: a second node on
-            // the same directory must not touch anything of the first (CF-19).
-            let lock = node::NodeLock::acquire(&data_dir)?;
-            node::init_logging(&data_dir);
-            let rt = runtime()?;
-            rt.block_on(async {
-                let token = tokio_util::sync::CancellationToken::new();
-                let t2 = token.clone();
-                tokio::spawn(async move {
-                    let _ = tokio::signal::ctrl_c().await;
-                    t2.cancel();
-                });
-                node::run(data_dir, token, lock).await
-            })?;
+        Cmd::Node { stop: true } => stop_cmd(),
+        Cmd::Node { stop: false } => {
+            crabfarm::daemon::run_node()?;
             Ok(0)
         }
+        Cmd::Service { cmd } => service_cmd(cmd),
+        Cmd::Path { cmd } => path_cmd(cmd),
+        Cmd::Enable { global, jobs } => enable_cmd(global, jobs),
+        Cmd::Disable { global } => disable_cmd(global),
         Cmd::Farm { cmd } => farm_cmd(cmd),
     }
 }

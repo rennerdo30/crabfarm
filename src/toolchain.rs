@@ -376,6 +376,7 @@ impl Toolchains {
     /// Run one rustup child with the install timeout, recording its PID so
     /// that only this process can be killed.
     fn run_recorded(&self, mut cmd: Command, timeout: Duration) -> anyhow::Result<()> {
+        crate::proctree::no_window(&mut cmd);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -595,6 +596,7 @@ fn wait_with_timeout(
 
 /// Run a command, return stdout as text; stderr is discarded.
 fn run_capture(mut cmd: Command, timeout: Duration) -> anyhow::Result<String> {
+    crate::proctree::no_window(&mut cmd);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -616,6 +618,7 @@ fn run_capture(mut cmd: Command, timeout: Duration) -> anyhow::Result<String> {
 
 /// Run the kill helper with a timeout (the helper itself can hang).
 fn run_kill_helper(mut cmd: Command) {
+    crate::proctree::no_window(&mut cmd);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

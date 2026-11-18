@@ -348,6 +348,10 @@ pub enum Message {
     /// tell a busy node from a dead one. The wrapper runs rustc itself after
     /// `ipc::NODE_SILENCE_LIMIT` without any frame.
     Keepalive,
+    /// CLI -> node over authenticated local IPC only (appended in CF-22, the
+    /// encoding of every earlier variant is unchanged): shut down cleanly.
+    /// `crabfarm node --stop` sends it; the node ignores it from any peer.
+    Shutdown,
 }
 
 /// Escape and truncate (200 characters) a string that came from a peer before
@@ -498,6 +502,7 @@ impl std::fmt::Debug for Message {
             Message::Cancel => f.write_str("Cancel"),
             Message::Tainted { path } => f.debug_struct("Tainted").field("path", path).finish(),
             Message::Keepalive => f.write_str("Keepalive"),
+            Message::Shutdown => f.write_str("Shutdown"),
             Message::IpcAuth { .. } => f.debug_struct("IpcAuth").field("token", &Redacted).finish(),
             Message::Submit {
                 spec,

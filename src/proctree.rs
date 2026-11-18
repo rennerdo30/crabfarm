@@ -15,8 +15,22 @@
 
 use std::process::Command;
 
+/// Keep a console child from opening a window when the node has no console
+/// (`crabfarmd` on Windows). Harmless when it has one: output is piped anyway.
+pub fn no_window(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
 /// Prepare `cmd` so its process can be tracked as a tree. Call before spawning.
 pub fn configure(cmd: &mut Command) {
+    no_window(cmd);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

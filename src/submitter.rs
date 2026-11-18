@@ -442,6 +442,13 @@ impl Node {
                         break;
                     }
                 }
+                Message::Shutdown => {
+                    // The sender is authenticated by the IPC token, which only
+                    // the owner of the data directory can read.
+                    tracing::info!("stop requested over local IPC");
+                    self.shutdown.cancel();
+                    break;
+                }
                 Message::Submit {
                     spec,
                     rustc: _,

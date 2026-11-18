@@ -515,37 +515,26 @@ pub fn env_name_eq(a: &str, b: &str) -> bool {
     }
 }
 
-/// Variables that change what git does (repository location, config,
-/// helpers it runs, transport, tracing). `up` is upper-case.
+/// Build-script data names that only become a string in the crate (`env!`).
+/// Every other `GIT_` name is git's own control variable (repository, config,
+/// helpers, transport, tracing, and whatever git adds later), so the rule
+/// cannot drift: new git variables are blocked by default, and only this exact
+/// short list is allowed. `up` is upper-case.
+const GIT_DATA_NAMES: &[&str] = &[
+    "GIT_HASH",
+    "GIT_SHA",
+    "GIT_SHORT_HASH",
+    "GIT_COMMIT",
+    "GIT_COMMIT_HASH",
+    "GIT_COMMIT_DATE",
+    "GIT_BRANCH",
+    "GIT_DESCRIBE",
+    "GIT_TAG",
+    "GIT_VERSION",
+];
+
 fn is_git_control_var(up: &str) -> bool {
-    const PREFIXES: &[&str] = &["GIT_CONFIG", "GIT_SSH", "GIT_SSL", "GIT_TRACE", "GIT_HTTP"];
-    const NAMES: &[&str] = &[
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_CEILING_DIRECTORIES",
-        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-        "GIT_COMMON_DIR",
-        "GIT_NAMESPACE",
-        "GIT_EXEC_PATH",
-        "GIT_ASKPASS",
-        "GIT_EDITOR",
-        "GIT_PAGER",
-        "GIT_SEQUENCE_EDITOR",
-        "GIT_PROXY_COMMAND",
-        "GIT_TEMPLATE_DIR",
-        "GIT_TERMINAL_PROMPT",
-        "GIT_ALLOW_PROTOCOL",
-        "GIT_PROTOCOL_FROM_USER",
-        "GIT_EXTERNAL_DIFF",
-        "GIT_DIFF_OPTS",
-        "GIT_REPLACE_REF_BASE",
-        "GIT_NO_REPLACE_OBJECTS",
-        "GIT_OPTIONAL_LOCKS",
-    ];
-    PREFIXES.iter().any(|p| up.starts_with(p)) || NAMES.contains(&up)
+    up.starts_with("GIT_") && !GIT_DATA_NAMES.contains(&up)
 }
 
 /// True when `name` is a variable the farm must never accept, even when the
@@ -566,14 +555,17 @@ fn never_forward(name: &str) -> bool {
         // network behaviour they change (CF-25). `RUST_LOG` is not here: it only
         // makes rustc print more, which the submitter treats as diagnostics.
         || up.starts_with("SSL_")
-        // git's own variables (git(1) "ENVIRONMENT VARIABLES"), not every
-        // `GIT_` name: build scripts commonly export `GIT_HASH`/`GIT_SHA`
-        // for `env!`, and those only become a string in the crate.
+        // Every `GIT_` name except the short list of build-script data names
+        // (`GIT_HASH`, ...): see `GIT_DATA_NAMES`.
         || is_git_control_var(&up)
         || up.starts_with("SSH_")
         || up.starts_with("PYTHON")
         || up.starts_with("PERL5")
         || up.starts_with("RUBY")
+        // C runtime, locale, allocator and Visual Studio / SDK discovery:
+        // they change which libraries or tools a compile or link finds (CF-27).
+        || up.starts_with("MALLOC_")
+        || up.starts_with("VSCMD_")
         || matches!(
             up.as_str(),
             "NODE_OPTIONS"
@@ -595,6 +587,22 @@ fn never_forward(name: &str) -> bool {
                 | "ALL_PROXY"
                 | "NO_PROXY"
                 | "JAVA_TOOL_OPTIONS"
+                | "GLIBC_TUNABLES"
+                | "GCONV_PATH"
+                | "LOCPATH"
+                | "NLSPATH"
+                | "VCINSTALLDIR"
+                | "VSINSTALLDIR"
+                | "VCTOOLSINSTALLDIR"
+                | "WINDOWSSDKDIR"
+                | "WINDOWSSDKVERSION"
+                | "UNIVERSALCRTSDKDIR"
+                | "__COMPAT_LAYER"
+                | "RUST_TARGET_PATH"
+                | "DEPENDENCIES_OUTPUT"
+                | "SUNPRO_DEPENDENCIES"
+                | "OPENSSL_CONF"
+                | "OPENSSL_MODULES"
         )
         || matches!(
             up.as_str(),
@@ -1069,6 +1077,30 @@ mod tests {
             "GIT_CONFIG_KEY_0",
             "GIT_ASKPASS",
             "git_exec_path",
+            "GIT_FUTURE_CONTROL_VAR",
+            "Git_Pager",
+            "GIT_HASH_EXTRA",
+            "GLIBC_TUNABLES",
+            "glibc_tunables",
+            "GCONV_PATH",
+            "LOCPATH",
+            "NLSPATH",
+            "MALLOC_CONF",
+            "malloc_perturb_",
+            "VCINSTALLDIR",
+            "VSINSTALLDIR",
+            "VCToolsInstallDir",
+            "VSCMD_ARG_TGT_ARCH",
+            "vscmd_start_dir",
+            "WindowsSdkDir",
+            "WindowsSDKVersion",
+            "UniversalCRTSdkDir",
+            "__COMPAT_LAYER",
+            "RUST_TARGET_PATH",
+            "DEPENDENCIES_OUTPUT",
+            "SUNPRO_DEPENDENCIES",
+            "OPENSSL_CONF",
+            "OpenSSL_Modules",
             "SSH_AUTH_SOCK",
             "PYTHONPATH",
             "PERL5LIB",
@@ -1092,6 +1124,14 @@ mod tests {
             "GIT_HASH",
             "GIT_SHA",
             "GIT_COMMIT_DATE",
+            "GIT_SHORT_HASH",
+            "GIT_COMMIT",
+            "GIT_COMMIT_HASH",
+            "GIT_BRANCH",
+            "GIT_DESCRIBE",
+            "GIT_TAG",
+            "GIT_VERSION",
+            "git_hash",
         ] {
             assert!(build_env_name_ok(ok), "{ok}");
         }

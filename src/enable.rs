@@ -16,12 +16,81 @@ use toml_edit::{DocumentMut, InlineTable, Item, Table, Value, value};
 /// Trailing comment on the `jobs` line that crabfarm wrote.
 const JOBS_MARKER: &str = " # crabfarm enable";
 
-/// Nearest directory at or above `start` with a `Cargo.toml`.
-pub fn find_project_root(start: &Path) -> Option<PathBuf> {
-    start
+/// Longest time `cargo locate-project` may take before the fallback is used.
+const LOCATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Directory of the workspace that contains `start`, as cargo itself sees it
+/// (`cargo locate-project --workspace`). `None` when cargo is missing, fails
+/// or does not answer within the timeout.
+fn locate_with_cargo(start: &Path) -> Option<PathBuf> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let mut child = Command::new(cargo)
+        .args(["locate-project", "--workspace", "--message-format", "plain"])
+        .current_dir(start)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + LOCATE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            _ => {
+                // Our own child: kill and reap it, nothing else.
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    let manifest = PathBuf::from(out.trim());
+    let dir = manifest.parent()?;
+    // Only a manifest at or above `start` is a root for it.
+    let dir = dir.to_path_buf();
+    (manifest.is_file() && start.ancestors().any(|a| same_dir(a, &dir))).then_some(dir)
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+fn manifest_has_workspace(manifest: &Path) -> bool {
+    std::fs::read_to_string(manifest)
+        .ok()
+        .and_then(|t| t.parse::<toml::Table>().ok())
+        .is_some_and(|t| t.contains_key("workspace"))
+}
+
+/// Without cargo: the topmost directory at or above the nearest `Cargo.toml`
+/// whose manifest has a `[workspace]`, else that nearest directory.
+pub fn find_project_root_fallback(start: &Path) -> Option<PathBuf> {
+    let nearest = start.ancestors().find(|d| d.join("Cargo.toml").is_file())?;
+    let top_workspace = nearest
         .ancestors()
-        .find(|d| d.join("Cargo.toml").is_file())
-        .map(Path::to_path_buf)
+        .filter(|d| manifest_has_workspace(&d.join("Cargo.toml")))
+        .last();
+    Some(top_workspace.unwrap_or(nearest).to_path_buf())
+}
+
+/// The directory `enable` writes `.cargo/config.toml` in: the WORKSPACE root,
+/// because cargo reads config files from the directory it runs in upwards and
+/// a member's own `.cargo` is ignored when building from the workspace root.
+pub fn find_project_root(start: &Path) -> Option<PathBuf> {
+    locate_with_cargo(start).or_else(|| find_project_root_fallback(start))
 }
 
 /// `<dir>/config.toml`, or the legacy `<dir>/config` when only that exists.
@@ -97,18 +166,60 @@ fn read_doc(path: &Path) -> anyhow::Result<DocumentMut> {
         .with_context(|| format!("{} is not valid TOML; not touching it", path.display()))
 }
 
+/// The file to write: a symlinked `config.toml` is followed, so the link
+/// stays a link and the real file changes.
+fn resolve_link(path: &Path) -> anyhow::Result<PathBuf> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path)
+            .with_context(|| format!("{} is a symlink that cannot be followed", path.display())),
+        _ => Ok(path.to_path_buf()),
+    }
+}
+
 fn write_if_changed(path: &Path, doc: &DocumentMut) -> anyhow::Result<()> {
-    let new = doc.to_string();
-    if std::fs::read_to_string(path).ok().as_deref() == Some(new.as_str()) {
+    use std::io::Write;
+    let target = resolve_link(path)?;
+    let existing = std::fs::read_to_string(&target).ok();
+    let mut new = doc.to_string();
+    // Lines crabfarm adds end in `\n`; a file that uses CRLF keeps CRLF.
+    if existing.as_deref().is_some_and(|t| t.contains("\r\n")) {
+        new = new.replace("\r\n", "\n").replace('\n', "\r\n");
+    }
+    if existing.as_deref() == Some(new.as_str()) {
         return Ok(());
     }
-    if let Some(dir) = path.parent() {
+    if let Some(dir) = target.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
-    // Replace in one step so an editor or cargo never sees half a file.
-    let tmp = path.with_extension("crabfarm-tmp");
-    std::fs::write(&tmp, new).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))
+    // Replace in one step so an editor or cargo never sees half a file. The
+    // temp name is unique, so two runs (or a leftover) never collide.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = target.with_file_name(format!(
+        ".{name}.crabfarm-{}-{nanos}.tmp",
+        std::process::id()
+    ));
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .with_context(|| format!("create {}", tmp.display()))?;
+    let written = f.write_all(new.as_bytes()).and_then(|()| f.sync_all());
+    drop(f);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("write {}", tmp.display()));
+    }
+    std::fs::rename(&tmp, &target).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::Error::new(e).context(format!("replace {}", target.display()))
+    })
 }
 
 fn table_mut<'a>(
@@ -125,16 +236,27 @@ fn str_of(item: &Item) -> Option<&str> {
     item.as_str()
 }
 
-/// The inner wrapper as stored in `[env]` (plain string or `{ value = .. }`).
-fn env_inner(env: &dyn toml_edit::TableLike) -> Option<String> {
+/// Comment on the `[env]` line when crabfarm took the wrapper from OUTSIDE the
+/// file (a parent directory or `CARGO_HOME`): `disable` then removes the entry
+/// instead of putting a wrapper into the file that was never there.
+const INHERITED_MARKER: &str = " # crabfarm enable (inherited)";
+
+/// The inner wrapper as stored in `[env]` (plain string or `{ value = .. }`),
+/// and whether crabfarm took it from outside the file.
+fn env_inner(env: &dyn toml_edit::TableLike) -> Option<(String, bool)> {
     let item = env.get(INNER_WRAPPER_ENV)?;
+    let inherited = item
+        .as_value()
+        .and_then(|v| v.decor().suffix())
+        .and_then(|s| s.as_str())
+        .is_some_and(|s| s.contains("crabfarm enable (inherited)"));
     if let Some(s) = item.as_str() {
-        return Some(s.to_string());
+        return Some((s.to_string(), inherited));
     }
     item.as_table_like()?
         .get("value")?
         .as_str()
-        .map(str::to_string)
+        .map(|s| (s.to_string(), inherited))
 }
 
 /// `Programs/x` style values are relative to the folder above `.cargo`; the
@@ -158,24 +280,76 @@ fn set_keep_decor(table: &mut dyn toml_edit::TableLike, key: &str, mut new: Valu
     table.insert(key, Item::Value(new));
 }
 
-fn jobs_marker(item: &Item) -> Option<Option<i64>> {
+/// What crabfarm remembers on the `jobs` line: the user's earlier value and
+/// the user's own trailing comment (kept, so a comment never gets lost).
+#[derive(Debug, Default, PartialEq, Eq, Clone)]
+struct JobsMark {
+    was: Option<i64>,
+    comment: Option<String>,
+}
+
+fn jobs_marker(item: &Item) -> Option<JobsMark> {
     let suffix = item.as_value()?.decor().suffix()?.as_str()?;
-    let rest = suffix.trim().strip_prefix("# crabfarm enable")?.trim();
-    if rest.is_empty() {
-        return Some(None);
+    let rest = suffix.trim().strip_prefix("# crabfarm enable")?;
+    let (head, comment) = match rest.split_once(" | ") {
+        Some((h, c)) => (h, Some(c.trim().to_string()).filter(|c| !c.is_empty())),
+        None => (rest, None),
+    };
+    let head = head.trim();
+    if head.is_empty() {
+        return Some(JobsMark { was: None, comment });
     }
-    let was = rest.strip_prefix("(was ")?.strip_suffix(')')?;
-    Some(was.trim().parse().ok())
+    let was = head.strip_prefix("(was ")?.strip_suffix(')')?;
+    Some(JobsMark {
+        was: was.trim().parse().ok(),
+        comment,
+    })
+}
+
+/// The user's own trailing comment of a value that crabfarm did not write.
+fn user_comment(item: &Item) -> Option<String> {
+    let suffix = item.as_value()?.decor().suffix()?.as_str()?.trim();
+    (suffix.starts_with('#') && !suffix.starts_with("# crabfarm enable"))
+        .then(|| suffix.to_string())
+}
+
+fn mark_suffix(mark: &JobsMark) -> String {
+    let mut s = String::from(JOBS_MARKER);
+    if let Some(w) = mark.was {
+        s.push_str(&format!(" (was {w})"));
+    }
+    if let Some(c) = &mark.comment {
+        s.push_str(&format!(" | {c}"));
+    }
+    s
+}
+
+/// `RUSTC_WRAPPER` / `CARGO_BUILD_RUSTC_WRAPPER` when set in the environment:
+/// cargo lets them override `build.rustc-wrapper` from any config file, so
+/// `enable` cannot take effect while one is set (a file cannot fix that).
+/// Returns the variable's name (never its value).
+pub fn env_wrapper_override(
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<&'static str> {
+    ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"]
+        .into_iter()
+        .find(|n| env(n).is_some())
 }
 
 /// Write the wrapper (and `jobs`) into `file`. `jobs`: `Some(n)` was asked
 /// for explicitly and replaces the file's value (remembering it); `None`
 /// keeps a value that is already there, else writes `default_jobs`.
+///
+/// `outer_wrapper` is the wrapper cargo would use for this scope WITHOUT the
+/// file (from a parent directory or `CARGO_HOME`, found with cargo's own
+/// precedence, never crabfarm). It is chained as the inner wrapper, because a
+/// `build.rustc-wrapper` in `file` would otherwise replace it silently.
 pub fn enable_file(
     file: &Path,
     exe: &Path,
     explicit_jobs: Option<u32>,
     default_jobs: u32,
+    outer_wrapper: Option<&str>,
 ) -> anyhow::Result<EnableReport> {
     anyhow::ensure!(
         exe.is_absolute(),
@@ -197,6 +371,7 @@ pub fn enable_file(
     }
     .transpose()?;
 
+    let outer = outer_wrapper.filter(|w| !w.is_empty() && !is_crabfarm(w, Some(exe)));
     match existing {
         // Already crabfarm (maybe another install dir): refresh the path only.
         Some(w) if is_crabfarm(&w, Some(exe)) => {}
@@ -209,10 +384,25 @@ pub fn enable_file(
                     file.display()
                 );
             }
+            // An empty value switches a wrapper from further out off. It is
+            // remembered (and restored) but is never a program to chain to.
             env.insert(INNER_WRAPPER_ENV, env_item_for(&other));
-            inner = Some(other);
+            if !other.is_empty() {
+                inner = Some(other);
+            }
         }
-        None => {}
+        None => {
+            if let Some(o) = outer {
+                let env = table_mut(&mut doc, "env", file)?;
+                // A value the user put there already is theirs.
+                if !env.contains_key(INNER_WRAPPER_ENV) {
+                    let mut v = Value::from(o);
+                    v.decor_mut().set_suffix(INHERITED_MARKER);
+                    env.insert(INNER_WRAPPER_ENV, Item::Value(v));
+                    inner = Some(o.to_string());
+                }
+            }
+        }
     }
     {
         let build = table_mut(&mut doc, "build", file)?;
@@ -226,17 +416,17 @@ pub fn enable_file(
         let ours = current.as_ref().and_then(jobs_marker);
         match (explicit_jobs, current_int) {
             (Some(n), cur) => {
-                // Remember what the user had; keep an older memory on re-runs.
-                let was = match (&ours, cur) {
-                    (Some(prev), _) => *prev,
-                    (None, c) => c,
+                // Remember what the user had (value and comment); keep an
+                // older memory on re-runs.
+                let mark = match (&ours, &current) {
+                    (Some(prev), _) => prev.clone(),
+                    (None, c) => JobsMark {
+                        was: cur,
+                        comment: c.as_ref().and_then(user_comment),
+                    },
                 };
                 let mut v = Value::from(i64::from(n));
-                let suffix = match was {
-                    Some(w) => format!("{JOBS_MARKER} (was {w})"),
-                    None => JOBS_MARKER.to_string(),
-                };
-                v.decor_mut().set_suffix(suffix);
+                v.decor_mut().set_suffix(mark_suffix(&mark));
                 build.insert("jobs", Item::Value(v));
                 Some((i64::from(n), true))
             }
@@ -281,28 +471,36 @@ pub fn disable_file(file: &Path) -> anyhow::Result<DisableReport> {
     }
     report.was_enabled = true;
 
-    // The wrapper that was in place before, if enable moved one into [env].
-    let inner = doc
+    // The wrapper that was in place before, if enable moved one into [env]
+    // (or recorded one it inherited from outside the file).
+    let stored = doc
         .get("env")
         .and_then(Item::as_table_like)
         .and_then(env_inner);
+    let restore = stored.as_ref().filter(|(_, inh)| !inh).map(|(w, _)| w);
     {
         let build = table_mut(&mut doc, "build", file)?;
-        match &inner {
+        match restore {
             Some(w) => set_keep_decor(build, "rustc-wrapper", Value::from(w.clone())),
             None => {
                 build.remove("rustc-wrapper");
             }
         }
         match build.get("jobs").and_then(jobs_marker) {
-            Some(Some(was)) => {
+            Some(JobsMark {
+                was: Some(was),
+                comment,
+            }) => {
                 let mut v = Value::from(was);
-                // Back to the user's line without our comment.
+                // Back to the user's line, with their own comment only.
                 v.decor_mut().clear();
                 v.decor_mut().set_prefix(" ");
+                if let Some(c) = comment {
+                    v.decor_mut().set_suffix(format!(" {c}"));
+                }
                 build.insert("jobs", Item::Value(v));
             }
-            Some(None) => {
+            Some(JobsMark { was: None, .. }) => {
                 build.remove("jobs");
             }
             None => {}
@@ -311,7 +509,7 @@ pub fn disable_file(file: &Path) -> anyhow::Result<DisableReport> {
             doc.remove("build");
         }
     }
-    if inner.is_some()
+    if stored.is_some()
         && let Some(env) = doc.get_mut("env").and_then(Item::as_table_like_mut)
     {
         env.remove(INNER_WRAPPER_ENV);
@@ -319,7 +517,7 @@ pub fn disable_file(file: &Path) -> anyhow::Result<DisableReport> {
             doc.remove("env");
         }
     }
-    report.restored = inner;
+    report.restored = restore.filter(|w| !w.is_empty()).cloned();
     write_if_changed(file, &doc)?;
     Ok(report)
 }
@@ -353,7 +551,7 @@ mod tests {
     fn enable_creates_the_file_and_disable_removes_everything() {
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join(".cargo/config.toml");
-        let r = enable_file(&f, &exe(), None, 24).unwrap();
+        let r = enable_file(&f, &exe(), None, 24, None).unwrap();
         assert_eq!(r.jobs, Some((24, true)));
         let t = parsed(&f);
         assert_eq!(t["build"]["rustc-wrapper"].as_str(), Some(EXE));
@@ -368,7 +566,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let original = "# my project\n[build]\n# keep this\ntarget-dir = \"out\"   # trailing\n\n[net]\nretry = 2\n\n[alias]\nb = \"build\" # short\n";
         let f = cfg_in(d.path(), original);
-        enable_file(&f, &exe(), Some(16), 0).unwrap();
+        enable_file(&f, &exe(), Some(16), 0, None).unwrap();
         let during = std::fs::read_to_string(&f).unwrap();
         for keep in [
             "# my project",
@@ -389,7 +587,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let original = "[build]\nrustc-wrapper = \"sccache\" # shared cache\njobs = 8\n";
         let f = cfg_in(d.path(), original);
-        let r = enable_file(&f, &exe(), Some(32), 0).unwrap();
+        let r = enable_file(&f, &exe(), Some(32), 0, None).unwrap();
         assert_eq!(r.inner.as_deref(), Some("sccache"));
         let t = parsed(&f);
         assert_eq!(t["build"]["rustc-wrapper"].as_str(), Some(EXE));
@@ -397,7 +595,7 @@ mod tests {
         assert_eq!(t["build"]["jobs"].as_integer(), Some(32));
         // Enabling again changes nothing and never chains crabfarm to itself.
         let again = std::fs::read_to_string(&f).unwrap();
-        enable_file(&f, &exe(), Some(32), 0).unwrap();
+        enable_file(&f, &exe(), Some(32), 0, None).unwrap();
         assert_eq!(std::fs::read_to_string(&f).unwrap(), again);
         assert_ne!(
             parsed(&f)["env"][INNER_WRAPPER_ENV].as_str(),
@@ -414,7 +612,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let original = "[build]\nrustc-wrapper = \"tools/wrap.sh\"\n";
         let f = cfg_in(d.path(), original);
-        enable_file(&f, &exe(), Some(4), 0).unwrap();
+        enable_file(&f, &exe(), Some(4), 0, None).unwrap();
         let during = std::fs::read_to_string(&f).unwrap();
         assert!(during.contains("relative = true"), "{during}");
         disable_file(&f).unwrap();
@@ -426,12 +624,12 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let f = cfg_in(d.path(), "[build]\njobs = 8\n");
         // No --jobs: the user's value stays and disable leaves it.
-        let r = enable_file(&f, &exe(), None, 40).unwrap();
+        let r = enable_file(&f, &exe(), None, 40, None).unwrap();
         assert_eq!(r.jobs, Some((8, false)));
         disable_file(&f).unwrap();
         assert_eq!(parsed(&f)["build"]["jobs"].as_integer(), Some(8));
         // --jobs: replaced, remembered, restored.
-        enable_file(&f, &exe(), Some(64), 40).unwrap();
+        enable_file(&f, &exe(), Some(64), 40, None).unwrap();
         assert_eq!(parsed(&f)["build"]["jobs"].as_integer(), Some(64));
         disable_file(&f).unwrap();
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "[build]\njobs = 8\n");
@@ -457,7 +655,7 @@ mod tests {
         let original =
             "[build]\nrustc-wrapper = \"sccache\"\n[env]\nCRABFARM_INNER_WRAPPER = \"other\"\n";
         let f = cfg_in(d.path(), original);
-        assert!(enable_file(&f, &exe(), None, 8).is_err());
+        assert!(enable_file(&f, &exe(), None, 8, None).is_err());
         assert_eq!(std::fs::read_to_string(&f).unwrap(), original);
     }
 
@@ -465,7 +663,7 @@ mod tests {
     fn invalid_toml_is_not_touched() {
         let d = tempfile::tempdir().unwrap();
         let f = cfg_in(d.path(), "[build\n");
-        assert!(enable_file(&f, &exe(), None, 8).is_err());
+        assert!(enable_file(&f, &exe(), None, 8, None).is_err());
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "[build\n");
     }
 
@@ -505,5 +703,176 @@ mod tests {
         assert_eq!(default_jobs(16, None), 32);
         assert_eq!(default_jobs(100, None), MAX_JOBS);
         assert_eq!(default_jobs(16, Some(&[])), 16);
+    }
+
+    /// A workspace with a member below it, valid enough for cargo itself.
+    fn make_workspace(root: &Path) -> PathBuf {
+        let member = root.join("crates/foo");
+        std::fs::create_dir_all(member.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/foo\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"foo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(member.join("src/lib.rs"), "").unwrap();
+        member
+    }
+
+    /// CF-27 F1: from a member the config goes to the workspace root, which is
+    /// where cargo looks when it builds from there.
+    #[test]
+    fn enable_in_a_workspace_member_targets_the_workspace_root() {
+        let d = tempfile::tempdir().unwrap();
+        let member = make_workspace(d.path());
+        let f = target_config(false, &member, None).unwrap();
+        assert_eq!(f, d.path().join(".cargo").join("config.toml"));
+        // The no-cargo fallback agrees.
+        assert_eq!(
+            find_project_root_fallback(&member).unwrap(),
+            d.path().to_path_buf()
+        );
+    }
+
+    #[test]
+    fn the_fallback_takes_the_topmost_workspace_manifest() {
+        let d = tempfile::tempdir().unwrap();
+        let member = make_workspace(d.path());
+        // A plain package without a workspace stays its own root.
+        let lone = d.path().join("lone");
+        std::fs::create_dir_all(&lone).unwrap();
+        std::fs::write(lone.join("Cargo.toml"), "[package]\nname = \"l\"\n").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("Cargo.toml"),
+            "[package]\nname = \"o\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            find_project_root_fallback(outside.path()).unwrap(),
+            outside.path().to_path_buf()
+        );
+        assert_eq!(
+            find_project_root_fallback(&member.join("src")).unwrap(),
+            d.path()
+        );
+    }
+
+    /// CF-27 F2: a wrapper from OUTSIDE the target file is chained, not lost.
+    #[test]
+    fn an_outer_wrapper_is_chained_and_disable_does_not_leave_it_behind() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join(".cargo/config.toml");
+        let r = enable_file(&f, &exe(), Some(8), 0, Some("sccache")).unwrap();
+        assert_eq!(r.inner.as_deref(), Some("sccache"));
+        let t = parsed(&f);
+        assert_eq!(t["build"]["rustc-wrapper"].as_str(), Some(EXE));
+        assert_eq!(t["env"][INNER_WRAPPER_ENV].as_str(), Some("sccache"));
+        // Same result a second time, nothing doubled.
+        let first = std::fs::read_to_string(&f).unwrap();
+        enable_file(&f, &exe(), Some(8), 0, Some("sccache")).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), first);
+        // The wrapper was never in this file, so disable must not write it.
+        let r = disable_file(&f).unwrap();
+        assert!(r.was_enabled);
+        assert_eq!(r.restored, None);
+        assert_eq!(std::fs::read_to_string(&f).unwrap().trim(), "");
+    }
+
+    #[test]
+    fn crabfarm_or_an_empty_outer_wrapper_is_never_chained() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join(".cargo/config.toml");
+        let me = exe().to_string_lossy().into_owned();
+        for outer in [Some(me.as_str()), Some(""), None] {
+            let r = enable_file(&f, &exe(), Some(2), 0, outer).unwrap();
+            assert_eq!(r.inner, None);
+            assert!(!parsed(&f).contains_key("env"));
+            disable_file(&f).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_wrapper_in_the_environment_is_reported_by_name_only() {
+        let none = |_: &str| None::<std::ffi::OsString>;
+        assert_eq!(env_wrapper_override(&none), None);
+        let a = |n: &str| (n == "RUSTC_WRAPPER").then(|| "sccache".into());
+        assert_eq!(env_wrapper_override(&a), Some("RUSTC_WRAPPER"));
+        let b = |n: &str| (n == "CARGO_BUILD_RUSTC_WRAPPER").then(std::ffi::OsString::new);
+        assert_eq!(env_wrapper_override(&b), Some("CARGO_BUILD_RUSTC_WRAPPER"));
+    }
+
+    #[test]
+    fn an_empty_original_wrapper_is_restored_and_never_used_as_inner() {
+        let d = tempfile::tempdir().unwrap();
+        let original = "[build]\nrustc-wrapper = \"\"\n";
+        let f = cfg_in(d.path(), original);
+        let r = enable_file(&f, &exe(), Some(4), 0, Some("sccache")).unwrap();
+        assert_eq!(r.inner, None);
+        let r = disable_file(&f).unwrap();
+        assert_eq!(r.restored, None);
+        assert!(r.was_enabled);
+        assert_eq!(parsed(&f)["build"]["rustc-wrapper"].as_str(), Some(""));
+        assert!(!parsed(&f).contains_key("env"));
+    }
+
+    #[test]
+    fn crlf_files_stay_crlf_and_come_back_byte_for_byte() {
+        let d = tempfile::tempdir().unwrap();
+        let original = "# c\r\n[build]\r\ntarget-dir = \"out\"\r\n";
+        let f = cfg_in(d.path(), original);
+        enable_file(&f, &exe(), Some(4), 0, None).unwrap();
+        let during = std::fs::read_to_string(&f).unwrap();
+        assert!(!during.replace("\r\n", "").contains('\n'), "{during:?}");
+        disable_file(&f).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), original);
+    }
+
+    #[test]
+    fn the_comment_on_the_jobs_line_survives_enable_and_disable() {
+        let d = tempfile::tempdir().unwrap();
+        let original = "[build]\njobs = 8 # my choice\n";
+        let f = cfg_in(d.path(), original);
+        enable_file(&f, &exe(), Some(32), 0, None).unwrap();
+        assert!(std::fs::read_to_string(&f).unwrap().contains("# my choice"));
+        enable_file(&f, &exe(), Some(48), 0, None).unwrap();
+        disable_file(&f).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), original);
+    }
+
+    #[test]
+    fn no_temp_file_is_left_next_to_the_config() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join(".cargo/config.toml");
+        enable_file(&f, &exe(), Some(4), 0, None).unwrap();
+        disable_file(&f).unwrap();
+        let names: Vec<_> = std::fs::read_dir(f.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["config.toml"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_config_is_written_through_and_stays_a_link() {
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("shared.toml");
+        std::fs::write(&real, "[net]\nretry = 2\n").unwrap();
+        let f = d.path().join(".cargo/config.toml");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, &f).unwrap();
+        enable_file(&f, &exe(), Some(4), 0, None).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&f)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(std::fs::read_to_string(&real).unwrap().contains(EXE));
     }
 }

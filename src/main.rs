@@ -252,7 +252,21 @@ fn enable_cmd(global: bool, jobs: Option<u32>) -> anyhow::Result<i32> {
         _ => None,
     };
     let default = enable::default_jobs(cfg.local_slots, peers);
-    let r = enable::enable_file(&file, &exe, jobs, default)?;
+    // The wrapper cargo uses today for this scope, found with cargo's own
+    // precedence and without the environment (a variable is not something to
+    // copy into a file; it is warned about below).
+    let outer = if global {
+        None
+    } else {
+        cargo_cmd::find_inner_wrapper(&[], &cwd, cargo_home().as_deref(), &|_| None, Some(&exe))
+    };
+    let r = enable::enable_file(&file, &exe, jobs, default, outer.as_deref())?;
+    if !global && let Some(root) = file.parent().and_then(Path::parent) {
+        println!(
+            "Project root: {} (the workspace root when this is a workspace member).",
+            root.display()
+        );
+    }
     println!("crabfarm is now the rustc wrapper in {}", r.file.display());
     if let Some(w) = &r.inner {
         println!(
@@ -275,6 +289,12 @@ fn enable_cmd(global: bool, jobs: Option<u32>) -> anyhow::Result<i32> {
             "build.jobs = {n} is your own value and was left alone; `crabfarm enable --jobs N` replaces it."
         ),
         None => {}
+    }
+    if let Some(name) = enable::env_wrapper_override(&|n| std::env::var_os(n)) {
+        eprintln!(
+            "WARNING: {name} is set in your environment. Cargo lets it override the config file, \
+             so crabfarm is NOT used until you unset {name} (a file cannot change that)."
+        );
     }
     println!(
         "Plain `cargo build` in this scope now goes through the farm. Undo with `crabfarm disable`."

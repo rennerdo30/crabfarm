@@ -5,7 +5,7 @@
 use crate::cas::BlobStore;
 use crate::config::Config;
 use crate::depgraph::DepGraph;
-use crate::discovery::{Mdns, PeerBook};
+use crate::discovery::{CandidateSet, ConnectLimiter, MDNS_FOUND_QUEUE, Mdns, PeerBook};
 use crate::exec::NodeJobserver;
 use crate::farm::{self, Identity, Invites};
 use crate::inputs::HashCache;
@@ -370,6 +370,31 @@ impl Node {
         }
     }
 
+    /// One connection attempt to an mDNS-learned candidate. A candidate that
+    /// does not prove to be the farm member it announced is forgotten; a real
+    /// member is handed to the normal per-node dial loop by `learn_peers`.
+    async fn try_mdns_candidate(self: Arc<Self>, instance: String, addr: String, cands: Arc<Mutex<CandidateSet>>) {
+        match transport::connect(&self.tls, &self.id, &addr).await {
+            Ok((pid, hello, conn)) => {
+                if pid.to_hex() != instance {
+                    tracing::debug!("mDNS candidate {addr} answered as a different node");
+                    return;
+                }
+                lock(&cands).mark_verified(&instance, &addr);
+                let name = match &hello {
+                    Message::Hello { node_name, .. } => node_name.clone(),
+                    _ => String::new(),
+                };
+                self.learn_peers(&[PeerInfo { node_id: pid, node_name: name, addrs: vec![addr], last_seen: unix_now() }]);
+                if self.has_control(pid) {
+                    return;
+                }
+                self.clone().run_control(pid, hello, Link::new(conn), None).await;
+            }
+            Err(e) => tracing::debug!("mDNS candidate {addr}: {e:#}"),
+        }
+    }
+
     // ------------------------------------------------------------ control
 
     /// Serve one control connection (either direction) until it ends.
@@ -699,14 +724,21 @@ pub async fn run(data_dir: PathBuf, shutdown: CancellationToken) -> anyhow::Resu
         node.ensure_addr_dialer(a);
     }
     let mdns = if node.cfg.mdns {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, String)>(MDNS_FOUND_QUEUE);
         match Mdns::start(node.id.node_id, &node.id.short_farm_id(), listen_addr.port(), tx) {
             Ok(m) => {
                 let n = node.clone();
                 tokio::spawn(async move {
-                    while let Some((_, addr)) = rx.recv().await {
-                        // Only the address is known; the node id comes with the handshake.
-                        n.ensure_addr_dialer(addr);
+                    // Unauthenticated multicast feeds this: bounded candidates and
+                    // rate-limited attempts (DESIGN section 4).
+                    let cands = Arc::new(Mutex::new(CandidateSet::default()));
+                    let mut limiter = ConnectLimiter::default();
+                    while let Some((instance, addr)) = rx.recv().await {
+                        if !lock(&cands).offer(&instance, &addr) || !limiter.allow(&instance, &addr, Instant::now()) {
+                            continue;
+                        }
+                        let (n, cands) = (n.clone(), cands.clone());
+                        tokio::spawn(async move { n.try_mdns_candidate(instance, addr, cands).await });
                     }
                 });
                 Some(m)

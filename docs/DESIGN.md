@@ -59,7 +59,7 @@ Data directory (via `directories`, `ProjectDirs::from("dev", "renner", "crabfarm
 
 ## 4. Discovery, membership and load balancing
 
-- **mDNS** (`mdns-sd`): service type `_crabfarm._tcp.local.`, instance name = node id, TXT: `f=<short farm id>`, `v=<protocol version>`. Nodes ignore other farms.
+- **mDNS** (`mdns-sd`): service type `_crabfarm._tcp.local.`, instance name = node id, TXT: `f=<short farm id>`, `v=<protocol version>`. Nodes ignore other farms. mDNS is unauthenticated multicast and the farm id in `f=` is readable by anyone on the LAN, so its input is bounded: a queue of 64 events (dropped when full), candidates deduplicated by (instance, addr) and capped at 64 (a new one replaces the oldest candidate that never handshook as a farm member), at most one connection attempt per candidate per 30 s and 4 new candidate connects per second overall. A candidate counts only when its TLS handshake yields the node id it announced.
 - **Static peers**: `config.toml` `peers = ["desktop.tailnet:47070", "10.0.0.5:47070"]` for VPN/remote use.
 - **Gossip**: on each connection, both sides exchange `PeerList` (node id, name, addresses, last seen). Learning one address is enough to find the whole farm. Learned peers persist in `peers.toml`.
 - **Status**: each node keeps a TLS control connection to every reachable peer and receives `Status` pushes every second while either side has active work, every 10 s otherwise:

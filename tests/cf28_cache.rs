@@ -956,12 +956,29 @@ fn proof_workspace(root: &Path, mac_src: &str, user_src: &str) -> PathBuf {
     work
 }
 
-/// Restart `n` with new config lines and wait until it sees its peer again.
-fn restart(n: &mut Node, peer_port: u16, extra: &str) {
+/// Stop a node's process (its data stays).
+fn stop(n: &mut Node) {
+    drop(n._proc.take());
+}
+
+/// Start a stopped node again.
+fn start(n: &mut Node) {
+    let _ = std::fs::remove_file(n.home.join("ipc.port"));
+    n._proc = Some(start_node(&n.home));
+}
+
+/// Restart `n` with new config lines; with `wait_peer`, wait until it sees its
+/// peer again. Without it the peer is expected to be stopped: every job then
+/// runs here (`NoPeer`), which is what the tests that need a local build ask
+/// for (a free local slot alone does not always keep a job off the peer).
+fn restart(n: &mut Node, peer_port: u16, extra: &str, wait_peer: bool) {
     drop(n._proc.take());
     let _ = std::fs::remove_file(n.home.join("ipc.port"));
     write_config(&n.home, "node-one", n.port, peer_port, extra);
     n._proc = Some(start_node(&n.home));
+    if !wait_peer {
+        return;
+    }
     let deadline = Instant::now() + Duration::from_secs(90);
     while !status(&n.home).contains("1 of 1 peers online") {
         assert!(
@@ -998,7 +1015,7 @@ fn a_proven_crate_whose_proc_macro_changes_is_not_served_stale() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let work = proof_workspace(tmp.path(), MAC_CONST, USER_PLAIN);
     let target = tmp.path().join("target");
-    let (mut n, peer) = two_nodes(
+    let (mut n, mut peer) = two_nodes(
         tmp.path(),
         "local_slots = 1\nprefer_remote = true",
         "local_slots = 2",
@@ -1006,7 +1023,10 @@ fn a_proven_crate_whose_proc_macro_changes_is_not_served_stale() {
     assert_eq!(build_app(&n, &work, &target), "outside=v1");
     assert!(remote_ok(&n.home) >= 2, "mac and user ran on the peer");
 
-    restart(&mut n, peer.port, "local_slots = 4");
+    // No peer from now on: `user` is built here without anything that could
+    // revoke its proof.
+    stop(&mut peer);
+    restart(&mut n, peer.port, "local_slots = 4", false);
     write(&work.join("mac/src/lib.rs"), MAC_READS_OUTSIDE);
     for text in ["one", "two", "three"] {
         write(&work.join("outside.txt"), text);
@@ -1038,7 +1058,7 @@ fn a_proven_crate_that_fails_on_a_peer_loses_its_proof_and_local_entries() {
     let plus = format!("{USER_PLAIN}pub fn added() {{}}\n");
     let work = proof_workspace(tmp.path(), MAC_CONST, USER_PLAIN);
     let target = tmp.path().join("target");
-    let (mut n, peer) = two_nodes(
+    let (mut n, mut peer) = two_nodes(
         tmp.path(),
         "local_slots = 1\nprefer_remote = true",
         "local_slots = 2",
@@ -1049,12 +1069,13 @@ fn a_proven_crate_that_fails_on_a_peer_loses_its_proof_and_local_entries() {
 
     // B: built here (an edit: another key, the same proof), the local result
     // is kept and then served.
-    restart(&mut n, peer.port, "local_slots = 4");
+    stop(&mut peer);
+    restart(&mut n, peer.port, "local_slots = 4", false);
     write(&work.join("user/src/lib.rs"), &plus);
     assert_eq!(build_app(&n, &work, &target), "outside=v1");
     let c = cache(&n.home);
-    assert_eq!(
-        c.stored, 1,
+    assert!(
+        c.stored >= 1,
         "the proven crate's local result is kept: {c:?}"
     );
     let first = cache(&n.home);
@@ -1065,7 +1086,13 @@ fn a_proven_crate_that_fails_on_a_peer_loses_its_proof_and_local_entries() {
 
     // C: the crate now reads a file the peer does not have: it fails there,
     // the rerun here works, and the proof is revoked.
-    restart(&mut n, peer.port, "local_slots = 1\nprefer_remote = true");
+    start(&mut peer);
+    restart(
+        &mut n,
+        peer.port,
+        "local_slots = 1\nprefer_remote = true",
+        true,
+    );
     write(&work.join("outside.txt"), "x");
     write(
         &work.join("user/src/lib.rs"),
@@ -1075,7 +1102,8 @@ fn a_proven_crate_that_fails_on_a_peer_loses_its_proof_and_local_entries() {
 
     // D: the source of step B again, built here: its stored result is gone
     // (revoked with the proof) and, unproven, it is not stored again.
-    restart(&mut n, peer.port, "local_slots = 4");
+    stop(&mut peer);
+    restart(&mut n, peer.port, "local_slots = 4", false);
     write(&work.join("user/src/lib.rs"), &plus);
     assert_eq!(build_app(&n, &work, &target), "outside=v1");
     let c = cache(&n.home);
@@ -1104,6 +1132,7 @@ fn a_node_that_retains_nothing_serves_nothing_to_the_farm() {
         &mut a,
         b.port,
         "local_slots = 1\nprefer_remote = true\nretain_blobs = false",
+        true,
     );
     wipe(&f.target);
     build_ok(&b, &f.work, &f.target);

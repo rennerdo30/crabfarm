@@ -48,7 +48,7 @@ pub fn has_jobs_flag(args: &[String]) -> bool {
         if a == "--" {
             return false;
         }
-        if a == "-j" || a == "--jobs" || a.starts_with("--jobs=") {
+        if a == "-j" || a == "--jobs" || a.starts_with("--jobs=") || a.starts_with("-j=") {
             return true;
         }
         if let Some(rest) = a.strip_prefix("-j")
@@ -58,6 +58,63 @@ pub fn has_jobs_flag(args: &[String]) -> bool {
         }
     }
     false
+}
+
+/// True when `build.jobs` is set in any `--config` argument.
+fn jobs_in_args(args: &[String]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            break;
+        }
+        let value = if a == "--config" {
+            i += 1;
+            args.get(i).map(String::as_str)
+        } else {
+            a.strip_prefix("--config=")
+        };
+        if let Some(kv) = value
+            && kv
+                .split_once('=')
+                .is_some_and(|(k, _)| k.trim() == "build.jobs")
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// True when some `.cargo/config.toml` from `cwd` up, or `<CARGO_HOME>/config.toml`,
+/// sets `build.jobs`.
+fn jobs_in_config_files(cwd: &Path, cargo_home: Option<&Path>) -> bool {
+    let mut dirs: Vec<PathBuf> = cwd.ancestors().map(|d| d.join(".cargo")).collect();
+    dirs.extend(cargo_home.map(Path::to_path_buf));
+    dirs.iter().any(|d| {
+        ["config.toml", "config"].iter().any(|f| {
+            std::fs::read_to_string(d.join(f))
+                .ok()
+                .and_then(|t| toml::from_str::<toml::Table>(&t).ok())
+                .and_then(|t| t.get("build")?.as_table()?.get("jobs").cloned())
+                .is_some()
+        })
+    })
+}
+
+/// True when the user already chose a job count in any way cargo knows: `-j`,
+/// `--jobs`, `-j=N`, `--config build.jobs=`, `CARGO_BUILD_JOBS`, or `build.jobs`
+/// in a config file (CF-19). Then crabfarm adds nothing.
+pub fn user_set_jobs(
+    args: &[String],
+    cwd: &Path,
+    cargo_home: Option<&Path>,
+    env: &dyn Fn(&str) -> Option<OsString>,
+) -> bool {
+    has_jobs_flag(args)
+        || jobs_in_args(args)
+        || env("CARGO_BUILD_JOBS").is_some_and(|v| !v.is_empty())
+        || jobs_in_config_files(cwd, cargo_home)
 }
 
 /// Insert `-j <jobs>` right after the subcommand (`build -j 24 --release`).
@@ -207,9 +264,16 @@ pub fn run(args: &[String]) -> i32 {
     };
     let cfg = Config::load(&data_dir).unwrap_or_default();
     let mut cargo_args = args.to_vec();
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|b| b.home_dir().join(".cargo")));
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let user_jobs = user_set_jobs(args, &cwd, cargo_home.as_deref(), &|n| std::env::var_os(n));
     match query_status(&data_dir) {
         Some(Message::FarmStatus { peers, .. }) => {
-            cargo_args = insert_jobs(args, farm_jobs(cfg.local_slots, &peers));
+            if !user_jobs {
+                cargo_args = insert_jobs(args, farm_jobs(cfg.local_slots, &peers));
+            }
         }
         _ => {
             eprintln!(
@@ -228,10 +292,6 @@ pub fn run(args: &[String]) -> i32 {
     cargo.args(&cargo_args).env("RUSTC_WRAPPER", &exe);
     // A wrapper that was in place before (sccache, ...) keeps working for the
     // runs that happen on this machine (CF-19).
-    let cargo_home = std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| directories::BaseDirs::new().map(|b| b.home_dir().join(".cargo")));
-    let cwd = std::env::current_dir().unwrap_or_default();
     if let Some(inner) = find_inner_wrapper(
         args,
         &cwd,
@@ -283,12 +343,59 @@ mod tests {
         );
     }
 
+    /// CF-19: every way the user can choose a job count wins; crabfarm adds nothing.
+    #[test]
+    fn jobs_set_by_the_user_in_any_form_win() {
+        let t = tempfile::tempdir().unwrap();
+        let none = |_: &str| None::<OsString>;
+        let set = |args: &[&str], env: &dyn Fn(&str) -> Option<OsString>| {
+            user_set_jobs(&a(args), t.path(), None, env)
+        };
+        assert!(!set(&["build"], &none));
+        for args in [
+            &["build", "-j", "4"][..],
+            &["build", "-j=4"],
+            &["build", "-j4"],
+            &["build", "--jobs=4"],
+            &["build", "--jobs", "4"],
+            &["build", "--config", "build.jobs=4"],
+            &["build", "--config=build.jobs=4"],
+            &["build", "--config", "build.jobs = \"default\""],
+        ] {
+            assert!(set(args, &none), "{args:?}");
+            // And `insert_jobs` leaves the explicit flags alone as before.
+        }
+        let env = |n: &str| (n == "CARGO_BUILD_JOBS").then(|| OsString::from("3"));
+        assert!(set(&["build"], &env));
+        let empty = |n: &str| (n == "CARGO_BUILD_JOBS").then(OsString::new);
+        assert!(!set(&["build"], &empty));
+        // A config file up the tree, or in CARGO_HOME.
+        write_cfg(t.path(), "[build]\njobs = 2\n");
+        let deep = t.path().join("a").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        assert!(user_set_jobs(&a(&["build"]), &deep, None, &none));
+        let other = tempfile::tempdir().unwrap();
+        assert!(!user_set_jobs(&a(&["build"]), other.path(), None, &none));
+        let home = tempfile::tempdir().unwrap();
+        write_cfg(home.path(), "[build]\njobs = 5\n");
+        assert!(user_set_jobs(
+            &a(&["build"]),
+            other.path(),
+            Some(&home.path().join(".cargo")),
+            &none
+        ));
+        // Other `[build]` keys are not a job count.
+        write_cfg(other.path(), "[build]\ntarget-dir = \"x\"\n");
+        assert!(!user_set_jobs(&a(&["build"]), other.path(), None, &none));
+    }
+
     #[test]
     fn user_jobs_and_other_commands_are_left_alone() {
         for args in [
             a(&["build", "-j", "4"]),
             a(&["build", "--jobs=4"]),
             a(&["build", "-j4"]),
+            a(&["build", "-j=4"]),
             a(&["build", "--jobs", "4"]),
         ] {
             assert_eq!(insert_jobs(&args, 24), args);

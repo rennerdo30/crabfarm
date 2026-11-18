@@ -24,6 +24,10 @@ const RETRY_WAIT: Duration = Duration::from_secs(60);
 const RESERVE_WAIT: Duration = Duration::from_secs(10);
 /// Uploads smaller than this say nothing about the link speed.
 const MIN_MEASURED_UPLOAD: u64 = 2 * 1024 * 1024;
+/// The whole blob upload of one job (CF-19). The per-frame waits inside it only
+/// notice a peer that stops, not one that takes the slot for hours.
+pub const UPLOAD_DEADLINE: Duration = Duration::from_secs(600);
+
 /// What one remote job may stage on the submitter (CF-19): a peer that streams
 /// endless or enormous outputs must not fill this disk. Beyond either limit
 /// the job fails and runs locally.
@@ -403,6 +407,15 @@ fn build_inputs(node: &Node, spec: &JobSpec, info: &SubmitInfo) -> Result<Built,
         files,
         has_proc_macro,
     })
+}
+
+/// `link.send`, but giving up at `deadline`: a frame waits for room in the
+/// queue while the peer does not read, and that must not last for ever.
+async fn send_by(link: &Link, m: Message, deadline: Instant) -> anyhow::Result<()> {
+    match tokio::time::timeout_at(deadline.into(), link.send(m)).await {
+        Ok(r) => r,
+        Err(_) => bail!("blob upload exceeded its overall deadline"),
+    }
 }
 
 struct PeerView {
@@ -812,6 +825,8 @@ impl Node {
         // pipeline (CF-16). A tainted job leaves no other file behind.
         let mut relay = Relay::default();
         let mut budget = OutputBudget::default();
+        // Started with the job: all `NeedBlobs` rounds share it.
+        let upload_deadline = Instant::now() + UPLOAD_DEADLINE;
         let style = spec.out_dir.style;
         loop {
             let m = tokio::time::timeout(idle, link.recv())
@@ -822,7 +837,8 @@ impl Node {
             };
             match m {
                 Message::NeedBlobs { hashes } => {
-                    self.upload_blobs(link, plan, target, &hashes).await?
+                    self.upload_blobs(link, plan, target, &hashes, upload_deadline)
+                        .await?
                 }
                 Message::Started => {}
                 Message::Stderr { line } => {
@@ -946,6 +962,7 @@ impl Node {
         plan: &Plan,
         target: NodeId,
         hashes: &[BlobHash],
+        deadline: Instant,
     ) -> anyhow::Result<()> {
         let started = Instant::now();
         let mut wire = 0u64;
@@ -963,12 +980,16 @@ impl Node {
             }
             for (offset, last, chunk) in cas::chunks(&data) {
                 wire += chunk.len() as u64;
-                link.send(Message::BlobChunk {
-                    hash: *h,
-                    offset,
-                    last,
-                    data: chunk,
-                })
+                send_by(
+                    link,
+                    Message::BlobChunk {
+                        hash: *h,
+                        offset,
+                        last,
+                        data: chunk,
+                    },
+                    deadline,
+                )
                 .await?;
             }
         }
@@ -1238,6 +1259,35 @@ mod tests {
         let mut b = OutputBudget::default();
         assert!(b.admit(u64::MAX).is_err(), "no overflow");
         assert!(b.admit(MAX_OUTPUT_BYTES + 1).is_err());
+    }
+
+    /// CF-19: an upload to a peer that does not read ends at the deadline
+    /// instead of waiting for room in the queue for ever.
+    #[tokio::test]
+    async fn an_upload_to_a_peer_that_never_reads_hits_the_deadline() {
+        use crate::transport::FramedConn;
+        // The peer end is kept open and never read: the 64 KiB pipe fills up
+        // and the queue behind it after a few frames.
+        let (a, _peer) = tokio::io::duplex(64 * 1024);
+        let link = Link::new(FramedConn::new(a));
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let started = Instant::now();
+        let mut result = Ok(());
+        for _ in 0..1000 {
+            let m = Message::BlobChunk {
+                hash: BlobHash([0; 32]),
+                offset: 0,
+                last: false,
+                data: vec![0u8; 256 * 1024],
+            };
+            result = send_by(&link, m, deadline).await;
+            if result.is_err() {
+                break;
+            }
+        }
+        let err = result.expect_err("the upload must not wait for ever");
+        assert!(format!("{err:#}").contains("deadline"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]

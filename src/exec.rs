@@ -434,7 +434,10 @@ fn render_job_args(
                         out.push(format!("linker={native}"));
                     }
                     None => {
-                        tracing::debug!(crate_name = spec.crate_name.as_str(), "dropped -C linker")
+                        tracing::debug!(
+                            crate_name = crate::proto::log_safe(&spec.crate_name).as_str(),
+                            "dropped -C linker"
+                        )
                     }
                 }
                 i += 2;
@@ -443,7 +446,10 @@ fn render_job_args(
                 match linker_on_this_peer(spec, toolchain, jobs_dir, path) {
                     Some(native) => out.push(format!("{prefix}{native}")),
                     None => {
-                        tracing::debug!(crate_name = spec.crate_name.as_str(), "dropped -C linker")
+                        tracing::debug!(
+                            crate_name = crate::proto::log_safe(&spec.crate_name).as_str(),
+                            "dropped -C linker"
+                        )
                     }
                 }
                 i += 1;
@@ -578,7 +584,7 @@ impl Emitter<'_> {
         if !scan_exempt(&path) && self.needles.iter().any(|n| contains_bytes(&data, n)) {
             let file = path.path.rsplit(['\\', '/']).next().unwrap_or("");
             tracing::info!(
-                crate_name = self.spec.crate_name.as_str(),
+                crate_name = crate::proto::log_safe(&self.spec.crate_name).as_str(),
                 file,
                 "output embeds the sandbox path"
             );
@@ -752,9 +758,12 @@ async fn run_in_sandbox(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("spawn rustc for {}", spec.crate_name))?;
+    let mut child = cmd.spawn().with_context(|| {
+        format!(
+            "spawn rustc for {}",
+            crate::proto::log_safe(&spec.crate_name)
+        )
+    })?;
     // Everything rustc starts (linker, cc) is killed with it.
     let mut tree = match crate::proctree::ProcessTree::adopt(&child) {
         Ok(t) => t,

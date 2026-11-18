@@ -2,9 +2,11 @@
 //! owner can `select!` on incoming messages without dropping a half-read frame
 //! (`FramedConn::recv` is not cancel-safe).
 //!
-//! Dropping a `Link` drops its sender; the writer then drains its queue and
-//! closes the write half, the peer sees EOF, and the reader task ends with the
-//! connection. `close` does the same but waits for the queue to be flushed.
+//! Dropping a `Link` drops its sender, so the writer drains its queue and
+//! closes the write half (the peer sees EOF), and it aborts the reader task:
+//! a reader blocked on a peer that never speaks would otherwise keep the
+//! connection's read half, and the socket, open for good. `close` does the
+//! same but waits for the queue to be flushed.
 
 use crate::proto::Message;
 use crate::transport::FramedConn;
@@ -40,9 +42,17 @@ impl Activity {
 pub struct Link {
     pub tx: mpsc::Sender<Message>,
     pub rx: mpsc::Receiver<Message>,
-    writer: JoinHandle<()>,
+    writer: Option<JoinHandle<()>>,
     reader: JoinHandle<()>,
     activity: Arc<Activity>,
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        // The writer is left to drain its queue (its sender is dropped with
+        // `self`); only the reader can block for ever.
+        self.reader.abort();
+    }
 }
 
 impl Link {
@@ -130,7 +140,7 @@ impl Link {
         Link {
             tx,
             rx,
-            writer,
+            writer: Some(writer),
             reader,
             activity,
         }
@@ -160,24 +170,21 @@ impl Link {
     }
 
     /// Flush everything queued, then close.
-    pub async fn close(self) {
-        let Link {
-            tx,
-            rx,
-            writer,
-            reader,
-            ..
-        } = self;
-        drop(tx);
-        drop(rx);
-        // Bounded so a stuck peer cannot hold the caller forever.
-        if tokio::time::timeout(std::time::Duration::from_secs(10), writer)
-            .await
-            .is_err()
-        {
-            tracing::debug!("link writer did not finish in time");
+    pub async fn close(mut self) {
+        // Replacing the channel ends drops the real ones: the writer then
+        // drains its queue and shuts the write half down.
+        drop(std::mem::replace(&mut self.tx, mpsc::channel(1).0));
+        drop(std::mem::replace(&mut self.rx, mpsc::channel(1).1));
+        if let Some(writer) = self.writer.take() {
+            // Bounded so a stuck peer cannot hold the caller forever.
+            if tokio::time::timeout(std::time::Duration::from_secs(10), writer)
+                .await
+                .is_err()
+            {
+                tracing::debug!("link writer did not finish in time");
+            }
         }
-        reader.abort();
+        // `Drop` aborts the reader.
     }
 }
 
@@ -191,6 +198,86 @@ mod tests {
     ) {
         let (a, b) = tokio::io::duplex(64 * 1024);
         (FramedConn::new(a), FramedConn::new(b))
+    }
+
+    /// A stream that reports when it is dropped, that is when the last holder of
+    /// the connection (reader half, writer half) has let go of it.
+    struct Probe {
+        inner: tokio::io::DuplexStream,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl AsyncRead for Probe {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for Probe {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// CF-19: dropping a link ends its reader task. The peer keeps its end open
+    /// and never writes, so the reader would sit on the connection for ever;
+    /// only the abort lets go of it.
+    #[tokio::test]
+    async fn dropping_a_link_aborts_its_reader() {
+        let (a, _silent_peer) = tokio::io::duplex(64 * 1024);
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let link = Link::new(FramedConn::new(Probe {
+            inner: a,
+            dropped: dropped.clone(),
+        }));
+        // Let the reader start and block on the silent peer.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!dropped.load(Ordering::SeqCst));
+        drop(link);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !dropped.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the reader of a dropped link still holds the connection"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_a_link_flushes_and_releases_the_connection() {
+        let (a, mut b) = pair();
+        let link = Link::new(a);
+        link.send(Message::Started).await.unwrap();
+        link.close().await;
+        assert!(matches!(b.recv().await, Ok(Some(Message::Started))));
+        assert!(matches!(b.recv().await, Ok(None)), "EOF after the flush");
     }
 
     #[tokio::test]

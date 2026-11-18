@@ -17,6 +17,8 @@ use tokio_util::sync::CancellationToken;
 const REQUEST_WAIT: Duration = Duration::from_secs(30);
 /// Silence while the submitter uploads blobs.
 const BLOB_WAIT: Duration = Duration::from_secs(60);
+/// The whole upload of one job (CF-19).
+const BLOB_TOTAL: Duration = Duration::from_secs(600);
 
 impl Node {
     /// Handle one job connection whose first frame was `Reserve`.
@@ -153,7 +155,7 @@ impl Node {
         match outcome {
             Ok(()) => {
                 tracing::info!(
-                    crate_name = spec.crate_name.as_str(),
+                    crate_name = crate::proto::log_safe(&spec.crate_name).as_str(),
                     code = exit_code.unwrap_or(-1),
                     ms = started.elapsed().as_millis() as u64,
                     "served job"
@@ -178,46 +180,74 @@ impl Node {
         spec: &JobSpec,
         missing: &[BlobHash],
     ) -> anyhow::Result<()> {
-        let mut want: HashMap<BlobHash, u64> = HashMap::new();
-        for h in missing {
-            if let Some(i) = spec.inputs.iter().find(|i| i.hash == *h) {
-                want.insert(*h, i.size);
-            }
-        }
-        let mut asm: HashMap<BlobHash, Assembler> = HashMap::new();
-        while !want.is_empty() {
-            let m = tokio::time::timeout(BLOB_WAIT, link.recv())
-                .await
-                .context("blob upload stalled")?;
-            match m {
-                Some(Message::BlobChunk {
-                    hash,
-                    offset,
-                    last,
-                    data,
-                }) => {
-                    let size = *want
-                        .get(&hash)
-                        .context("peer sent a blob that was not requested")?;
-                    if offset > size {
-                        bail!("blob chunk beyond the declared size");
-                    }
-                    let a = asm.entry(hash).or_default();
-                    if let Some(plain) = a.push(&hash, offset, last, &data)? {
-                        if plain.len() as u64 != size {
-                            bail!("blob size differs from the job's declaration");
-                        }
-                        self.store.put(owner, key, &hash, &plain)?;
-                        want.remove(&hash);
-                        asm.remove(&hash);
-                    }
-                }
-                Some(Message::Cancel) | None => bail!("submitter went away during upload"),
-                Some(_) => bail!("unexpected message during blob upload"),
-            }
-        }
-        Ok(())
+        receive_blobs_into(link, spec, missing, BLOB_WAIT, BLOB_TOTAL, |hash, plain| {
+            self.store.put(owner, key, hash, plain)
+        })
+        .await
     }
+}
+
+/// Receive the `missing` blobs of `spec` from `link`, handing each complete one
+/// to `put`. Two limits apply (CF-19): no frame may take longer than
+/// `frame_wait`, and the whole upload may not take longer than `total_wait`, so
+/// a submitter that sends one chunk every few seconds cannot hold a reserved
+/// slot for ever.
+async fn receive_blobs_into(
+    link: &mut Link,
+    spec: &JobSpec,
+    missing: &[BlobHash],
+    frame_wait: Duration,
+    total_wait: Duration,
+    mut put: impl FnMut(&BlobHash, &[u8]) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let mut want: HashMap<BlobHash, u64> = HashMap::new();
+    for h in missing {
+        if let Some(i) = spec.inputs.iter().find(|i| i.hash == *h) {
+            want.insert(*h, i.size);
+        }
+    }
+    let mut asm: HashMap<BlobHash, Assembler> = HashMap::new();
+    let deadline = Instant::now() + total_wait;
+    while !want.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            bail!("blob upload exceeded its overall deadline");
+        }
+        let m = match tokio::time::timeout(frame_wait.min(left), link.recv()).await {
+            Ok(m) => m,
+            Err(_) if Instant::now() >= deadline => {
+                bail!("blob upload exceeded its overall deadline")
+            }
+            Err(_) => bail!("blob upload stalled"),
+        };
+        match m {
+            Some(Message::BlobChunk {
+                hash,
+                offset,
+                last,
+                data,
+            }) => {
+                let size = *want
+                    .get(&hash)
+                    .context("peer sent a blob that was not requested")?;
+                if offset > size {
+                    bail!("blob chunk beyond the declared size");
+                }
+                let a = asm.entry(hash).or_default();
+                if let Some(plain) = a.push(&hash, offset, last, &data)? {
+                    if plain.len() as u64 != size {
+                        bail!("blob size differs from the job's declaration");
+                    }
+                    put(&hash, &plain)?;
+                    want.remove(&hash);
+                    asm.remove(&hash);
+                }
+            }
+            Some(Message::Cancel) | None => bail!("submitter went away during upload"),
+            Some(_) => bail!("unexpected message during blob upload"),
+        }
+    }
+    Ok(())
 }
 
 /// `Output` followed by its chunks; the submitter writes the file before it
@@ -244,4 +274,118 @@ async fn send_output(
         .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::{ClientPath, InputFile, PathStyle, ToolchainId};
+    use crate::transport::FramedConn;
+
+    fn pair() -> (Link, FramedConn<tokio::io::DuplexStream>) {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        (Link::new(FramedConn::new(a)), FramedConn::new(b))
+    }
+
+    fn spec_with(data: &[u8]) -> (JobSpec, BlobHash) {
+        let hash = BlobHash::of(data);
+        let p = ClientPath::parse(PathStyle::Posix, "/w/a.rs").unwrap();
+        let spec = JobSpec {
+            job_id: JobId([1; 16]),
+            toolchain: ToolchainId {
+                release: "1".into(),
+                commit_hash: "a".into(),
+                commit_date: "d".into(),
+                host: "h".into(),
+            },
+            target: "t".into(),
+            args: Vec::new(),
+            cwd: p.clone(),
+            env: Vec::new(),
+            extra_env: Vec::new(),
+            inputs: vec![InputFile {
+                path: p.clone(),
+                hash,
+                size: data.len() as u64,
+                executable: false,
+            }],
+            dirs: Vec::new(),
+            out_dir: p,
+            crate_name: "x".into(),
+            no_retain: false,
+            needs_host: false,
+        };
+        (spec, hash)
+    }
+
+    /// CF-19: valid chunks, each well inside the per-frame wait, that add up to
+    /// more than the overall deadline are cut off.
+    #[tokio::test]
+    async fn an_upload_that_keeps_going_past_the_deadline_is_refused() {
+        // Many tiny blobs are not possible with one input; use one blob whose
+        // chunks arrive one per 150 ms and whose end never comes within 500 ms.
+        let data = vec![1u8; 3 * crate::proto::CHUNK_SIZE];
+        let (spec, hash) = spec_with(&data);
+        let (mut link, mut peer) = pair();
+        let feeder = tokio::spawn(async move {
+            for (offset, last, chunk) in crate::cas::chunks(&data) {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                let m = Message::BlobChunk {
+                    hash,
+                    offset,
+                    last,
+                    data: chunk,
+                };
+                if peer.send(&m).await.is_err() {
+                    return;
+                }
+            }
+            // Keep the connection open.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let r = receive_blobs_into(
+            &mut link,
+            &spec,
+            &[hash],
+            Duration::from_secs(30),
+            Duration::from_millis(500),
+            |_, _| Ok(()),
+        )
+        .await;
+        feeder.abort();
+        let err = format!("{:#}", r.unwrap_err());
+        assert!(err.contains("deadline"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_prompt_upload_completes() {
+        let data = vec![3u8; 100];
+        let (spec, hash) = spec_with(&data);
+        let (mut link, mut peer) = pair();
+        for (offset, last, chunk) in crate::cas::chunks(&data) {
+            peer.send(&Message::BlobChunk {
+                hash,
+                offset,
+                last,
+                data: chunk,
+            })
+            .await
+            .unwrap();
+        }
+        let mut got = Vec::new();
+        receive_blobs_into(
+            &mut link,
+            &spec,
+            &[hash],
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            |h, plain| {
+                got.push((*h, plain.to_vec()));
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, vec![(hash, data)]);
+    }
 }

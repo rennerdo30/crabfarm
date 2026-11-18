@@ -141,8 +141,47 @@ fn path_value(v: &str) -> bool {
     v == MARK.to_string() || safe_relative(v)
 }
 
+/// Longest crate name accepted (it ends up in file names and log lines).
+const MAX_CRATE_NAME: usize = 128;
+
+/// rustc's crate-name syntax: letters, digits and `_` (Unicode letters allowed).
 fn crate_name_ok(n: &str) -> bool {
-    !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_')
+    !n.is_empty()
+        && n.chars().count() <= MAX_CRATE_NAME
+        && n.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// The value of `--crate-name` in a job's arguments, in either spelling.
+fn args_crate_name(args: &[Arg]) -> Option<&str> {
+    let mut found = None;
+    let mut i = 0;
+    while i < args.len() {
+        if let Arg::Plain(a) = &args[i] {
+            if a == "--crate-name" {
+                if let Some(Arg::Plain(v)) = args.get(i + 1) {
+                    found = Some(v.as_str());
+                }
+                i += 1;
+            } else if let Some(v) = a.strip_prefix("--crate-name=") {
+                found = Some(v);
+            }
+        }
+        i += 1;
+    }
+    found
+}
+
+/// `JobSpec.crate_name` ends up in logs and status output on this peer, so it
+/// has to be what it says it is: a valid crate name that is the one rustc is
+/// told to compile (CF-19).
+fn check_crate_name(spec: &JobSpec) -> Result<(), String> {
+    if !crate_name_ok(&spec.crate_name) {
+        return Err("job has an invalid crate name".into());
+    }
+    if args_crate_name(&spec.args) != Some(spec.crate_name.as_str()) {
+        return Err("job crate name differs from --crate-name".into());
+    }
+    Ok(())
 }
 
 /// `-C key[=value]` as the classifier treats it (CF-19). The keys are an
@@ -565,6 +604,7 @@ pub fn validate_env(spec: &JobSpec, policy: &Policy) -> Result<(), String> {
 /// Everything that can be decided without touching the file system.
 pub fn validate_spec(spec: &JobSpec, policy: &Policy) -> Result<(), String> {
     check_caps(spec)?;
+    check_crate_name(spec)?;
     check_collisions(spec, policy.case_insensitive)?;
     validate_args(&spec.args, spec.toolchain.host == policy.peer_host)?;
     validate_env(spec, policy)
@@ -999,6 +1039,40 @@ mod tests {
         // The very same path with two contents is refused everywhere.
         let dup = with(vec![input(r"C:\w\x.rs", b"1"), input(r"C:\w\x.rs", b"2")]);
         assert!(check_collisions(&dup, false).is_err());
+    }
+
+    /// CF-19: the crate name of the spec is a valid name and the one in the arguments.
+    #[test]
+    fn the_crate_name_must_be_valid_and_match_the_arguments() {
+        let mut s = spec(vec![], &[]);
+        s.crate_name = "x".into();
+        assert_eq!(check_crate_name(&s), Ok(()));
+        for bad in [
+            "",
+            "a-b",
+            "a b",
+            "x\n[ERROR] forged",
+            "x\u{1b}[31m",
+            "../x",
+            "x/y",
+            &"n".repeat(MAX_CRATE_NAME + 1),
+        ] {
+            s.crate_name = bad.into();
+            assert!(check_crate_name(&s).is_err(), "{bad:?}");
+        }
+        // A valid name that is not the one being compiled.
+        s.crate_name = "other".into();
+        assert!(check_crate_name(&s).is_err());
+        // Both spellings of the flag count.
+        s.args = vec![Arg::Plain("--crate-name=other".into())];
+        assert_eq!(check_crate_name(&s), Ok(()));
+        // Unicode letters are valid in a crate name.
+        s.crate_name = "caf\u{e9}".into();
+        s.args = vec![
+            Arg::Plain("--crate-name".into()),
+            Arg::Plain("caf\u{e9}".into()),
+        ];
+        assert_eq!(check_crate_name(&s), Ok(()));
     }
 
     #[test]

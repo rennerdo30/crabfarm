@@ -36,6 +36,8 @@ const JOB_IDLE: Duration = Duration::from_secs(600);
 /// proved to be a farm member (TLS and first frame pending, or a join).
 const MAX_INBOUND: usize = 256;
 const MAX_UNAUTHENTICATED: usize = 8;
+/// IPC connections that may wait for `IpcAuth` at once (CF-19).
+pub const MAX_IPC_UNAUTHENTICATED: usize = 16;
 /// How long an inbound connection may take to say what it is.
 const FIRST_MESSAGE: Duration = Duration::from_secs(10);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -662,16 +664,27 @@ impl Node {
     }
 
     async fn ipc_listener(self: Arc<Self>, listener: tokio::net::TcpListener, token: [u8; 32]) {
+        // Any local process can connect to the loopback port: at most
+        // `MAX_IPC_UNAUTHENTICATED` connections may wait for their `IpcAuth`
+        // (each for 2 s at most); the rest are dropped at accept (CF-19).
+        let waiting = Arc::new(Semaphore::new(MAX_IPC_UNAUTHENTICATED));
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => return,
                 acc = listener.accept() => {
                     let Ok((tcp, _)) = acc else { continue };
+                    let Ok(auth_slot) = waiting.clone().try_acquire_owned() else {
+                        tracing::debug!("IPC connection refused: too many waiting for authentication");
+                        continue;
+                    };
                     tcp.set_nodelay(true).ok();
                     let node = self.clone();
                     tokio::spawn(async move {
                         let mut conn = FramedConn::new(tcp);
-                        if !ipc::authenticate(&mut conn, &token).await {
+                        let authenticated = ipc::authenticate(&mut conn, &token).await;
+                        // The slot is for the wait, not for the life of the connection.
+                        drop(auth_slot);
+                        if !authenticated {
                             tracing::debug!("IPC connection failed authentication");
                             return;
                         }

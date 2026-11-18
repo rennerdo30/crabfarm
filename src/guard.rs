@@ -26,14 +26,25 @@ const MARK: char = '\u{1}';
 /// Caps on the declared inputs and directories.
 pub fn check_caps(spec: &JobSpec) -> Result<(), String> {
     if spec.inputs.len() > MAX_INPUT_FILES {
-        return Err(format!("job has {} input files (limit {MAX_INPUT_FILES})", spec.inputs.len()));
+        return Err(format!(
+            "job has {} input files (limit {MAX_INPUT_FILES})",
+            spec.inputs.len()
+        ));
     }
     if spec.dirs.len() > MAX_DIRS {
-        return Err(format!("job has {} directories (limit {MAX_DIRS})", spec.dirs.len()));
+        return Err(format!(
+            "job has {} directories (limit {MAX_DIRS})",
+            spec.dirs.len()
+        ));
     }
-    let total = spec.inputs.iter().fold(0u64, |a, i| a.saturating_add(i.size));
+    let total = spec
+        .inputs
+        .iter()
+        .fold(0u64, |a, i| a.saturating_add(i.size));
     if total > MAX_MATERIALIZED_BYTES {
-        return Err(format!("job inputs are {total} bytes (limit {MAX_MATERIALIZED_BYTES})"));
+        return Err(format!(
+            "job inputs are {total} bytes (limit {MAX_MATERIALIZED_BYTES})"
+        ));
     }
     Ok(())
 }
@@ -41,10 +52,12 @@ pub fn check_caps(spec: &JobSpec) -> Result<(), String> {
 /// A relative path value that stays below the working directory: no root, no
 /// drive, no `..`, every component a plain name.
 fn safe_relative(s: &str) -> bool {
-    if s.is_empty() || looks_absolute(PathStyle::Windows, s) || looks_absolute(PathStyle::Posix, s) {
+    if s.is_empty() || looks_absolute(PathStyle::Windows, s) || looks_absolute(PathStyle::Posix, s)
+    {
         return false;
     }
-    s.split(['/', '\\']).all(|c| c.is_empty() || c == "." || valid_component(c))
+    s.split(['/', '\\'])
+        .all(|c| c.is_empty() || c == "." || valid_component(c))
 }
 
 /// A path-carrying value: the structured marker alone, or a safe relative path.
@@ -62,7 +75,8 @@ fn codegen_ok(value: &str) -> Result<(), String> {
         return Err("-C takes a mapped path".into());
     }
     let (key, val) = value.split_once('=').unwrap_or((value, ""));
-    let abs = |v: &str| looks_absolute(PathStyle::Windows, v) || looks_absolute(PathStyle::Posix, v);
+    let abs =
+        |v: &str| looks_absolute(PathStyle::Windows, v) || looks_absolute(PathStyle::Posix, v);
     match key {
         "incremental" => Err("-C incremental".into()),
         "target-cpu" if val == "native" => Err("-C target-cpu=native".into()),
@@ -92,7 +106,9 @@ fn codegen_ok(value: &str) -> Result<(), String> {
                 Ok(())
             }
         }
-        _ if val.contains(MARK) || abs(val) || val.starts_with('@') => Err(format!("-C {key} takes a path")),
+        _ if val.contains(MARK) || abs(val) || val.starts_with('@') => {
+            Err(format!("-C {key} takes a path"))
+        }
         _ => Ok(()),
     }
 }
@@ -128,7 +144,9 @@ pub fn validate_args(args: &[Arg]) -> Result<(), String> {
     while i < v.len() {
         let a = v[i].as_str();
         match a {
-            "-vV" | "-V" | "--version" | "-h" | "--help" | "--test" | "-" => return Err(format!("flag {a}")),
+            "-vV" | "-V" | "--version" | "-h" | "--help" | "--test" | "-" => {
+                return Err(format!("flag {a}"));
+            }
             "-g" | "-O" | "-v" | "--verbose" => {
                 i += 1;
                 continue;
@@ -143,7 +161,9 @@ pub fn validate_args(args: &[Arg]) -> Result<(), String> {
             // A structured argument may only be the value of a flag that maps paths.
             let val = tok.value.as_str();
             match tok.name {
-                "--print" | "--explain" | "--sysroot" | "-Z" => return Err(format!("flag {}", tok.name)),
+                "--print" | "--explain" | "--sysroot" | "-Z" => {
+                    return Err(format!("flag {}", tok.name));
+                }
                 "--crate-type" => {
                     if val.contains(MARK) {
                         return Err("--crate-type".into());
@@ -198,7 +218,8 @@ pub fn validate_args(args: &[Arg]) -> Result<(), String> {
                 }
                 "--emit" => {
                     for it in val.split(',').filter(|s| !s.is_empty()) {
-                        let (kind, path) = it.split_once('=').map_or((it, None), |(k, p)| (k, Some(p)));
+                        let (kind, path) =
+                            it.split_once('=').map_or((it, None), |(k, p)| (k, Some(p)));
                         if !ALLOWED_EMIT.contains(&kind) {
                             return Err(format!("--emit {kind}"));
                         }
@@ -232,13 +253,16 @@ pub fn validate_args(args: &[Arg]) -> Result<(), String> {
                 return Err(format!("unknown flag {a} with a mapped path"));
             }
             if let Some((_, val)) = a.split_once('=')
-                && (looks_absolute(PathStyle::Windows, val) || looks_absolute(PathStyle::Posix, val))
+                && (looks_absolute(PathStyle::Windows, val)
+                    || looks_absolute(PathStyle::Posix, val))
             {
                 return Err(format!("unknown flag {a} with a path value"));
             }
             if let Some(next) = v.get(i + 1)
                 && !next.starts_with('-')
-                && (structured[i + 1] || looks_absolute(PathStyle::Windows, next) || looks_absolute(PathStyle::Posix, next))
+                && (structured[i + 1]
+                    || looks_absolute(PathStyle::Windows, next)
+                    || looks_absolute(PathStyle::Posix, next))
             {
                 return Err(format!("unknown flag {a} followed by a path"));
             }
@@ -276,7 +300,17 @@ fn design_env(name: &str) -> bool {
     up == "CARGO"
         || up.starts_with("CARGO_")
         || up.starts_with("DEP_")
-        || matches!(up.as_str(), "OUT_DIR" | "RUSTC_BOOTSTRAP" | "TARGET" | "HOST" | "PROFILE" | "NUM_JOBS" | "OPT_LEVEL" | "DEBUG")
+        || matches!(
+            up.as_str(),
+            "OUT_DIR"
+                | "RUSTC_BOOTSTRAP"
+                | "TARGET"
+                | "HOST"
+                | "PROFILE"
+                | "NUM_JOBS"
+                | "OPT_LEVEL"
+                | "DEBUG"
+        )
 }
 
 /// True when `name` is a variable the farm must never accept, even when the
@@ -294,8 +328,27 @@ fn never_forward(name: &str) -> bool {
         || up.starts_with("CARGO_MAKEFLAGS")
         || matches!(
             up.as_str(),
-            "PATH" | "PATHEXT" | "RUSTFLAGS" | "MAKEFLAGS" | "MFLAGS" | "MAKELEVEL" | "SYSTEMROOT" | "WINDIR" | "COMSPEC" | "TEMP" | "TMP" | "TMPDIR"
-                | "HOME" | "USERPROFILE" | "APPDATA" | "LOCALAPPDATA" | "LIB" | "INCLUDE" | "LIBPATH" | "SHELL" | "IFS"
+            "PATH"
+                | "PATHEXT"
+                | "RUSTFLAGS"
+                | "MAKEFLAGS"
+                | "MFLAGS"
+                | "MAKELEVEL"
+                | "SYSTEMROOT"
+                | "WINDIR"
+                | "COMSPEC"
+                | "TEMP"
+                | "TMP"
+                | "TMPDIR"
+                | "HOME"
+                | "USERPROFILE"
+                | "APPDATA"
+                | "LOCALAPPDATA"
+                | "LIB"
+                | "INCLUDE"
+                | "LIBPATH"
+                | "SHELL"
+                | "IFS"
         )
 }
 
@@ -373,11 +426,20 @@ mod tests {
             p("-C"),
             p("extra-filename=-abc"),
             p("-L"),
-            Arg::PrefixedPath { prefix: "dependency=".into(), path: cp(r"C:\w\target\deps") },
+            Arg::PrefixedPath {
+                prefix: "dependency=".into(),
+                path: cp(r"C:\w\target\deps"),
+            },
             p("--extern"),
-            Arg::PrefixedPath { prefix: "dep=".into(), path: cp(r"C:\w\target\deps\libdep-1.rlib") },
+            Arg::PrefixedPath {
+                prefix: "dep=".into(),
+                path: cp(r"C:\w\target\deps\libdep-1.rlib"),
+            },
             p("--remap-path-prefix"),
-            Arg::RemapFrom { from: cp(r"C:\w"), to: "/rustc".into() },
+            Arg::RemapFrom {
+                from: cp(r"C:\w"),
+                to: "/rustc".into(),
+            },
             p("-l"),
             p("static=foo"),
             p("--cfg"),
@@ -392,7 +454,10 @@ mod tests {
         assert_eq!(validate_args(&good()), Ok(()));
         // Attached forms and a mapped linker.
         let mut a = good();
-        a.push(Arg::PrefixedPath { prefix: "-Clinker=".into(), path: cp(r"C:\tools\link.exe") });
+        a.push(Arg::PrefixedPath {
+            prefix: "-Clinker=".into(),
+            path: cp(r"C:\tools\link.exe"),
+        });
         a.push(p("--emit=metadata=target/x.rmeta"));
         a.push(p("-Ldependency=deps"));
         assert_eq!(validate_args(&a), Ok(()));
@@ -448,7 +513,10 @@ mod tests {
         let mut a = good();
         a.push(Arg::Path(cp(r"C:\w\src\other.rs")));
         assert!(validate_args(&a).is_err(), "two inputs");
-        assert!(validate_args(&[p("--crate-type"), p("lib")]).is_err(), "no input");
+        assert!(
+            validate_args(&[p("--crate-type"), p("lib")]).is_err(),
+            "no input"
+        );
         let mut b = good();
         b.retain(|x| !matches!(x, Arg::Plain(s) if s == "lib"));
         b.retain(|x| !matches!(x, Arg::Plain(s) if s == "--crate-type"));
@@ -463,7 +531,12 @@ mod tests {
     fn spec(env: Vec<(&str, EnvValue)>, extra: &[&str]) -> JobSpec {
         JobSpec {
             job_id: JobId([1; 16]),
-            toolchain: ToolchainId { release: "1".into(), commit_hash: "a".into(), commit_date: "d".into(), host: "h".into() },
+            toolchain: ToolchainId {
+                release: "1".into(),
+                commit_hash: "a".into(),
+                commit_date: "d".into(),
+                host: "h".into(),
+            },
             target: "t".into(),
             args: good(),
             cwd: cp(r"C:\w"),
@@ -486,11 +559,29 @@ mod tests {
     fn env_follows_design_section_9() {
         let none = |_: &str| false;
         let ok = spec(
-            vec![("CARGO_PKG_NAME", plain("x")), ("OUT_DIR", EnvValue::Path(cp(r"C:\o"))), ("DEP_A_B", plain("1")), ("RUSTC_BOOTSTRAP", plain("1")), ("MY_VAR", plain("v"))],
+            vec![
+                ("CARGO_PKG_NAME", plain("x")),
+                ("OUT_DIR", EnvValue::Path(cp(r"C:\o"))),
+                ("DEP_A_B", plain("1")),
+                ("RUSTC_BOOTSTRAP", plain("1")),
+                ("MY_VAR", plain("v")),
+            ],
             &["MY_VAR"],
         );
         assert_eq!(validate_env(&ok, &none), Ok(()));
-        for bad in ["PATH", "Path", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "RUSTFLAGS", "SystemRoot", "CARGO_MAKEFLAGS", "RUSTUP_TOOLCHAIN", "HOME"] {
+        for bad in [
+            "PATH",
+            "Path",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "RUSTFLAGS",
+            "SystemRoot",
+            "CARGO_MAKEFLAGS",
+            "RUSTUP_TOOLCHAIN",
+            "HOME",
+        ] {
             let s = spec(vec![(bad, plain("x"))], &[]);
             assert!(validate_env(&s, &none).is_err(), "{bad} undeclared");
             // Declaring it does not help.
@@ -499,7 +590,11 @@ mod tests {
         }
         // An undeclared variable is refused; a declared one that the node itself defines too is refused.
         assert!(validate_env(&spec(vec![("MY_VAR", plain("v"))], &[]), &none).is_err());
-        assert!(validate_env(&spec(vec![("MY_VAR", plain("v"))], &["MY_VAR"]), &|n| n == "MY_VAR").is_err());
+        assert!(
+            validate_env(&spec(vec![("MY_VAR", plain("v"))], &["MY_VAR"]), &|n| n
+                == "MY_VAR")
+            .is_err()
+        );
     }
 
     #[test]
@@ -517,7 +612,9 @@ mod tests {
         assert!(check_caps(&s).is_err());
         s.inputs = vec![f(0, MAX_MATERIALIZED_BYTES)];
         assert_eq!(check_caps(&s), Ok(()));
-        s.dirs = (0..MAX_DIRS + 1).map(|i| cp(&format!(r"C:\w\d{i}"))).collect();
+        s.dirs = (0..MAX_DIRS + 1)
+            .map(|i| cp(&format!(r"C:\w\d{i}")))
+            .collect();
         assert!(check_caps(&s).is_err());
     }
 }

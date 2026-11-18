@@ -29,7 +29,9 @@ const AUTO_FILE: &str = "auto-toolchains.toml";
 pub fn parse_version_verbose(out: &str) -> anyhow::Result<ToolchainId> {
     let (mut release, mut hash, mut date, mut host) = (None, None, None, None);
     for line in out.lines() {
-        let Some((k, v)) = line.split_once(':') else { continue };
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
         let v = v.trim().to_string();
         match k.trim() {
             "release" => release = Some(v),
@@ -47,14 +49,20 @@ pub fn parse_version_verbose(out: &str) -> anyhow::Result<ToolchainId> {
     if commit_hash.is_empty() || commit_hash == "unknown" {
         bail!("rustc -vV: toolchain has no commit hash");
     }
-    Ok(ToolchainId { release, commit_hash, commit_date: date.unwrap_or_default(), host })
+    Ok(ToolchainId {
+        release,
+        commit_hash,
+        commit_date: date.unwrap_or_default(),
+        host,
+    })
 }
 
 /// Run `<rustc> -vV` (timeout 30 s) and parse it.
 pub fn query(rustc: &Path) -> anyhow::Result<ToolchainId> {
     let mut cmd = Command::new(rustc);
     cmd.arg("-vV");
-    let out = run_capture(cmd, QUERY_TIMEOUT).with_context(|| format!("run {} -vV", rustc.display()))?;
+    let out =
+        run_capture(cmd, QUERY_TIMEOUT).with_context(|| format!("run {} -vV", rustc.display()))?;
     parse_version_verbose(&out)
 }
 
@@ -142,25 +150,52 @@ impl Toolchains {
     }
 
     /// Like [`Toolchains::scan`] with an explicit `max_auto_toolchains`.
-    pub fn scan_with(data_dir: &Path, auto_install: bool, max_auto: usize) -> anyhow::Result<Toolchains> {
+    pub fn scan_with(
+        data_dir: &Path,
+        auto_install: bool,
+        max_auto: usize,
+    ) -> anyhow::Result<Toolchains> {
         let installed = scan_installed(data_dir)?;
-        Ok(Self::with_installed_cap(data_dir, auto_install, max_auto, installed))
+        Ok(Self::with_installed_cap(
+            data_dir,
+            auto_install,
+            max_auto,
+            installed,
+        ))
     }
 
     /// Registry over a known list (no rustup access); used by tests.
-    pub fn with_installed(data_dir: &Path, auto_install: bool, installed: Vec<Installed>) -> Toolchains {
-        Self::with_installed_cap(data_dir, auto_install, DEFAULT_MAX_AUTO_TOOLCHAINS, installed)
+    pub fn with_installed(
+        data_dir: &Path,
+        auto_install: bool,
+        installed: Vec<Installed>,
+    ) -> Toolchains {
+        Self::with_installed_cap(
+            data_dir,
+            auto_install,
+            DEFAULT_MAX_AUTO_TOOLCHAINS,
+            installed,
+        )
     }
 
     /// [`Toolchains::with_installed`] with an explicit cap.
-    pub fn with_installed_cap(data_dir: &Path, auto_install: bool, max_auto: usize, installed: Vec<Installed>) -> Toolchains {
+    pub fn with_installed_cap(
+        data_dir: &Path,
+        auto_install: bool,
+        max_auto: usize,
+        installed: Vec<Installed>,
+    ) -> Toolchains {
         let auto = load_auto(data_dir, &installed);
         Toolchains {
             inner: Arc::new(Inner {
                 data_dir: data_dir.to_path_buf(),
                 auto_install,
                 max_auto,
-                state: Mutex::new(State { installed, auto, ..State::default() }),
+                state: Mutex::new(State {
+                    installed,
+                    auto,
+                    ..State::default()
+                }),
             }),
         }
     }
@@ -216,7 +251,11 @@ impl Toolchains {
     pub fn resolve(&self, id: &ToolchainId, target: &str) -> Option<Installed> {
         let spec = Self::install_spec(id);
         let mut st = self.lock();
-        let found = st.installed.iter().find(|t| t.id.same_compiler(id)).cloned();
+        let found = st
+            .installed
+            .iter()
+            .find(|t| t.id.same_compiler(id))
+            .cloned();
         if let Some(t) = &found
             && t.targets.iter().any(|x| x == target)
         {
@@ -248,20 +287,22 @@ impl Toolchains {
         let this = self.clone();
         let id = id.clone();
         let target = target.to_string();
-        let spawned = std::thread::Builder::new().name("crabfarm-install".into()).spawn(move || {
-            let ok = match this.install_blocking(&id, &spec, &target) {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::warn!("toolchain install {spec} (target {target}) failed: {e:#}");
-                    false
+        let spawned = std::thread::Builder::new()
+            .name("crabfarm-install".into())
+            .spawn(move || {
+                let ok = match this.install_blocking(&id, &spec, &target) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!("toolchain install {spec} (target {target}) failed: {e:#}");
+                        false
+                    }
+                };
+                let mut st = this.lock();
+                st.installing = None;
+                if !ok {
+                    st.failed.insert((spec, target));
                 }
-            };
-            let mut st = this.lock();
-            st.installing = None;
-            if !ok {
-                st.failed.insert((spec, target));
-            }
-        });
+            });
         if spawned.is_err() {
             let mut st = self.lock();
             st.installing = None;
@@ -276,7 +317,14 @@ impl Toolchains {
             tracing::info!("installing toolchain {spec}");
             let before: Vec<String> = self.list().into_iter().map(|t| t.name).collect();
             let mut cmd = Command::new("rustup");
-            cmd.args(["toolchain", "install", spec, "--profile", "minimal", "--no-self-update"]);
+            cmd.args([
+                "toolchain",
+                "install",
+                spec,
+                "--profile",
+                "minimal",
+                "--no-self-update",
+            ]);
             let install_res = self.run_recorded(cmd, INSTALL_TIMEOUT);
             // Even a failed or timed out install may have left a toolchain.
             let rescan_res = self.rescan();
@@ -305,7 +353,9 @@ impl Toolchains {
                 );
             }
         }
-        let Some(t) = found else { bail!("toolchain vanished") };
+        let Some(t) = found else {
+            bail!("toolchain vanished")
+        };
         if !t.targets.iter().any(|x| x == target) {
             tracing::info!("adding target {target} to {}", t.name);
             let mut cmd = Command::new("rustup");
@@ -326,7 +376,9 @@ impl Toolchains {
     /// Run one rustup child with the install timeout, recording its PID so
     /// that only this process can be killed.
     fn run_recorded(&self, mut cmd: Command, timeout: Duration) -> anyhow::Result<()> {
-        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         let mut child = cmd.spawn().context("spawn rustup")?;
         if let Some(i) = self.lock().installing.as_mut() {
             i.pid = Some(child.id());
@@ -374,7 +426,11 @@ impl Toolchains {
 
 /// Names present in `after` but not in `before`: what one install added.
 fn newly_added(before: &[String], after: &[Installed]) -> Vec<String> {
-    after.iter().filter(|t| !before.contains(&t.name)).map(|t| t.name.clone()).collect()
+    after
+        .iter()
+        .filter(|t| !before.contains(&t.name))
+        .map(|t| t.name.clone())
+        .collect()
 }
 
 fn load_auto(data_dir: &Path, installed: &[Installed]) -> Vec<String> {
@@ -387,7 +443,10 @@ fn load_auto(data_dir: &Path, installed: &[Installed]) -> Vec<String> {
         .ok()
         .and_then(|s| toml::from_str(&s).ok())
         .unwrap_or_default();
-    f.names.into_iter().filter(|n| installed.iter().any(|t| t.name == *n)).collect()
+    f.names
+        .into_iter()
+        .filter(|n| installed.iter().any(|t| t.name == *n))
+        .collect()
 }
 
 fn write_auto(data_dir: &Path, names: &[String]) -> anyhow::Result<()> {
@@ -450,14 +509,17 @@ pub fn valid_commit_date(s: &str) -> bool {
 
 /// 40 lowercase hex characters.
 pub fn valid_commit_hash(s: &str) -> bool {
-    s.len() == 40 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    s.len() == 40
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// `^[A-Za-z0-9_.-]{1,64}$`, not starting with `-` (it becomes a rustup argument).
 pub fn valid_target(s: &str) -> bool {
     (1..=64).contains(&s.len())
         && !s.starts_with('-')
-        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
 /// Check everything a peer-supplied id and target contribute to a rustup call.
@@ -513,7 +575,10 @@ fn next_day(date: &str) -> Option<String> {
 // ---- process helpers ----
 
 /// Wait for `child` up to `timeout`; on timeout kill exactly this child.
-fn wait_with_timeout(child: &mut std::process::Child, timeout: Duration) -> anyhow::Result<std::process::ExitStatus> {
+fn wait_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> anyhow::Result<std::process::ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(s) = child.try_wait().context("wait for child")? {
@@ -530,7 +595,9 @@ fn wait_with_timeout(child: &mut std::process::Child, timeout: Duration) -> anyh
 
 /// Run a command, return stdout as text; stderr is discarded.
 fn run_capture(mut cmd: Command, timeout: Duration) -> anyhow::Result<String> {
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
     let mut child = cmd.spawn().context("spawn")?;
     let mut stdout = child.stdout.take().context("no stdout pipe")?;
     // Reader thread so a full pipe cannot stall the child while we poll.
@@ -549,7 +616,9 @@ fn run_capture(mut cmd: Command, timeout: Duration) -> anyhow::Result<String> {
 
 /// Run the kill helper with a timeout (the helper itself can hang).
 fn run_kill_helper(mut cmd: Command) {
-    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     match cmd.spawn() {
         Ok(mut child) => {
             if let Err(e) = wait_with_timeout(&mut child, KILL_TIMEOUT) {
@@ -619,7 +688,11 @@ fn mtime_nanos(p: &Path) -> u128 {
 /// the mtime of `lib/rustlib` is part of the stamp too (otherwise the cached
 /// target list would go stale).
 fn stamp(dir: &Path) -> String {
-    format!("{}:{}", mtime_nanos(dir), mtime_nanos(&dir.join("lib").join("rustlib")))
+    format!(
+        "{}:{}",
+        mtime_nanos(dir),
+        mtime_nanos(&dir.join("lib").join("rustlib"))
+    )
 }
 
 fn parse_toolchain_list(out: &str) -> Vec<String> {
@@ -654,7 +727,11 @@ fn scan_installed(data_dir: &Path) -> anyhow::Result<Vec<Installed>> {
             continue;
         }
         let st = stamp(&dir);
-        let cached = old.toolchain.iter().find(|e| e.name == name && e.stamp == st).cloned();
+        let cached = old
+            .toolchain
+            .iter()
+            .find(|e| e.name == name && e.stamp == st)
+            .cloned();
         let entry = match cached {
             Some(e) => e,
             None => match fresh_entry(&name, &rustc, st) {
@@ -697,7 +774,12 @@ fn fresh_entry(name: &str, rustc: &Path, stamp: String) -> anyhow::Result<CacheE
     let mut cmd = Command::new("rustup");
     cmd.args(["target", "list", "--installed", "--toolchain", name]);
     let list = run_capture(cmd, QUERY_TIMEOUT).context("rustup target list")?;
-    let targets = list.lines().map(str::trim).filter(|l| !l.is_empty()).map(|l| l.split_whitespace().next().unwrap_or(l).to_string()).collect();
+    let targets = list
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| l.split_whitespace().next().unwrap_or(l).to_string())
+        .collect();
     Ok(CacheEntry {
         name: name.to_string(),
         stamp,
@@ -740,10 +822,19 @@ mod tests {
 
     #[test]
     fn install_specs() {
-        assert_eq!(Toolchains::install_spec(&parse_version_verbose(STABLE).unwrap()), "1.100.0");
-        assert_eq!(Toolchains::install_spec(&parse_version_verbose(BETA).unwrap()), "1.101.0-beta.3");
+        assert_eq!(
+            Toolchains::install_spec(&parse_version_verbose(STABLE).unwrap()),
+            "1.100.0"
+        );
+        assert_eq!(
+            Toolchains::install_spec(&parse_version_verbose(BETA).unwrap()),
+            "1.101.0-beta.3"
+        );
         // Year end rolls over: commit date + 1 day.
-        assert_eq!(Toolchains::install_spec(&parse_version_verbose(NIGHTLY).unwrap()), "nightly-2027-01-01");
+        assert_eq!(
+            Toolchains::install_spec(&parse_version_verbose(NIGHTLY).unwrap()),
+            "nightly-2027-01-01"
+        );
     }
 
     #[test]
@@ -762,14 +853,23 @@ mod tests {
         let out = "stable-x86_64-pc-windows-msvc (default)\n1.95.0-x86_64-pc-windows-msvc\nnightly-2026-11-01-x86_64-pc-windows-msvc (active)\n";
         assert_eq!(
             parse_toolchain_list(out),
-            vec!["stable-x86_64-pc-windows-msvc", "1.95.0-x86_64-pc-windows-msvc", "nightly-2026-11-01-x86_64-pc-windows-msvc"]
+            vec![
+                "stable-x86_64-pc-windows-msvc",
+                "1.95.0-x86_64-pc-windows-msvc",
+                "nightly-2026-11-01-x86_64-pc-windows-msvc"
+            ]
         );
         assert!(parse_toolchain_list("no installed toolchains\n").is_empty());
     }
 
     fn fake(release: &str, hash: &str, targets: &[&str]) -> Installed {
         Installed {
-            id: ToolchainId { release: release.into(), commit_hash: hash.into(), commit_date: "2026-11-09".into(), host: "h".into() },
+            id: ToolchainId {
+                release: release.into(),
+                commit_hash: hash.into(),
+                commit_date: "2026-11-09".into(),
+                host: "h".into(),
+            },
             name: release.into(),
             rustc: PathBuf::from("rustc"),
             targets: targets.iter().map(|s| s.to_string()).collect(),
@@ -780,18 +880,40 @@ mod tests {
     fn resolve_matches_compiler_and_target_without_install() {
         let d = tempfile::tempdir().unwrap();
         let tc = Toolchains::with_installed(d.path(), false, vec![fake("1.100.0", "abc", &["h"])]);
-        let want = ToolchainId { release: "1.100.0".into(), commit_hash: "abc".into(), commit_date: String::new(), host: "other".into() };
-        assert!(tc.resolve(&want, "h").is_some(), "host of the id may differ");
-        assert!(tc.resolve(&want, "wasm32").is_none(), "missing target, auto_install off");
-        let other = ToolchainId { commit_hash: "zzz".into(), ..want };
-        assert!(tc.resolve(&other, "h").is_none(), "same release, other commit");
+        let want = ToolchainId {
+            release: "1.100.0".into(),
+            commit_hash: "abc".into(),
+            commit_date: String::new(),
+            host: "other".into(),
+        };
+        assert!(
+            tc.resolve(&want, "h").is_some(),
+            "host of the id may differ"
+        );
+        assert!(
+            tc.resolve(&want, "wasm32").is_none(),
+            "missing target, auto_install off"
+        );
+        let other = ToolchainId {
+            commit_hash: "zzz".into(),
+            ..want
+        };
+        assert!(
+            tc.resolve(&other, "h").is_none(),
+            "same release, other commit"
+        );
         assert!(!tc.is_installing());
     }
 
     const HASH: &str = "0ef1bc386059596dada8fb65b50425aab2ea637a";
 
     fn wanted(release: &str, hash: &str, date: &str) -> ToolchainId {
-        ToolchainId { release: release.into(), commit_hash: hash.into(), commit_date: date.into(), host: "h".into() }
+        ToolchainId {
+            release: release.into(),
+            commit_hash: hash.into(),
+            commit_date: date.into(),
+            host: "h".into(),
+        }
     }
 
     #[test]
@@ -800,8 +922,20 @@ mod tests {
             assert!(valid_release(ok), "{ok}");
         }
         for bad in [
-            "", "-1.0.0", "--help", "1.100", "1.100.0.1", "1.100.0-beta", "1.100.0-beta.", "1.100.0-rc.1", "stable",
-            "nightly", "1.100.0 --x", "1.100.0-nightly.1", "a.b.c", "1.100.0\n",
+            "",
+            "-1.0.0",
+            "--help",
+            "1.100",
+            "1.100.0.1",
+            "1.100.0-beta",
+            "1.100.0-beta.",
+            "1.100.0-rc.1",
+            "stable",
+            "nightly",
+            "1.100.0 --x",
+            "1.100.0-nightly.1",
+            "a.b.c",
+            "1.100.0\n",
         ] {
             assert!(!valid_release(bad), "{bad:?}");
         }
@@ -812,8 +946,17 @@ mod tests {
         assert!(valid_commit_date("2026-11-09"));
         assert!(valid_commit_date("2028-02-29"));
         for bad in [
-            "", "2027-02-29", "2026-13-01", "2026-00-10", "2026-11-31", "2026-1-09", "26-11-09", "-026-11-09",
-            "2026-11-09x", "2026/11/09", "1999-01-01",
+            "",
+            "2027-02-29",
+            "2026-13-01",
+            "2026-00-10",
+            "2026-11-31",
+            "2026-1-09",
+            "26-11-09",
+            "-026-11-09",
+            "2026-11-09x",
+            "2026/11/09",
+            "1999-01-01",
         ] {
             assert!(!valid_commit_date(bad), "{bad:?}");
         }
@@ -843,12 +986,30 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let tc = Toolchains::with_installed(d.path(), true, vec![]);
         // `--bogus-flag` would be a rustup argument on unvalidated code.
-        assert!(tc.resolve(&wanted("--bogus-flag", HASH, "2026-11-09"), "h").is_none());
-        assert!(!tc.is_installing(), "an invalid release must not start rustup");
-        assert!(tc.resolve(&wanted("9.99.9", HASH, "2026-11-09"), "--bogus-flag").is_none());
-        assert!(!tc.is_installing(), "an invalid target must not start rustup");
-        assert!(tc.resolve(&wanted("9.99.9", "deadbeef", "2026-11-09"), "h").is_none());
-        assert!(!tc.is_installing(), "an invalid commit hash must not start rustup");
+        assert!(
+            tc.resolve(&wanted("--bogus-flag", HASH, "2026-11-09"), "h")
+                .is_none()
+        );
+        assert!(
+            !tc.is_installing(),
+            "an invalid release must not start rustup"
+        );
+        assert!(
+            tc.resolve(&wanted("9.99.9", HASH, "2026-11-09"), "--bogus-flag")
+                .is_none()
+        );
+        assert!(
+            !tc.is_installing(),
+            "an invalid target must not start rustup"
+        );
+        assert!(
+            tc.resolve(&wanted("9.99.9", "deadbeef", "2026-11-09"), "h")
+                .is_none()
+        );
+        assert!(
+            !tc.is_installing(),
+            "an invalid commit hash must not start rustup"
+        );
     }
 
     #[test]
@@ -858,13 +1019,24 @@ mod tests {
         a.name = "1.90.0-h".into();
         let mut b = fake("1.91.0", "abd", &["h"]);
         b.name = "1.91.0-h".into();
-        write_auto(d.path(), &["1.90.0-h".to_string(), "1.91.0-h".to_string(), "gone-h".to_string()]).unwrap();
+        write_auto(
+            d.path(),
+            &[
+                "1.90.0-h".to_string(),
+                "1.91.0-h".to_string(),
+                "gone-h".to_string(),
+            ],
+        )
+        .unwrap();
         let tc = Toolchains::with_installed_cap(d.path(), true, 2, vec![a, b]);
         // The entry for a toolchain that no longer exists does not count.
         assert_eq!(tc.auto_installed(), vec!["1.90.0-h", "1.91.0-h"]);
         let new = wanted("9.99.9", HASH, "2026-11-09");
         assert!(tc.resolve(&new, "h").is_none());
-        assert!(!tc.is_installing(), "cap reached: no new toolchain may be installed");
+        assert!(
+            !tc.is_installing(),
+            "cap reached: no new toolchain may be installed"
+        );
         // Cap 0 disables toolchain auto installs entirely.
         let tc0 = Toolchains::with_installed_cap(d.path(), true, 0, vec![]);
         assert!(tc0.resolve(&new, "h").is_none());
@@ -906,9 +1078,16 @@ mod tests {
         let tc = Toolchains::scan(d.path(), false).unwrap();
         let active = query(Path::new("rustc")).unwrap();
         let list = tc.list();
-        let hit = list.iter().find(|t| t.id.same_compiler(&active)).expect("active toolchain not listed");
+        let hit = list
+            .iter()
+            .find(|t| t.id.same_compiler(&active))
+            .expect("active toolchain not listed");
         assert!(hit.rustc.is_file());
-        assert!(hit.targets.contains(&active.host), "host target missing: {:?}", hit.targets);
+        assert!(
+            hit.targets.contains(&active.host),
+            "host target missing: {:?}",
+            hit.targets
+        );
         assert!(tc.resolve(&active, &active.host).is_some());
         // Second scan is served from the cache file and agrees.
         assert!(d.path().join("toolchains.toml").is_file());

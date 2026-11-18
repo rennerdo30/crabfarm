@@ -41,7 +41,9 @@ impl std::fmt::Display for CollectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CollectError::TooLarge => write!(f, "job inputs exceed the size cap"),
-            CollectError::MissingNativeLib(n) => write!(f, "native library `{n}` not found in the search dirs"),
+            CollectError::MissingNativeLib(n) => {
+                write!(f, "native library `{n}` not found in the search dirs")
+            }
             CollectError::Io(e) => write!(f, "reading job inputs: {e}"),
         }
     }
@@ -70,7 +72,15 @@ pub fn collect(
     link_libs: &[(String, String)],
     target_is_msvc: bool,
 ) -> Result<Collected, CollectError> {
-    collect_with_limits(package_dir, out_dir_env, search_dirs, link_libs, target_is_msvc, MAX_FILE, MAX_TOTAL)
+    collect_with_limits(
+        package_dir,
+        out_dir_env,
+        search_dirs,
+        link_libs,
+        target_is_msvc,
+        MAX_FILE,
+        MAX_TOTAL,
+    )
 }
 
 struct Acc {
@@ -108,23 +118,31 @@ fn is_executable(_meta: &std::fs::Metadata) -> bool {
 /// Walk `root`; `is_package` selects the skip rules for the package dir.
 fn walk(root: &Path, is_package: bool, max_file: u64, acc: &mut Acc) -> Result<(), CollectError> {
     let canon_root = root.canonicalize()?;
-    let walker = WalkDir::new(root).follow_links(false).sort_by_file_name().into_iter().filter_entry(|e| {
-        if !is_package || e.depth() == 0 || !e.file_type().is_dir() {
-            return true;
-        }
-        let name = e.file_name().to_string_lossy();
-        !(name.starts_with('.') || (e.depth() == 1 && name == "target"))
-    });
+    let walker = WalkDir::new(root)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|e| {
+            if !is_package || e.depth() == 0 || !e.file_type().is_dir() {
+                return true;
+            }
+            let name = e.file_name().to_string_lossy();
+            !(name.starts_with('.') || (e.depth() == 1 && name == "target"))
+        });
     for entry in walker {
         let entry = entry?;
         let ft = entry.file_type();
         let (meta, path) = if ft.is_symlink() {
             // Only a link to a regular file inside the tree counts.
-            let Ok(canon) = entry.path().canonicalize() else { continue };
+            let Ok(canon) = entry.path().canonicalize() else {
+                continue;
+            };
             if !canon.starts_with(&canon_root) {
                 continue;
             }
-            let Ok(meta) = std::fs::metadata(entry.path()) else { continue };
+            let Ok(meta) = std::fs::metadata(entry.path()) else {
+                continue;
+            };
             if !meta.is_file() {
                 continue;
             }
@@ -154,7 +172,12 @@ fn collect_with_limits(
     max_file: u64,
     max_total: u64,
 ) -> Result<Collected, CollectError> {
-    let mut acc = Acc { files: Vec::new(), total: 0, seen: HashSet::new(), max_total };
+    let mut acc = Acc {
+        files: Vec::new(),
+        total: 0,
+        seen: HashSet::new(),
+        max_total,
+    };
     walk(package_dir, true, max_file, &mut acc)?;
     if let Some(out) = out_dir_env {
         walk(out, false, max_file, &mut acc)?;
@@ -164,7 +187,11 @@ fn collect_with_limits(
         if kind.split(':').next() != Some("static") {
             continue;
         }
-        let file = if target_is_msvc { format!("{name}.lib") } else { format!("lib{name}.a") };
+        let file = if target_is_msvc {
+            format!("{name}.lib")
+        } else {
+            format!("lib{name}.a")
+        };
         let found = search_dirs
             .iter()
             .filter(|(k, _)| k == "native" || k == "all")
@@ -179,7 +206,10 @@ fn collect_with_limits(
         }
         acc.add(path, meta.len(), is_executable(&meta))?;
     }
-    Ok(Collected { files: acc.files, total: acc.total })
+    Ok(Collected {
+        files: acc.files,
+        total: acc.total,
+    })
 }
 
 /// Hash cache keyed by client path, valid while (size, mtime nanos) match.
@@ -201,7 +231,9 @@ fn mtime_nanos(meta: &std::fs::Metadata) -> std::io::Result<i128> {
 }
 
 fn now_nanos() -> i128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as i128)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as i128)
 }
 
 impl HashCache {
@@ -210,7 +242,10 @@ impl HashCache {
     pub fn hash(&mut self, client: &ClientPath, path: &Path) -> std::io::Result<(BlobHash, u64)> {
         let meta = std::fs::metadata(path)?;
         if !meta.is_file() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
         }
         let (size, mtime) = (meta.len(), mtime_nanos(&meta)?);
         if let Some((s, m, h)) = self.entries.get(client)
@@ -254,7 +289,12 @@ mod tests {
         let mut v: Vec<String> = c
             .files
             .iter()
-            .map(|(p, _, _)| p.strip_prefix(root).unwrap_or(p).to_string_lossy().replace('\\', "/"))
+            .map(|(p, _, _)| {
+                p.strip_prefix(root)
+                    .unwrap_or(p)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
             .collect();
         v.sort();
         v
@@ -270,14 +310,25 @@ mod tests {
         let r = d.path();
         write(&r.join("Cargo.toml"), b"x");
         write(&r.join("src/lib.rs"), b"fn a(){}");
-        write(&r.join("src/target/mod.rs"), b"nested module dir named target is source");
+        write(
+            &r.join("src/target/mod.rs"),
+            b"nested module dir named target is source",
+        );
         write(&r.join("target/debug/junk.rlib"), b"junk");
         write(&r.join(".git/HEAD"), b"ref");
         write(&r.join(".hidden/x.rs"), b"x");
         write(&r.join("src/.cache/y.rs"), b"y");
         write(&r.join(".gitignore"), b"a dot FILE is kept");
         let c = collect_pkg(r);
-        assert_eq!(names(&c, r), vec![".gitignore", "Cargo.toml", "src/lib.rs", "src/target/mod.rs"]);
+        assert_eq!(
+            names(&c, r),
+            vec![
+                ".gitignore",
+                "Cargo.toml",
+                "src/lib.rs",
+                "src/target/mod.rs"
+            ]
+        );
         assert_eq!(c.total, c.files.iter().map(|f| f.1).sum::<u64>());
     }
 
@@ -314,14 +365,26 @@ mod tests {
         write(&out.join("a/gen.rs"), b"gen");
         write(&out.join(".hidden/h.rs"), b"h");
         let c = collect(&pkg, Some(&out), &[], &[], true).expect("collect");
-        assert_eq!(names(&c, d.path()), vec!["out/.hidden/h.rs", "out/a/gen.rs", "pkg/lib.rs"]);
+        assert_eq!(
+            names(&c, d.path()),
+            vec!["out/.hidden/h.rs", "out/a/gen.rs", "pkg/lib.rs"]
+        );
         // OUT_DIR inside the package dir is not listed twice.
         let inner = pkg.join("gen");
         write(&inner.join("g.rs"), b"g");
         let c = collect(&pkg, Some(&inner), &[], &[], true).expect("collect");
-        assert_eq!(c.files.iter().filter(|(p, _, _)| p.ends_with("g.rs")).count(), 1);
+        assert_eq!(
+            c.files
+                .iter()
+                .filter(|(p, _, _)| p.ends_with("g.rs"))
+                .count(),
+            1
+        );
         // A missing OUT_DIR is an error, not silently empty.
-        assert!(matches!(collect(&pkg, Some(&d.path().join("nope")), &[], &[], true), Err(CollectError::Io(_))));
+        assert!(matches!(
+            collect(&pkg, Some(&d.path().join("nope")), &[], &[], true),
+            Err(CollectError::Io(_))
+        ));
     }
 
     #[test]
@@ -342,9 +405,14 @@ mod tests {
         let all = vec![("all".to_string(), libs.clone())];
         assert!(collect(&pkg, None, &all, &wanted("foo"), true).is_ok());
         let dep = vec![("dependency".to_string(), libs.clone())];
-        assert!(matches!(collect(&pkg, None, &dep, &wanted("foo"), true), Err(CollectError::MissingNativeLib(n)) if n == "foo"));
+        assert!(
+            matches!(collect(&pkg, None, &dep, &wanted("foo"), true), Err(CollectError::MissingNativeLib(n)) if n == "foo")
+        );
         // Wrong naming scheme for the target is missing, not found.
-        assert!(matches!(collect(&pkg, None, &dirs, &wanted("bar"), true), Err(CollectError::MissingNativeLib(_))));
+        assert!(matches!(
+            collect(&pkg, None, &dirs, &wanted("bar"), true),
+            Err(CollectError::MissingNativeLib(_))
+        ));
         // Modifier kinds still count as static; dylibs are never collected.
         let modded = vec![("static:+bundle".to_string(), "foo".to_string())];
         assert!(collect(&pkg, None, &dirs, &modded, true).is_ok());
@@ -384,7 +452,10 @@ mod tests {
             eprintln!("symlinks not available here, skipping");
             return;
         }
-        assert!(mk_file(&d.path().join("outside.rs"), &pkg.join("outside_link.rs")));
+        assert!(mk_file(
+            &d.path().join("outside.rs"),
+            &pkg.join("outside_link.rs")
+        ));
         assert!(mk_dir(&d.path().join("outside_dir"), &pkg.join("dir_link")));
         assert!(mk_dir(&pkg, &pkg.join("self_loop")));
         let c = collect_pkg(&pkg);
@@ -399,7 +470,12 @@ mod tests {
         write(&f, b"hello world");
         // Make the stamp old enough to be cached.
         let old = SystemTime::now() - Duration::from_secs(3600);
-        fs::File::options().write(true).open(&f).expect("open").set_modified(old).expect("mtime");
+        fs::File::options()
+            .write(true)
+            .open(&f)
+            .expect("open")
+            .set_modified(old)
+            .expect("mtime");
         let client = ClientPath::parse(PathStyle::Windows, r"C:\p\f.rs").expect("path");
         let mut cache = HashCache::default();
         let (h, size) = cache.hash(&client, &f).expect("hash");
@@ -412,11 +488,24 @@ mod tests {
         cache.entries.insert(client.clone(), (s, m, fake));
         assert_eq!(cache.hash(&client, &f).expect("hash").0, fake);
         // Same size, new mtime: rehashed.
-        fs::File::options().write(true).open(&f).expect("open").set_modified(old + Duration::from_secs(5)).expect("mtime");
-        assert_eq!(cache.hash(&client, &f).expect("hash").0, BlobHash::of(b"hello world"));
+        fs::File::options()
+            .write(true)
+            .open(&f)
+            .expect("open")
+            .set_modified(old + Duration::from_secs(5))
+            .expect("mtime");
+        assert_eq!(
+            cache.hash(&client, &f).expect("hash").0,
+            BlobHash::of(b"hello world")
+        );
         // Different content and size: rehashed.
         write(&f, b"changed content");
-        fs::File::options().write(true).open(&f).expect("open").set_modified(old).expect("mtime");
+        fs::File::options()
+            .write(true)
+            .open(&f)
+            .expect("open")
+            .set_modified(old)
+            .expect("mtime");
         let (h, size) = cache.hash(&client, &f).expect("hash");
         assert_eq!((h, size), (BlobHash::of(b"changed content"), 15));
     }
@@ -430,7 +519,10 @@ mod tests {
         let mut cache = HashCache::default();
         let (h, _) = cache.hash(&client, &f).expect("hash");
         assert_eq!(h, BlobHash::of(b"just written"));
-        assert!(cache.entries.is_empty(), "a file modified a moment ago must not be cached");
+        assert!(
+            cache.entries.is_empty(),
+            "a file modified a moment ago must not be cached"
+        );
     }
 
     #[test]
@@ -439,9 +531,14 @@ mod tests {
         let client = ClientPath::parse(PathStyle::Posix, "/p/x").expect("path");
         let mut cache = HashCache::default();
         assert!(cache.hash(&client, &d.path().join("missing")).is_err());
-        assert!(cache.hash(&client, d.path()).is_err(), "a directory is not hashable");
+        assert!(
+            cache.hash(&client, d.path()).is_err(),
+            "a directory is not hashable"
+        );
         // The persisted form (postcard) round-trips, including a pre-1970 mtime.
-        cache.entries.insert(client.clone(), (3, -5, BlobHash([1; 32])));
+        cache
+            .entries
+            .insert(client.clone(), (3, -5, BlobHash([1; 32])));
         let bytes = postcard::to_stdvec(&cache).expect("encode");
         let back: HashCache = postcard::from_bytes(&bytes).expect("decode");
         assert_eq!(back.entries[&client], (3, -5, BlobHash([1; 32])));

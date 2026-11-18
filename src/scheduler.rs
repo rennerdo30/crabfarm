@@ -33,7 +33,9 @@ pub fn eligible(status: &Status, needs: &JobNeeds) -> bool {
         .toolchains
         .iter()
         .zip(&status.targets)
-        .any(|(t, targets)| t.same_compiler(needs.toolchain) && targets.iter().any(|x| x == needs.target))
+        .any(|(t, targets)| {
+            t.same_compiler(needs.toolchain) && targets.iter().any(|x| x == needs.target)
+        })
 }
 
 /// Score points lost for uploading `upload_bytes`: one reference slot per second.
@@ -58,7 +60,11 @@ pub struct Candidate {
 
 impl Candidate {
     pub fn score(&self) -> i64 {
-        score(self.free_slots, self.speed, link_penalty(self.upload_bytes, self.bandwidth_bps))
+        score(
+            self.free_slots,
+            self.speed,
+            link_penalty(self.upload_bytes, self.bandwidth_bps),
+        )
     }
 }
 
@@ -97,10 +103,20 @@ mod tests {
     use super::*;
 
     fn tc(commit: &str) -> ToolchainId {
-        ToolchainId { release: "1.100.0".into(), commit_hash: commit.into(), commit_date: "2026-11-09".into(), host: "x86_64-pc-windows-msvc".into() }
+        ToolchainId {
+            release: "1.100.0".into(),
+            commit_hash: commit.into(),
+            commit_date: "2026-11-09".into(),
+            host: "x86_64-pc-windows-msvc".into(),
+        }
     }
 
-    fn status(host: &str, toolchains: Vec<ToolchainId>, targets: Vec<Vec<String>>, accepting: bool) -> Status {
+    fn status(
+        host: &str,
+        toolchains: Vec<ToolchainId>,
+        targets: Vec<Vec<String>>,
+        accepting: bool,
+    ) -> Status {
         Status {
             node_id: crate::proto::NodeId([1; 16]),
             node_name: "p".into(),
@@ -116,7 +132,12 @@ mod tests {
     }
 
     fn cand(free: u32, upload: u64) -> Candidate {
-        Candidate { free_slots: free, speed: REFERENCE_SPEED, upload_bytes: upload, bandwidth_bps: DEFAULT_BANDWIDTH_BPS }
+        Candidate {
+            free_slots: free,
+            speed: REFERENCE_SPEED,
+            upload_bytes: upload,
+            bandwidth_bps: DEFAULT_BANDWIDTH_BPS,
+        }
     }
 
     #[test]
@@ -151,7 +172,10 @@ mod tests {
 
     #[test]
     fn best_peer_wins_and_equal_peers_pick_the_first() {
-        assert_eq!(choose(0, false, &[cand(2, 0), cand(5, 0), cand(5, 0)]), Choice::Peer(1));
+        assert_eq!(
+            choose(0, false, &[cand(2, 0), cand(5, 0), cand(5, 0)]),
+            Choice::Peer(1)
+        );
     }
 
     #[test]
@@ -165,19 +189,61 @@ mod tests {
     #[test]
     fn eligibility_checks_toolchain_target_host_and_accepting() {
         let id = tc("abc");
-        let needs = JobNeeds { toolchain: &id, target: "x86_64-pc-windows-msvc", needs_host: false, local_host: "x86_64-pc-windows-msvc" };
-        let ok = status("x86_64-pc-windows-msvc", vec![tc("abc")], vec![vec!["x86_64-pc-windows-msvc".into()]], true);
+        let needs = JobNeeds {
+            toolchain: &id,
+            target: "x86_64-pc-windows-msvc",
+            needs_host: false,
+            local_host: "x86_64-pc-windows-msvc",
+        };
+        let ok = status(
+            "x86_64-pc-windows-msvc",
+            vec![tc("abc")],
+            vec![vec!["x86_64-pc-windows-msvc".into()]],
+            true,
+        );
         assert!(eligible(&ok, &needs));
         // Other compiler build.
-        assert!(!eligible(&status("x86_64-pc-windows-msvc", vec![tc("def")], vec![vec!["x86_64-pc-windows-msvc".into()]], true), &needs));
+        assert!(!eligible(
+            &status(
+                "x86_64-pc-windows-msvc",
+                vec![tc("def")],
+                vec![vec!["x86_64-pc-windows-msvc".into()]],
+                true
+            ),
+            &needs
+        ));
         // Target missing.
-        assert!(!eligible(&status("x86_64-pc-windows-msvc", vec![tc("abc")], vec![vec!["aarch64-apple-darwin".into()]], true), &needs));
+        assert!(!eligible(
+            &status(
+                "x86_64-pc-windows-msvc",
+                vec![tc("abc")],
+                vec![vec!["aarch64-apple-darwin".into()]],
+                true
+            ),
+            &needs
+        ));
         // Not accepting.
-        assert!(!eligible(&status("x86_64-pc-windows-msvc", vec![tc("abc")], vec![vec!["x86_64-pc-windows-msvc".into()]], false), &needs));
+        assert!(!eligible(
+            &status(
+                "x86_64-pc-windows-msvc",
+                vec![tc("abc")],
+                vec![vec!["x86_64-pc-windows-msvc".into()]],
+                false
+            ),
+            &needs
+        ));
         // Same compiler build on another host is fine for ordinary jobs, not for proc macros.
-        let other = status("x86_64-unknown-linux-gnu", vec![tc("abc")], vec![vec!["x86_64-pc-windows-msvc".into()]], true);
+        let other = status(
+            "x86_64-unknown-linux-gnu",
+            vec![tc("abc")],
+            vec![vec!["x86_64-pc-windows-msvc".into()]],
+            true,
+        );
         assert!(eligible(&other, &needs));
-        let pm = JobNeeds { needs_host: true, ..needs };
+        let pm = JobNeeds {
+            needs_host: true,
+            ..needs
+        };
         assert!(!eligible(&other, &pm));
         assert!(eligible(&ok, &pm));
     }

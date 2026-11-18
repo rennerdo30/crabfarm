@@ -43,7 +43,9 @@ pub enum Unknown {
 impl std::fmt::Display for Unknown {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Unknown::NotRecorded(p) => write!(f, "dependency {} was not built through crabfarm", p.path),
+            Unknown::NotRecorded(p) => {
+                write!(f, "dependency {} was not built through crabfarm", p.path)
+            }
             Unknown::Changed(p) => write!(f, "dependency {} changed since it was recorded", p.path),
         }
     }
@@ -57,7 +59,10 @@ pub struct DepGraph {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// (size, mtime in ns since the epoch) of a local file.
@@ -82,7 +87,10 @@ pub fn is_proc_macro_lib(p: &ClientPath) -> bool {
 impl DepGraph {
     /// A missing file is an empty graph; a corrupt one too (it is only a cache).
     pub fn load(path: &Path) -> DepGraph {
-        std::fs::read(path).ok().and_then(|b| postcard::from_bytes::<DepGraph>(&b).ok()).unwrap_or_default()
+        std::fs::read(path)
+            .ok()
+            .and_then(|b| postcard::from_bytes::<DepGraph>(&b).ok())
+            .unwrap_or_default()
     }
 
     /// Persist when something changed. Pending entries are not written.
@@ -91,7 +99,12 @@ impl DepGraph {
             return Ok(());
         }
         let snapshot = DepGraph {
-            entries: self.entries.iter().filter(|(_, e)| e.pending_since.is_none()).map(|(k, v)| (k.clone(), v.clone())).collect(),
+            entries: self
+                .entries
+                .iter()
+                .filter(|(_, e)| e.pending_since.is_none())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
             dirty: false,
         };
         let bytes = postcard::to_stdvec(&snapshot)?;
@@ -120,7 +133,15 @@ impl DepGraph {
             self.entries.clear();
         }
         for p in produces {
-            self.entries.insert(p.clone(), Entry { size: 0, mtime_ns: 0, externs: externs.to_vec(), pending_since: Some(now) });
+            self.entries.insert(
+                p.clone(),
+                Entry {
+                    size: 0,
+                    mtime_ns: 0,
+                    externs: externs.to_vec(),
+                    pending_since: Some(now),
+                },
+            );
         }
     }
 
@@ -165,7 +186,10 @@ impl DepGraph {
             if !seen.insert(p.clone()) {
                 continue;
             }
-            let e = self.entries.get(&p).ok_or_else(|| Unknown::NotRecorded(p.clone()))?;
+            let e = self
+                .entries
+                .get(&p)
+                .ok_or_else(|| Unknown::NotRecorded(p.clone()))?;
             match e.pending_since {
                 Some(t) if now.saturating_sub(t) <= PENDING_TTL_SECS => {}
                 Some(_) => return Err(Unknown::NotRecorded(p)),
@@ -220,7 +244,10 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let a = make(d.path(), "liba.rlib", "a");
         let g = DepGraph::default();
-        assert_eq!(g.closure(std::slice::from_ref(&a)), Err(Unknown::NotRecorded(a)));
+        assert_eq!(
+            g.closure(std::slice::from_ref(&a)),
+            Err(Unknown::NotRecorded(a))
+        );
     }
 
     #[test]
@@ -231,7 +258,10 @@ mod tests {
         let mut g = DepGraph::default();
         // b was built from a, but a itself was never seen.
         g.record(std::slice::from_ref(&b), std::slice::from_ref(&a));
-        assert_eq!(g.closure(std::slice::from_ref(&b)), Err(Unknown::NotRecorded(a)));
+        assert_eq!(
+            g.closure(std::slice::from_ref(&b)),
+            Err(Unknown::NotRecorded(a))
+        );
     }
 
     #[test]
@@ -243,7 +273,10 @@ mod tests {
         assert!(g.closure(std::slice::from_ref(&a)).is_ok());
         // Different size, so the check does not depend on mtime granularity.
         std::fs::write(a.to_local(), "aaaa").unwrap();
-        assert_eq!(g.closure(std::slice::from_ref(&a)), Err(Unknown::Changed(a)));
+        assert_eq!(
+            g.closure(std::slice::from_ref(&a)),
+            Err(Unknown::Changed(a))
+        );
     }
 
     #[test]
@@ -253,7 +286,10 @@ mod tests {
         let mut g = DepGraph::default();
         g.begin_at(std::slice::from_ref(&a), &[], 1000);
         assert!(g.closure_at(std::slice::from_ref(&a), 1100).is_ok());
-        assert_eq!(g.closure_at(std::slice::from_ref(&a), 1000 + PENDING_TTL_SECS + 1), Err(Unknown::NotRecorded(a)));
+        assert_eq!(
+            g.closure_at(std::slice::from_ref(&a), 1000 + PENDING_TTL_SECS + 1),
+            Err(Unknown::NotRecorded(a))
+        );
     }
 
     #[test]
@@ -283,7 +319,10 @@ mod tests {
 
     #[test]
     fn proc_macro_libraries_are_recognised() {
-        let p = |s: &str| ClientPath { style: crate::proto::PathStyle::Posix, path: s.into() };
+        let p = |s: &str| ClientPath {
+            style: crate::proto::PathStyle::Posix,
+            path: s.into(),
+        };
         assert!(is_proc_macro_lib(&p("/t/deps/derive_mac-1.dll")));
         assert!(is_proc_macro_lib(&p("/t/deps/libderive_mac-1.so")));
         assert!(!is_proc_macro_lib(&p("/t/deps/libcore_lib-1.rlib")));

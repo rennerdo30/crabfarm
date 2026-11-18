@@ -32,8 +32,9 @@ mod imp {
     use std::ffi::c_void;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject,
     };
 
     pub struct Tree(HANDLE);
@@ -50,7 +51,10 @@ mod imp {
             unsafe {
                 let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
                 if job.is_null() {
-                    anyhow::bail!("CreateJobObject failed: {}", std::io::Error::last_os_error());
+                    anyhow::bail!(
+                        "CreateJobObject failed: {}",
+                        std::io::Error::last_os_error()
+                    );
                 }
                 let tree = Tree(job);
                 let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
@@ -62,10 +66,16 @@ mod imp {
                     std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
                 );
                 if ok == 0 {
-                    anyhow::bail!("SetInformationJobObject failed: {}", std::io::Error::last_os_error());
+                    anyhow::bail!(
+                        "SetInformationJobObject failed: {}",
+                        std::io::Error::last_os_error()
+                    );
                 }
                 if AssignProcessToJobObject(job, process) == 0 {
-                    anyhow::bail!("AssignProcessToJobObject failed: {}", std::io::Error::last_os_error());
+                    anyhow::bail!(
+                        "AssignProcessToJobObject failed: {}",
+                        std::io::Error::last_os_error()
+                    );
                 }
                 Ok(tree)
             }
@@ -101,7 +111,10 @@ mod imp {
 
     impl Tree {
         pub fn adopt(pid: u32) -> anyhow::Result<Tree> {
-            let pgid = i32::try_from(pid).ok().filter(|p| *p > 1).ok_or_else(|| anyhow::anyhow!("invalid child pid"))?;
+            let pgid = i32::try_from(pid)
+                .ok()
+                .filter(|p| *p > 1)
+                .ok_or_else(|| anyhow::anyhow!("invalid child pid"))?;
             Ok(Tree { pgid, armed: true })
         }
 
@@ -154,12 +167,16 @@ impl ProcessTree {
     pub fn adopt(child: &tokio::process::Child) -> anyhow::Result<ProcessTree> {
         #[cfg(windows)]
         {
-            let handle = child.raw_handle().ok_or_else(|| anyhow::anyhow!("child already exited"))?;
+            let handle = child
+                .raw_handle()
+                .ok_or_else(|| anyhow::anyhow!("child already exited"))?;
             Ok(ProcessTree(imp::Tree::adopt(handle)?))
         }
         #[cfg(not(windows))]
         {
-            let pid = child.id().ok_or_else(|| anyhow::anyhow!("child already exited"))?;
+            let pid = child
+                .id()
+                .ok_or_else(|| anyhow::anyhow!("child already exited"))?;
             Ok(ProcessTree(imp::Tree::adopt(pid)?))
         }
     }

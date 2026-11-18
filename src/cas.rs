@@ -11,9 +11,9 @@ use crate::proto::{BlobHash, CHUNK_SIZE, NodeId};
 use anyhow::{Context, bail};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -72,13 +72,20 @@ impl Drop for PinGuard<'_> {
 impl BlobStore {
     pub fn open(dir: &Path, max_bytes: u64) -> anyhow::Result<BlobStore> {
         fs::create_dir_all(dir).with_context(|| format!("create blob store {}", dir.display()))?;
-        Ok(BlobStore { dir: dir.to_path_buf(), max_bytes, pins: Mutex::default() })
+        Ok(BlobStore {
+            dir: dir.to_path_buf(),
+            max_bytes,
+            pins: Mutex::default(),
+        })
     }
 
     /// Pin the blobs of `owner` with these hashes (present or not yet received)
     /// until the guard is dropped. Pins nest: a blob stays while any guard holds it.
     pub fn pin(&self, owner: NodeId, hashes: impl IntoIterator<Item = BlobHash>) -> PinGuard<'_> {
-        let mut paths: Vec<PathBuf> = hashes.into_iter().map(|h| self.path_of(owner, &h)).collect();
+        let mut paths: Vec<PathBuf> = hashes
+            .into_iter()
+            .map(|h| self.path_of(owner, &h))
+            .collect();
         paths.sort();
         paths.dedup();
         let mut pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
@@ -91,7 +98,10 @@ impl BlobStore {
 
     /// True when a running job holds this blob.
     fn pinned(&self, path: &Path) -> bool {
-        self.pins.lock().unwrap_or_else(|e| e.into_inner()).contains_key(path)
+        self.pins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(path)
     }
 
     fn path_of(&self, owner: NodeId, hash: &BlobHash) -> PathBuf {
@@ -106,7 +116,13 @@ impl BlobStore {
 
     /// Verify `BlobHash::of(plaintext) == hash`, encrypt and store atomically
     /// (temp file + rename). Touches mtime for LRU.
-    pub fn put(&self, owner: NodeId, key: &[u8; 32], hash: &BlobHash, plaintext: &[u8]) -> anyhow::Result<()> {
+    pub fn put(
+        &self,
+        owner: NodeId,
+        key: &[u8; 32],
+        hash: &BlobHash,
+        plaintext: &[u8],
+    ) -> anyhow::Result<()> {
         if BlobHash::of(plaintext) != *hash {
             bail!("blob hash mismatch on put ({hash:?})");
         }
@@ -118,7 +134,13 @@ impl BlobStore {
         let mut nonce = [0u8; NONCE_LEN];
         rand::fill(&mut nonce[..]);
         let ct = cipher
-            .encrypt(&XNonce::from(nonce), Payload { msg: plaintext, aad: &hash.0 })
+            .encrypt(
+                &XNonce::from(nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &hash.0,
+                },
+            )
             .map_err(|_| anyhow::anyhow!("encrypt blob {hash:?}"))?;
 
         // Temp file in the same directory so the rename stays on one volume
@@ -159,8 +181,16 @@ impl BlobStore {
         let nonce: [u8; NONCE_LEN] = nonce.try_into().context("nonce length")?;
         let cipher = XChaCha20Poly1305::new(key.into());
         let plain = cipher
-            .decrypt(&XNonce::from(nonce), Payload { msg: ct, aad: &hash.0 })
-            .map_err(|_| anyhow::anyhow!("blob {hash:?} failed authentication (wrong key or tampered)"))?;
+            .decrypt(
+                &XNonce::from(nonce),
+                Payload {
+                    msg: ct,
+                    aad: &hash.0,
+                },
+            )
+            .map_err(|_| {
+                anyhow::anyhow!("blob {hash:?} failed authentication (wrong key or tampered)")
+            })?;
         // The AEAD already binds the hash as AAD; this also catches a blob that
         // was stored under a hash it does not have.
         if BlobHash::of(&plain) != *hash {
@@ -193,14 +223,22 @@ impl BlobStore {
         let mut files: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
         let mut total = 0u64;
         let now = SystemTime::now();
-        for entry in walkdir::WalkDir::new(&self.dir).min_depth(1).into_iter().filter_map(|e| e.ok()) {
+        for entry in walkdir::WalkDir::new(&self.dir)
+            .min_depth(1)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             if !entry.file_type().is_file() {
                 continue;
             }
             let Ok(md) = entry.metadata() else { continue };
             let mtime = md.modified().unwrap_or(SystemTime::UNIX_EPOCH);
             if entry.file_name().to_string_lossy().starts_with(".tmp-") {
-                if now.duration_since(mtime).map(|d| d > STALE_TMP).unwrap_or(false) {
+                if now
+                    .duration_since(mtime)
+                    .map(|d| d > STALE_TMP)
+                    .unwrap_or(false)
+                {
                     let _ = fs::remove_file(entry.path());
                 }
                 continue;
@@ -252,7 +290,8 @@ pub fn chunks(plaintext: &[u8]) -> Vec<(u64, bool, Vec<u8>)> {
 fn compress(data: &[u8]) -> Vec<u8> {
     // Compressing in-memory input does not fail in practice; fall back to a
     // cheaper level rather than panicking.
-    zstd::bulk::compress(data, 3).unwrap_or_else(|_| zstd::bulk::compress(data, 1).unwrap_or_default())
+    zstd::bulk::compress(data, 3)
+        .unwrap_or_else(|_| zstd::bulk::compress(data, 1).unwrap_or_default())
 }
 
 /// Node-wide limit on blobs being reassembled. A peer opens an assembler by
@@ -267,20 +306,36 @@ pub struct AssemblyBudget {
 
 impl AssemblyBudget {
     pub const fn new(max_blobs: usize, max_bytes: u64) -> AssemblyBudget {
-        AssemblyBudget { max_blobs, max_bytes, blobs: AtomicUsize::new(0), bytes: AtomicU64::new(0) }
+        AssemblyBudget {
+            max_blobs,
+            max_bytes,
+            blobs: AtomicUsize::new(0),
+            bytes: AtomicU64::new(0),
+        }
     }
 
     fn acquire_blob(&self) -> bool {
-        self.blobs.try_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < self.max_blobs).then_some(n + 1)).is_ok()
+        self.blobs
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < self.max_blobs).then_some(n + 1)
+            })
+            .is_ok()
     }
 
     fn acquire_bytes(&self, n: u64) -> bool {
-        self.bytes.try_update(Ordering::AcqRel, Ordering::Acquire, |b| b.checked_add(n).filter(|t| *t <= self.max_bytes)).is_ok()
+        self.bytes
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |b| {
+                b.checked_add(n).filter(|t| *t <= self.max_bytes)
+            })
+            .is_ok()
     }
 
     /// Blobs and bytes currently held (tests and diagnostics).
     pub fn in_flight(&self) -> (usize, u64) {
-        (self.blobs.load(Ordering::Acquire), self.bytes.load(Ordering::Acquire))
+        (
+            self.blobs.load(Ordering::Acquire),
+            self.bytes.load(Ordering::Acquire),
+        )
     }
 }
 
@@ -316,7 +371,15 @@ impl Drop for Assembler {
 impl Assembler {
     /// An assembler drawing on `budget` instead of the node-wide one.
     pub fn with_budget(budget: &'static AssemblyBudget) -> Assembler {
-        Assembler { hash: None, buf: Vec::new(), done: false, limit: MAX_BLOB_BYTES, budget, counted: false, held: 0 }
+        Assembler {
+            hash: None,
+            buf: Vec::new(),
+            done: false,
+            limit: MAX_BLOB_BYTES,
+            budget,
+            counted: false,
+            held: 0,
+        }
     }
 
     fn release(&mut self) {
@@ -332,7 +395,13 @@ impl Assembler {
 
     /// Feed one chunk; returns the full plaintext when `last` and verified.
     /// Chunks must arrive in order (`offset` equals the bytes received so far).
-    pub fn push(&mut self, hash: &BlobHash, offset: u64, last: bool, data: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+    pub fn push(
+        &mut self,
+        hash: &BlobHash,
+        offset: u64,
+        last: bool,
+        data: &[u8],
+    ) -> anyhow::Result<Option<Vec<u8>>> {
         if self.done {
             bail!("chunk after the last chunk of {hash:?}");
         }
@@ -342,7 +411,10 @@ impl Assembler {
             None => self.hash = Some(*hash),
         }
         if offset != self.buf.len() as u64 {
-            bail!("out-of-order chunk for {hash:?}: offset {offset}, expected {}", self.buf.len());
+            bail!(
+                "out-of-order chunk for {hash:?}: offset {offset}, expected {}",
+                self.buf.len()
+            );
         }
         // Bounded decompression: a chunk can never legitimately exceed CHUNK_SIZE.
         let plain = zstd::bulk::decompress(data, CHUNK_SIZE).context("decompress chunk")?;
@@ -412,11 +484,17 @@ mod tests {
         s.remove(owner(1), &h).unwrap();
         s.evict().unwrap();
         assert!(s.has(owner(1), &h), "pinned blob was deleted");
-        assert!(!s.has(owner(1), &other), "evict must still free unpinned blobs");
+        assert!(
+            !s.has(owner(1), &other),
+            "evict must still free unpinned blobs"
+        );
         drop(pin);
         assert!(s.has(owner(1), &h), "still held by the second pin");
         drop(nested);
-        assert!(!s.has(owner(1), &h), "the requested removal happens when the last pin goes");
+        assert!(
+            !s.has(owner(1), &h),
+            "the requested removal happens when the last pin goes"
+        );
         // Pinning also covers a blob that has not arrived yet; without a removal request it stays.
         let later = BlobHash::of(b"arrives later");
         let g = s.pin(owner(1), [later]);
@@ -439,7 +517,10 @@ mod tests {
         let p = s.dir.join(owner(1).to_hex()).join(&hex[..2]).join(&hex);
         let raw = fs::read(p).unwrap();
         assert_eq!(&raw[..4], b"CFB1");
-        assert!(!raw.windows(10).any(|w| w == b"hello blob"), "stored plaintext");
+        assert!(
+            !raw.windows(10).any(|w| w == b"hello blob"),
+            "stored plaintext"
+        );
     }
 
     #[test]
@@ -504,16 +585,26 @@ mod tests {
     fn evicts_oldest_first_and_get_refreshes() {
         let (_d, s) = store(u64::MAX);
         let key = [9u8; 32];
-        let hashes: Vec<BlobHash> = (0..4u8).map(|i| put(&s, owner(1), &key, &vec![i; 1000])).collect();
+        let hashes: Vec<BlobHash> = (0..4u8)
+            .map(|i| put(&s, owner(1), &key, &vec![i; 1000]))
+            .collect();
         // Explicit mtimes: 0 oldest .. 3 newest, then use blob 0 so it becomes newest.
         let base = SystemTime::now() - Duration::from_secs(1000);
         for (i, h) in hashes.iter().enumerate() {
-            let f = fs::OpenOptions::new().write(true).open(s.path_of(owner(1), h)).unwrap();
-            f.set_modified(base + Duration::from_secs(i as u64 * 10)).unwrap();
+            let f = fs::OpenOptions::new()
+                .write(true)
+                .open(s.path_of(owner(1), h))
+                .unwrap();
+            f.set_modified(base + Duration::from_secs(i as u64 * 10))
+                .unwrap();
         }
         s.get(owner(1), &key, &hashes[0]).unwrap();
         let one = fs::metadata(s.path_of(owner(1), &hashes[0])).unwrap().len();
-        let small = BlobStore { dir: s.dir.clone(), max_bytes: one * 2, pins: Mutex::default() };
+        let small = BlobStore {
+            dir: s.dir.clone(),
+            max_bytes: one * 2,
+            pins: Mutex::default(),
+        };
         let freed = small.evict().unwrap();
         assert_eq!(freed, one * 2);
         assert!(!s.has(owner(1), &hashes[1]));
@@ -524,7 +615,9 @@ mod tests {
 
     #[test]
     fn chunk_round_trip_large() {
-        let data: Vec<u8> = (0..(2 * CHUNK_SIZE + 12345)).map(|i| (i % 251) as u8 ^ (i / 7) as u8).collect();
+        let data: Vec<u8> = (0..(2 * CHUNK_SIZE + 12345))
+            .map(|i| (i % 251) as u8 ^ (i / 7) as u8)
+            .collect();
         let h = BlobHash::of(&data);
         let cs = chunks(&data);
         assert_eq!(cs.len(), 3);
@@ -544,7 +637,10 @@ mod tests {
         let cs = chunks(b"");
         assert_eq!(cs.len(), 1);
         let mut a = Assembler::default();
-        assert_eq!(a.push(&h, 0, true, &cs[0].2).unwrap().unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            a.push(&h, 0, true, &cs[0].2).unwrap().unwrap(),
+            Vec::<u8>::new()
+        );
     }
 
     #[test]
@@ -574,7 +670,10 @@ mod tests {
         let big = vec![0u8; CHUNK_SIZE + 1];
         let comp = zstd::bulk::compress(&big, 3).unwrap();
         let mut a = Assembler::default();
-        assert!(a.push(&BlobHash::of(&big), 0, true, &comp).is_err(), "chunk above CHUNK_SIZE");
+        assert!(
+            a.push(&BlobHash::of(&big), 0, true, &comp).is_err(),
+            "chunk above CHUNK_SIZE"
+        );
 
         // Same guard as the 256 MiB cap, with a small limit so the test is cheap.
         let data = vec![3u8; 3 * CHUNK_SIZE];
@@ -583,8 +682,15 @@ mod tests {
         let mut a = Assembler::default();
         a.limit = 2 * CHUNK_SIZE as u64 + 10;
         assert!(a.push(&h, 0, false, &comp).unwrap().is_none());
-        assert!(a.push(&h, CHUNK_SIZE as u64, false, &comp).unwrap().is_none());
-        assert!(a.push(&h, 2 * CHUNK_SIZE as u64, false, &comp).is_err(), "total above limit");
+        assert!(
+            a.push(&h, CHUNK_SIZE as u64, false, &comp)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            a.push(&h, 2 * CHUNK_SIZE as u64, false, &comp).is_err(),
+            "total above limit"
+        );
     }
 
     #[test]
@@ -598,11 +704,18 @@ mod tests {
         let h = BlobHash::of(&data);
         let short = zstd::bulk::compress(&data[..1000], 3).unwrap();
         let mut a = Assembler::default();
-        assert!(a.push(&h, 0, false, &short).is_err(), "short chunk that is not the last");
+        assert!(
+            a.push(&h, 0, false, &short).is_err(),
+            "short chunk that is not the last"
+        );
         // A short final chunk is normal.
         let tail = vec![4u8; 1000];
         let mut a = Assembler::default();
-        assert!(a.push(&BlobHash::of(&tail), 0, true, &short).unwrap().is_some());
+        assert!(
+            a.push(&BlobHash::of(&tail), 0, true, &short)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -615,10 +728,17 @@ mod tests {
         let (h1, c1) = chunk(1);
         let (h2, c2) = chunk(2);
         let (h3, c3) = chunk(3);
-        let (mut a, mut b, mut c) = (Assembler::with_budget(&BLOBS), Assembler::with_budget(&BLOBS), Assembler::with_budget(&BLOBS));
+        let (mut a, mut b, mut c) = (
+            Assembler::with_budget(&BLOBS),
+            Assembler::with_budget(&BLOBS),
+            Assembler::with_budget(&BLOBS),
+        );
         a.push(&h1, 0, false, &c1).unwrap();
         b.push(&h2, 0, false, &c2).unwrap();
-        assert!(c.push(&h3, 0, false, &c3).is_err(), "third concurrent blob refused");
+        assert!(
+            c.push(&h3, 0, false, &c3).is_err(),
+            "third concurrent blob refused"
+        );
         assert_eq!(BLOBS.in_flight().0, 2);
         drop(a);
         assert!(c.push(&h3, 0, false, &c3).is_ok(), "slot freed by drop");
@@ -626,14 +746,28 @@ mod tests {
         assert_eq!(BLOBS.in_flight(), (0, 0));
 
         // Bytes: room for one and a half chunks.
-        static BYTES: AssemblyBudget = AssemblyBudget::new(10, CHUNK_SIZE as u64 + CHUNK_SIZE as u64 / 2);
-        let (mut a, mut b) = (Assembler::with_budget(&BYTES), Assembler::with_budget(&BYTES));
+        static BYTES: AssemblyBudget =
+            AssemblyBudget::new(10, CHUNK_SIZE as u64 + CHUNK_SIZE as u64 / 2);
+        let (mut a, mut b) = (
+            Assembler::with_budget(&BYTES),
+            Assembler::with_budget(&BYTES),
+        );
         a.push(&h1, 0, false, &c1).unwrap();
-        assert!(b.push(&h2, 0, false, &c2).is_err(), "second chunk exceeds the byte budget");
+        assert!(
+            b.push(&h2, 0, false, &c2).is_err(),
+            "second chunk exceeds the byte budget"
+        );
         // A finished blob returns its bytes and its slot.
         let small = vec![9u8; 10];
         let mut f = Assembler::with_budget(&BYTES);
-        f.push(&BlobHash::of(&small), 0, true, &zstd::bulk::compress(&small, 1).unwrap()).unwrap().unwrap();
+        f.push(
+            &BlobHash::of(&small),
+            0,
+            true,
+            &zstd::bulk::compress(&small, 1).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
         drop((a, b, f));
         assert_eq!(BYTES.in_flight(), (0, 0));
     }
@@ -645,7 +779,10 @@ mod tests {
         let cs = chunks(&data);
         let mut a = Assembler::default();
         a.push(&h, 0, false, &cs[0].2).unwrap();
-        assert!(a.push(&BlobHash::of(b"zz"), cs[1].0, true, &cs[1].2).is_err());
+        assert!(
+            a.push(&BlobHash::of(b"zz"), cs[1].0, true, &cs[1].2)
+                .is_err()
+        );
         let mut a = Assembler::default();
         a.push(&h, 0, false, &cs[0].2).unwrap();
         a.push(&h, cs[1].0, true, &cs[1].2).unwrap();

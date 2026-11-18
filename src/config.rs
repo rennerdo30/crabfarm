@@ -41,7 +41,9 @@ impl Default for Config {
         Config {
             node_name: hostname(),
             listen: format!("0.0.0.0:{}", crate::proto::DEFAULT_PORT),
-            slots: std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(4),
+            slots: std::thread::available_parallelism()
+                .map(|n| n.get() as u32)
+                .unwrap_or(4),
             accept_remote_jobs: true,
             peers: Vec::new(),
             auto_install: true,
@@ -53,7 +55,9 @@ impl Default for Config {
             cache_max_gb: 20,
             job_timeout_min: 30,
             forward_env: Vec::new(),
-            local_slots: std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(4),
+            local_slots: std::thread::available_parallelism()
+                .map(|n| n.get() as u32)
+                .unwrap_or(4),
             mdns: true,
             prefer_remote: false,
         }

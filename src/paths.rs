@@ -8,7 +8,11 @@ use std::path::{Component, Path, PathBuf};
 
 /// Path style of the machine this process runs on.
 pub fn host_style() -> PathStyle {
-    if cfg!(windows) { PathStyle::Windows } else { PathStyle::Posix }
+    if cfg!(windows) {
+        PathStyle::Windows
+    } else {
+        PathStyle::Posix
+    }
 }
 
 /// Device names Windows resolves in every directory, with or without an
@@ -27,7 +31,9 @@ pub fn valid_component(c: &str) -> bool {
     if c.is_empty() || c == "." || c == ".." || c.ends_with('.') || c.ends_with(' ') {
         return false;
     }
-    if c.chars().any(|ch| ch.is_control() || matches!(ch, ':' | '\\' | '/' | '<' | '>' | '"' | '|' | '?' | '*')) {
+    if c.chars().any(|ch| {
+        ch.is_control() || matches!(ch, ':' | '\\' | '/' | '<' | '>' | '"' | '|' | '?' | '*')
+    }) {
         return false;
     }
     let stem = c.split('.').next().unwrap_or(c).trim_end_matches(' ');
@@ -35,7 +41,10 @@ pub fn valid_component(c: &str) -> bool {
     if RESERVED_DEVICES.contains(&up.as_str()) {
         return false;
     }
-    let numbered = |prefix: &str| up.strip_prefix(prefix).is_some_and(|d| matches!(d.as_bytes(), [b'1'..=b'9']));
+    let numbered = |prefix: &str| {
+        up.strip_prefix(prefix)
+            .is_some_and(|d| matches!(d.as_bytes(), [b'1'..=b'9']))
+    };
     !(numbered("COM") || numbered("LPT"))
 }
 
@@ -61,7 +70,8 @@ fn normalize_components(raw: &str, sep: char, floor: usize) -> Option<Vec<&str>>
 
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     let head = s.get(..prefix.len())?;
-    head.eq_ignore_ascii_case(prefix).then(|| &s[prefix.len()..])
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &s[prefix.len()..])
 }
 
 fn parse_windows(input: &str) -> Option<String> {
@@ -120,7 +130,11 @@ impl ClientPath {
     /// Absolute path on this machine (style = this OS). Relative paths are
     /// joined to `cwd` first.
     pub fn from_local(p: &Path, cwd: &Path) -> Option<ClientPath> {
-        let joined = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
+        let joined = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cwd.join(p)
+        };
         ClientPath::parse(host_style(), joined.to_str()?)
     }
 
@@ -133,7 +147,10 @@ impl ClientPath {
     /// (the fields are public) by returning an empty component list.
     fn split(&self) -> (String, Vec<&str>) {
         match self.style {
-            PathStyle::Posix => ("/".to_string(), self.path.split('/').filter(|c| !c.is_empty()).collect()),
+            PathStyle::Posix => (
+                "/".to_string(),
+                self.path.split('/').filter(|c| !c.is_empty()).collect(),
+            ),
             PathStyle::Windows => {
                 if let Some(rest) = self.path.strip_prefix(r"\\") {
                     let all: Vec<&str> = rest.split('\\').filter(|c| !c.is_empty()).collect();
@@ -144,7 +161,10 @@ impl ClientPath {
                 } else {
                     let drive = self.path.get(..2).unwrap_or("");
                     let rest = self.path.get(3..).unwrap_or("");
-                    (format!("{drive}\\"), rest.split('\\').filter(|c| !c.is_empty()).collect())
+                    (
+                        format!("{drive}\\"),
+                        rest.split('\\').filter(|c| !c.is_empty()).collect(),
+                    )
                 }
             }
         }
@@ -164,7 +184,10 @@ impl ClientPath {
         match self.style {
             PathStyle::Windows => {
                 r1.to_lowercase() == r2.to_lowercase()
-                    && c2.iter().zip(&c1).all(|(a, b)| a.to_lowercase() == b.to_lowercase())
+                    && c2
+                        .iter()
+                        .zip(&c1)
+                        .all(|(a, b)| a.to_lowercase() == b.to_lowercase())
             }
             PathStyle::Posix => r1 == r2 && c2.iter().zip(&c1).all(|(a, b)| a == b),
         }
@@ -173,7 +196,10 @@ impl ClientPath {
     /// The root this path belongs to: `C:\` for Windows drive paths,
     /// `\\server\share` for UNC, `/` for Posix.
     pub fn root(&self) -> ClientPath {
-        ClientPath { style: self.style, path: self.split().0 }
+        ClientPath {
+            style: self.style,
+            path: self.split().0,
+        }
     }
 
     /// Directory names below the sandbox root, in order. `None` when the value
@@ -189,11 +215,14 @@ impl ClientPath {
                     if names.len() != 2 {
                         return None;
                     }
-                    std::iter::once("UNC".to_string()).chain(names.into_iter().map(str::to_string)).collect()
+                    std::iter::once("UNC".to_string())
+                        .chain(names.into_iter().map(str::to_string))
+                        .collect()
                 }
                 None => {
                     let b = root.as_bytes();
-                    if b.len() != 3 || !b[0].is_ascii_alphabetic() || b[1] != b':' || b[2] != b'\\' {
+                    if b.len() != 3 || !b[0].is_ascii_alphabetic() || b[1] != b':' || b[2] != b'\\'
+                    {
                         return None;
                     }
                     vec![(b[0] as char).to_string()]
@@ -229,7 +258,9 @@ impl SandboxMap {
             out.push(part);
         }
         let rel = out.strip_prefix(&self.root).ok()?;
-        rel.components().all(|c| matches!(c, Component::Normal(_))).then_some(out)
+        rel.components()
+            .all(|c| matches!(c, Component::Normal(_)))
+            .then_some(out)
     }
 
     /// Inverse of `to_sandbox`; `None` if `p` is not under `root`.
@@ -275,9 +306,15 @@ impl SandboxMap {
     /// Callers validate every path with `to_sandbox` first; for a path that
     /// fails it still returns a string inside the root, never one outside.
     pub fn render(&self, p: &ClientPath) -> String {
-        let path = self.to_sandbox(p).unwrap_or_else(|| self.root.join("_invalid_path_"));
+        let path = self
+            .to_sandbox(p)
+            .unwrap_or_else(|| self.root.join("_invalid_path_"));
         let s = path.to_string_lossy().into_owned();
-        if cfg!(windows) { s.replace('/', "\\") } else { s }
+        if cfg!(windows) {
+            s.replace('/', "\\")
+        } else {
+            s
+        }
     }
 
     /// `(sandbox root string, client root string)` for every distinct root of
@@ -285,7 +322,10 @@ impl SandboxMap {
     /// side is rendered as rustc on this host will print it; the client side is
     /// the root as `ClientPath::root` gives it (`C:\`, `\\srv\share`, `/`).
     /// Longest sandbox string first.
-    pub fn remaps<'a>(&self, paths: impl IntoIterator<Item = &'a ClientPath>) -> Vec<(String, String)> {
+    pub fn remaps<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a ClientPath>,
+    ) -> Vec<(String, String)> {
         let mut roots: Vec<ClientPath> = Vec::new();
         for p in paths {
             let r = p.root();
@@ -293,7 +333,10 @@ impl SandboxMap {
                 roots.push(r);
             }
         }
-        let mut out: Vec<(String, String)> = roots.iter().map(|r| (self.render(r), r.path.clone())).collect();
+        let mut out: Vec<(String, String)> = roots
+            .iter()
+            .map(|r| (self.render(r), r.path.clone()))
+            .collect();
         out.sort_by_key(|(s, _)| std::cmp::Reverse(s.len()));
         out
     }
@@ -375,14 +418,19 @@ mod tests {
     #[test]
     fn roots() {
         assert_eq!(cp(PathStyle::Windows, r"c:\a\b").root().path, r"C:\");
-        assert_eq!(cp(PathStyle::Windows, r"\\srv\share\a").root().path, r"\\srv\share");
+        assert_eq!(
+            cp(PathStyle::Windows, r"\\srv\share\a").root().path,
+            r"\\srv\share"
+        );
         assert_eq!(cp(PathStyle::Posix, "/a/b").root().path, "/");
         assert_eq!(cp(PathStyle::Windows, r"C:\").root().path, r"C:\");
     }
 
     /// True when mapping `p` yields something that is not strictly below the root.
     fn escapes(m: &SandboxMap, p: &ClientPath) -> bool {
-        let Some(out) = m.to_sandbox(p) else { return false };
+        let Some(out) = m.to_sandbox(p) else {
+            return false;
+        };
         match out.strip_prefix(&m.root) {
             Ok(rel) => !rel.components().all(|c| matches!(c, Component::Normal(_))),
             Err(_) => true,
@@ -397,13 +445,22 @@ mod tests {
     fn sandbox_layout() {
         let m = map();
         let r = &m.root;
-        assert_eq!(m.to_sandbox(&cp(PathStyle::Windows, r"C:\a\b")), Some(r.join("C").join("a").join("b")));
+        assert_eq!(
+            m.to_sandbox(&cp(PathStyle::Windows, r"C:\a\b")),
+            Some(r.join("C").join("a").join("b"))
+        );
         assert_eq!(
             m.to_sandbox(&cp(PathStyle::Windows, r"\\srv\share\a")),
             Some(r.join("UNC").join("srv").join("share").join("a"))
         );
-        assert_eq!(m.to_sandbox(&cp(PathStyle::Posix, "/a/b")), Some(r.join("_").join("a").join("b")));
-        assert_eq!(m.to_sandbox(&cp(PathStyle::Windows, r"D:\")), Some(r.join("D")));
+        assert_eq!(
+            m.to_sandbox(&cp(PathStyle::Posix, "/a/b")),
+            Some(r.join("_").join("a").join("b"))
+        );
+        assert_eq!(
+            m.to_sandbox(&cp(PathStyle::Windows, r"D:\")),
+            Some(r.join("D"))
+        );
         assert_eq!(m.to_sandbox(&cp(PathStyle::Posix, "/")), Some(r.join("_")));
     }
 
@@ -420,21 +477,43 @@ mod tests {
             (PathStyle::Posix, "/"),
         ] {
             let p = cp(style, s);
-            assert_eq!(m.from_sandbox(&m.to_sandbox(&p).expect("maps"), style), Some(p.clone()), "{s}");
+            assert_eq!(
+                m.from_sandbox(&m.to_sandbox(&p).expect("maps"), style),
+                Some(p.clone()),
+                "{s}"
+            );
         }
     }
 
     #[test]
     fn from_sandbox_rejects_outside_and_malformed() {
         let m = map();
-        assert_eq!(m.from_sandbox(Path::new("elsewhere/C/a"), PathStyle::Windows), None);
+        assert_eq!(
+            m.from_sandbox(Path::new("elsewhere/C/a"), PathStyle::Windows),
+            None
+        );
         assert_eq!(m.from_sandbox(&m.root, PathStyle::Windows), None);
-        assert_eq!(m.from_sandbox(&m.root.join("CC").join("a"), PathStyle::Windows), None);
-        assert_eq!(m.from_sandbox(&m.root.join("UNC").join("srv"), PathStyle::Windows), None);
-        assert_eq!(m.from_sandbox(&m.root.join("C").join("a"), PathStyle::Posix), None);
-        assert_eq!(m.from_sandbox(&m.root.join("_").join("a"), PathStyle::Windows), None);
+        assert_eq!(
+            m.from_sandbox(&m.root.join("CC").join("a"), PathStyle::Windows),
+            None
+        );
+        assert_eq!(
+            m.from_sandbox(&m.root.join("UNC").join("srv"), PathStyle::Windows),
+            None
+        );
+        assert_eq!(
+            m.from_sandbox(&m.root.join("C").join("a"), PathStyle::Posix),
+            None
+        );
+        assert_eq!(
+            m.from_sandbox(&m.root.join("_").join("a"), PathStyle::Windows),
+            None
+        );
         // Escaping the sandbox through `..` is refused.
-        assert_eq!(m.from_sandbox(&m.root.join("C").join("..").join(".."), PathStyle::Windows), None);
+        assert_eq!(
+            m.from_sandbox(&m.root.join("C").join("..").join(".."), PathStyle::Windows),
+            None
+        );
     }
 
     #[test]
@@ -483,11 +562,23 @@ mod tests {
             assert_eq!(win(s), None, "{s:?}");
         }
         let p = |s: &str| ClientPath::parse(PathStyle::Posix, s);
-        for s in [r"/D:\Windows\x", r"/a\..\..\..\x", "/a/D:foo", "/a/CON", "/a/lpt9.txt", "/a/x.", "/a/b*c", "/a/b\u{0}c"] {
+        for s in [
+            r"/D:\Windows\x",
+            r"/a\..\..\..\x",
+            "/a/D:foo",
+            "/a/CON",
+            "/a/lpt9.txt",
+            "/a/x.",
+            "/a/b*c",
+            "/a/b\u{0}c",
+        ] {
             assert_eq!(p(s), None, "{s:?}");
         }
         // Ordinary names stay valid, including dots inside and device-like prefixes.
-        assert_eq!(win(r"C:\a\console\com10\nullable\x.y.rs"), Some(r"C:\a\console\com10\nullable\x.y.rs".into()));
+        assert_eq!(
+            win(r"C:\a\console\com10\nullable\x.y.rs"),
+            Some(r"C:\a\console\com10\nullable\x.y.rs".into())
+        );
         assert_eq!(
             p("/a/.cargo/registry/serde-1.0/src/lib.rs").map(|p| p.path),
             Some("/a/.cargo/registry/serde-1.0/src/lib.rs".into())
@@ -509,8 +600,15 @@ mod tests {
             (PathStyle::Windows, r"\\srv\share\D:\x"),
         ];
         for (style, s) in evil {
-            let p = ClientPath { style, path: s.to_string() };
-            assert!(!escapes(&m, &p), "{s} maps outside the sandbox: {:?}", m.to_sandbox(&p));
+            let p = ClientPath {
+                style,
+                path: s.to_string(),
+            };
+            assert!(
+                !escapes(&m, &p),
+                "{s} maps outside the sandbox: {:?}",
+                m.to_sandbox(&p)
+            );
             assert_eq!(m.to_sandbox(&p), None, "{s} must be refused");
         }
     }
@@ -519,14 +617,28 @@ mod tests {
     #[test]
     fn render_uses_backslashes_only_on_windows() {
         let m = SandboxMap::new(PathBuf::from("E:/data/jobs/x/root"));
-        assert_eq!(m.render(&cp(PathStyle::Windows, r"C:\a\b")), r"E:\data\jobs\x\root\C\a\b");
+        assert_eq!(
+            m.render(&cp(PathStyle::Windows, r"C:\a\b")),
+            r"E:\data\jobs\x\root\C\a\b"
+        );
     }
 
     #[test]
     fn from_local_joins_cwd() {
-        let cwd = if cfg!(windows) { Path::new(r"C:\work") } else { Path::new("/work") };
+        let cwd = if cfg!(windows) {
+            Path::new(r"C:\work")
+        } else {
+            Path::new("/work")
+        };
         let p = ClientPath::from_local(Path::new("src/lib.rs"), cwd).expect("abs");
-        assert_eq!(p.path, if cfg!(windows) { r"C:\work\src\lib.rs" } else { "/work/src/lib.rs" });
+        assert_eq!(
+            p.path,
+            if cfg!(windows) {
+                r"C:\work\src\lib.rs"
+            } else {
+                "/work/src/lib.rs"
+            }
+        );
         assert_eq!(p.style, host_style());
         assert_eq!(p.to_local(), PathBuf::from(&p.path));
         let up = ClientPath::from_local(Path::new("../x"), cwd).expect("abs");

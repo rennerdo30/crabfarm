@@ -27,7 +27,8 @@ struct Activity {
 
 impl Activity {
     fn touch(&self) {
-        self.last_ms.store(self.base.elapsed().as_millis() as u64, Ordering::Release);
+        self.last_ms
+            .store(self.base.elapsed().as_millis() as u64, Ordering::Release);
     }
 
     fn idle_for(&self) -> Duration {
@@ -126,19 +127,31 @@ impl Link {
                 }
             });
         }
-        Link { tx, rx, writer, reader, activity }
+        Link {
+            tx,
+            rx,
+            writer,
+            reader,
+            activity,
+        }
     }
 
     /// Change or lift (`None`) the idle limit of a link made with
     /// [`Link::new_with_idle`]; the idle clock restarts.
     pub fn set_idle(&self, idle: Option<Duration>) {
         self.activity.touch();
-        self.activity.limit_ms.store(idle.map_or(0, |d| d.as_millis().max(1) as u64), Ordering::Release);
+        self.activity.limit_ms.store(
+            idle.map_or(0, |d| d.as_millis().max(1) as u64),
+            Ordering::Release,
+        );
     }
 
     /// Queue a frame. Fails once the writer task has stopped (connection gone).
     pub async fn send(&self, m: Message) -> anyhow::Result<()> {
-        self.tx.send(m).await.map_err(|_| anyhow::anyhow!("connection closed"))
+        self.tx
+            .send(m)
+            .await
+            .map_err(|_| anyhow::anyhow!("connection closed"))
     }
 
     /// Next frame; `None` when the connection ended.
@@ -148,11 +161,20 @@ impl Link {
 
     /// Flush everything queued, then close.
     pub async fn close(self) {
-        let Link { tx, rx, writer, reader, .. } = self;
+        let Link {
+            tx,
+            rx,
+            writer,
+            reader,
+            ..
+        } = self;
         drop(tx);
         drop(rx);
         // Bounded so a stuck peer cannot hold the caller forever.
-        if tokio::time::timeout(std::time::Duration::from_secs(10), writer).await.is_err() {
+        if tokio::time::timeout(std::time::Duration::from_secs(10), writer)
+            .await
+            .is_err()
+        {
             tracing::debug!("link writer did not finish in time");
         }
         reader.abort();
@@ -163,7 +185,10 @@ impl Link {
 mod tests {
     use super::*;
 
-    fn pair() -> (FramedConn<tokio::io::DuplexStream>, FramedConn<tokio::io::DuplexStream>) {
+    fn pair() -> (
+        FramedConn<tokio::io::DuplexStream>,
+        FramedConn<tokio::io::DuplexStream>,
+    ) {
         let (a, b) = tokio::io::duplex(64 * 1024);
         (FramedConn::new(a), FramedConn::new(b))
     }
@@ -172,7 +197,9 @@ mod tests {
     async fn silent_connection_is_closed_after_the_idle_limit() {
         let (a, _b) = pair();
         let mut link = Link::new_with_idle(a, Some(Duration::from_millis(150)));
-        let r = tokio::time::timeout(Duration::from_secs(5), link.recv()).await.expect("watchdog never fired");
+        let r = tokio::time::timeout(Duration::from_secs(5), link.recv())
+            .await
+            .expect("watchdog never fired");
         assert!(r.is_none(), "idle link must end");
     }
 
@@ -190,8 +217,18 @@ mod tests {
             link.send(Message::Cancel).await.unwrap();
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert!(tokio::time::timeout(Duration::from_millis(50), link.recv()).await.is_err(), "still open");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), link.recv())
+                .await
+                .is_err(),
+            "still open"
+        );
         link.set_idle(None);
-        assert!(tokio::time::timeout(Duration::from_millis(800), link.recv()).await.is_err(), "no limit: stays open");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(800), link.recv())
+                .await
+                .is_err(),
+            "no limit: stays open"
+        );
     }
 }

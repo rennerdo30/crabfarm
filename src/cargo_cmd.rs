@@ -12,8 +12,8 @@ pub const MAX_JOBS: u32 = 128;
 
 /// Subcommands that accept `-j`; anything else gets no extra flag.
 const JOBS_COMMANDS: [&str; 19] = [
-    "build", "b", "check", "c", "clippy", "test", "t", "run", "r", "bench", "doc", "d", "install", "rustc", "rustdoc", "fix", "package",
-    "publish", "miri",
+    "build", "b", "check", "c", "clippy", "test", "t", "run", "r", "bench", "doc", "d", "install",
+    "rustc", "rustdoc", "fix", "package", "publish", "miri",
 ];
 
 /// Global options that take their value as the next argument.
@@ -57,7 +57,9 @@ pub fn has_jobs_flag(args: &[String]) -> bool {
 /// Arguments are returned unchanged when the user gave their own `-j`, the
 /// subcommand does not take one, or there is no subcommand.
 pub fn insert_jobs(args: &[String], jobs: u32) -> Vec<String> {
-    let Some(i) = subcommand_index(args) else { return args.to_vec() };
+    let Some(i) = subcommand_index(args) else {
+        return args.to_vec();
+    };
     if !JOBS_COMMANDS.contains(&args[i].as_str()) || has_jobs_flag(&args[i + 1..]) {
         return args.to_vec();
     }
@@ -68,7 +70,10 @@ pub fn insert_jobs(args: &[String], jobs: u32) -> Vec<String> {
 }
 
 /// Local slots plus the free slots of every peer that reported a status.
-pub fn farm_jobs(local_slots: u32, peers: &[(crate::proto::PeerInfo, Option<crate::proto::Status>)]) -> u32 {
+pub fn farm_jobs(
+    local_slots: u32,
+    peers: &[(crate::proto::PeerInfo, Option<crate::proto::Status>)],
+) -> u32 {
     let remote: u32 = peers
         .iter()
         .filter_map(|(_, s)| s.as_ref())
@@ -80,7 +85,10 @@ pub fn farm_jobs(local_slots: u32, peers: &[(crate::proto::PeerInfo, Option<crat
 
 /// Ask the node for its status; `None` when it is not running.
 pub fn query_status(data_dir: &std::path::Path) -> Option<Message> {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
     rt.block_on(async {
         let mut conn = ipc::connect(data_dir).await.ok()?;
         conn.send(&Message::QueryStatus).await.ok()?;
@@ -103,7 +111,9 @@ pub fn run(args: &[String]) -> i32 {
             cargo_args = insert_jobs(args, farm_jobs(cfg.local_slots, &peers));
         }
         _ => {
-            eprintln!("crabfarm: node is not running, building locally. Start it with `crabfarm node` in another terminal.");
+            eprintln!(
+                "crabfarm: node is not running, building locally. Start it with `crabfarm node` in another terminal."
+            );
         }
     }
     let exe = match std::env::current_exe() {
@@ -113,7 +123,11 @@ pub fn run(args: &[String]) -> i32 {
             return 1;
         }
     };
-    match Command::new("cargo").args(&cargo_args).env("RUSTC_WRAPPER", &exe).status() {
+    match Command::new("cargo")
+        .args(&cargo_args)
+        .env("RUSTC_WRAPPER", &exe)
+        .status()
+    {
         Ok(s) => s.code().unwrap_or(1),
         Err(e) => {
             eprintln!("crabfarm: could not run cargo: {e}");
@@ -133,16 +147,36 @@ mod tests {
 
     #[test]
     fn jobs_go_right_after_the_subcommand() {
-        assert_eq!(insert_jobs(&a(&["build", "--release"]), 24), a(&["build", "-j", "24", "--release"]));
-        assert_eq!(insert_jobs(&a(&["+nightly", "test", "-p", "x"]), 8), a(&["+nightly", "test", "-j", "8", "-p", "x"]));
-        assert_eq!(insert_jobs(&a(&["--config", "a=b", "check"]), 8), a(&["--config", "a=b", "check", "-j", "8"]));
-        assert_eq!(insert_jobs(&a(&["-Z", "unstable", "build"]), 3), a(&["-Z", "unstable", "build", "-j", "3"]));
-        assert_eq!(insert_jobs(&a(&["run", "--", "-j", "2"]), 9), a(&["run", "-j", "9", "--", "-j", "2"]));
+        assert_eq!(
+            insert_jobs(&a(&["build", "--release"]), 24),
+            a(&["build", "-j", "24", "--release"])
+        );
+        assert_eq!(
+            insert_jobs(&a(&["+nightly", "test", "-p", "x"]), 8),
+            a(&["+nightly", "test", "-j", "8", "-p", "x"])
+        );
+        assert_eq!(
+            insert_jobs(&a(&["--config", "a=b", "check"]), 8),
+            a(&["--config", "a=b", "check", "-j", "8"])
+        );
+        assert_eq!(
+            insert_jobs(&a(&["-Z", "unstable", "build"]), 3),
+            a(&["-Z", "unstable", "build", "-j", "3"])
+        );
+        assert_eq!(
+            insert_jobs(&a(&["run", "--", "-j", "2"]), 9),
+            a(&["run", "-j", "9", "--", "-j", "2"])
+        );
     }
 
     #[test]
     fn user_jobs_and_other_commands_are_left_alone() {
-        for args in [a(&["build", "-j", "4"]), a(&["build", "--jobs=4"]), a(&["build", "-j4"]), a(&["build", "--jobs", "4"])] {
+        for args in [
+            a(&["build", "-j", "4"]),
+            a(&["build", "--jobs=4"]),
+            a(&["build", "-j4"]),
+            a(&["build", "--jobs", "4"]),
+        ] {
             assert_eq!(insert_jobs(&args, 24), args);
         }
         assert_eq!(insert_jobs(&a(&["fmt"]), 24), a(&["fmt"]));
@@ -152,7 +186,12 @@ mod tests {
 
     fn peer(total: u32, busy: u32, accepting: bool) -> (PeerInfo, Option<Status>) {
         (
-            PeerInfo { node_id: NodeId([1; 16]), node_name: "p".into(), addrs: vec![], last_seen: 0 },
+            PeerInfo {
+                node_id: NodeId([1; 16]),
+                node_name: "p".into(),
+                addrs: vec![],
+                last_seen: 0,
+            },
             Some(Status {
                 node_id: NodeId([1; 16]),
                 node_name: "p".into(),

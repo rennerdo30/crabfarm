@@ -10,7 +10,11 @@ use crabfarm::{cargo_cmd, node, status, wrapper};
 use std::path::Path;
 
 #[derive(Parser)]
-#[command(name = "crabfarm", version, about = "Distributed rustc over a peer-to-peer farm")]
+#[command(
+    name = "crabfarm",
+    version,
+    about = "Distributed rustc over a peer-to-peer farm"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -80,7 +84,10 @@ fn main() {
 }
 
 fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread().enable_all().build().context("start async runtime")
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("start async runtime")
 }
 
 fn real_main() -> anyhow::Result<i32> {
@@ -114,22 +121,38 @@ fn farm_cmd(cmd: FarmCmd) -> anyhow::Result<i32> {
         FarmCmd::Create { name } => {
             let name = name.unwrap_or_else(|| cfg.node_name.clone());
             let id = farm::create(&data_dir, &name)?;
-            println!("Created farm {} with this machine as `{}`.", id.short_farm_id(), id.node_name);
-            println!("Next: run `crabfarm node` here, then `crabfarm farm invite` to add a machine.");
+            println!(
+                "Created farm {} with this machine as `{}`.",
+                id.short_farm_id(),
+                id.node_name
+            );
+            println!(
+                "Next: run `crabfarm node` here, then `crabfarm farm invite` to add a machine."
+            );
             Ok(0)
         }
         FarmCmd::Invite { addr } => {
-            let id = farm::load(&data_dir)?.context("this machine is not in a farm: run `crabfarm farm create` first")?;
-            anyhow::ensure!(id.ca_key_der.is_some(), "only the machine that created the farm can invite (P1)");
+            let id = farm::load(&data_dir)?
+                .context("this machine is not in a farm: run `crabfarm farm create` first")?;
+            anyhow::ensure!(
+                id.ca_key_der.is_some(),
+                "only the machine that created the farm can invite (P1)"
+            );
             let addr = match addr {
                 Some(a) => a,
                 None => default_invite_addr(&data_dir, &cfg)?,
             };
             let mut invites = Invites::load(&data_dir)?;
             let token = invites.issue(&data_dir)?;
-            let code = JoinCode { token, cert_fp: farm::cert_fingerprint(&id.node_cert_der), addr };
+            let code = JoinCode {
+                token,
+                cert_fp: farm::cert_fingerprint(&id.node_cert_der),
+                addr,
+            };
             println!("{}", code.encode());
-            eprintln!("Valid for 10 minutes, single use. On the new machine run:\n  crabfarm farm join <code>");
+            eprintln!(
+                "Valid for 10 minutes, single use. On the new machine run:\n  crabfarm farm join <code>"
+            );
             Ok(0)
         }
         FarmCmd::Join { code, name } => {
@@ -141,7 +164,9 @@ fn farm_cmd(cmd: FarmCmd) -> anyhow::Result<i32> {
             book.merge(&known, id.node_id);
             book.save(&data_dir)?;
             println!("Joined farm {} as `{}`.", id.short_farm_id(), id.node_name);
-            println!("Next: run `crabfarm node` here, then `crabfarm cargo build` in a Rust project.");
+            println!(
+                "Next: run `crabfarm node` here, then `crabfarm cargo build` in a Rust project."
+            );
             Ok(0)
         }
     }
@@ -150,7 +175,8 @@ fn farm_cmd(cmd: FarmCmd) -> anyhow::Result<i32> {
 /// First LAN IPv4 of this machine plus the node's port: the one written by a
 /// running node (`listen.addr`), else the configured one.
 fn default_invite_addr(data_dir: &Path, cfg: &Config) -> anyhow::Result<String> {
-    let listen = std::fs::read_to_string(data_dir.join("listen.addr")).unwrap_or_else(|_| cfg.listen.clone());
+    let listen = std::fs::read_to_string(data_dir.join("listen.addr"))
+        .unwrap_or_else(|_| cfg.listen.clone());
     let port = listen
         .trim()
         .rsplit(':')
@@ -158,6 +184,9 @@ fn default_invite_addr(data_dir: &Path, cfg: &Config) -> anyhow::Result<String> 
         .and_then(|p| p.parse::<u16>().ok())
         .filter(|p| *p != 0)
         .context("cannot tell the listen port; pass --addr host:port")?;
-    let ip = node::lan_ipv4s().into_iter().next().context("no LAN address found; pass --addr host:port")?;
+    let ip = node::lan_ipv4s()
+        .into_iter()
+        .next()
+        .context("no LAN address found; pass --addr host:port")?;
     Ok(format!("{ip}:{port}"))
 }

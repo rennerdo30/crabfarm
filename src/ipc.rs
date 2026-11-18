@@ -39,8 +39,11 @@ pub fn write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts.open(path).with_context(|| format!("create {}", path.display()))?;
-    f.write_all(data).with_context(|| format!("write {}", path.display()))?;
+    let mut f = opts
+        .open(path)
+        .with_context(|| format!("create {}", path.display()))?;
+    f.write_all(data)
+        .with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
@@ -48,7 +51,9 @@ pub fn write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
 /// The old port file is removed first so a wrapper never reads a stale pair.
 pub async fn bind(data_dir: &Path) -> anyhow::Result<(TcpListener, [u8; 32])> {
     let _ = std::fs::remove_file(port_path(data_dir));
-    let listener = TcpListener::bind("127.0.0.1:0").await.context("bind IPC port")?;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("bind IPC port")?;
     let port = listener.local_addr().context("IPC address")?.port();
     let mut token = [0u8; 32];
     rand::fill(&mut token[..]);
@@ -114,9 +119,15 @@ mod tests {
         // Right token through the real client path.
         let _ok = connect(d.path()).await.unwrap();
         // Wrong token by hand.
-        let port: u16 = std::fs::read_to_string(port_path(d.path())).unwrap().trim().parse().unwrap();
+        let port: u16 = std::fs::read_to_string(port_path(d.path()))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         let mut bad = FramedConn::new(TcpStream::connect(("127.0.0.1", port)).await.unwrap());
-        bad.send(&Message::IpcAuth { token: [0; 32] }).await.unwrap();
+        bad.send(&Message::IpcAuth { token: [0; 32] })
+            .await
+            .unwrap();
         assert_eq!(server.await.unwrap(), vec![true, false]);
     }
 

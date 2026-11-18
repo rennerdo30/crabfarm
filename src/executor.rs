@@ -29,16 +29,29 @@ impl Node {
         let result = self.serve_reserved(submitter, &mut link, job_id).await;
         if let Err(e) = result {
             tracing::debug!("job connection failed: {e:#}");
-            let _ = link.send(Message::Error { message: format!("{e:#}") }).await;
+            let _ = link
+                .send(Message::Error {
+                    message: format!("{e:#}"),
+                })
+                .await;
         }
         drop(slot);
         link.close().await;
     }
 
-    async fn serve_reserved(self: &Arc<Self>, submitter: NodeId, link: &mut Link, job_id: JobId) -> anyhow::Result<()> {
+    async fn serve_reserved(
+        self: &Arc<Self>,
+        submitter: NodeId,
+        link: &mut Link,
+        job_id: JobId,
+    ) -> anyhow::Result<()> {
         link.send(Message::Reserved { job_id }).await?;
-        let first = tokio::time::timeout(REQUEST_WAIT, link.recv()).await.context("no JobRequest after Reserve")?;
-        let Some(Message::JobRequest { spec, blob_key }) = first else { bail!("expected JobRequest") };
+        let first = tokio::time::timeout(REQUEST_WAIT, link.recv())
+            .await
+            .context("no JobRequest after Reserve")?;
+        let Some(Message::JobRequest { spec, blob_key }) = first else {
+            bail!("expected JobRequest")
+        };
         if spec.job_id != job_id {
             bail!("JobRequest for a different job");
         }
@@ -47,7 +60,9 @@ impl Node {
         exec::validate_spec(&spec)?;
         // From here on no other job's cleanup or an eviction may delete a blob
         // this job needs, including the ones still to be uploaded.
-        let _pin = self.store.pin(submitter, spec.inputs.iter().map(|i| i.hash));
+        let _pin = self
+            .store
+            .pin(submitter, spec.inputs.iter().map(|i| i.hash));
 
         let timeout = Duration::from_secs(self.cfg.job_timeout_min.max(1) * 60);
         let ctx = ExecContext {
@@ -60,8 +75,12 @@ impl Node {
         };
         let missing = exec::missing_inputs(&ctx, &spec);
         if !missing.is_empty() {
-            link.send(Message::NeedBlobs { hashes: missing.clone() }).await?;
-            self.receive_blobs(link, submitter, &blob_key, &spec, &missing).await?;
+            link.send(Message::NeedBlobs {
+                hashes: missing.clone(),
+            })
+            .await?;
+            self.receive_blobs(link, submitter, &blob_key, &spec, &missing)
+                .await?;
         }
 
         let Some(toolchain) = self.toolchains.resolve(&spec.toolchain, &spec.target) else {
@@ -160,10 +179,19 @@ impl Node {
         }
         let mut asm: HashMap<BlobHash, Assembler> = HashMap::new();
         while !want.is_empty() {
-            let m = tokio::time::timeout(BLOB_WAIT, link.recv()).await.context("blob upload stalled")?;
+            let m = tokio::time::timeout(BLOB_WAIT, link.recv())
+                .await
+                .context("blob upload stalled")?;
             match m {
-                Some(Message::BlobChunk { hash, offset, last, data }) => {
-                    let size = *want.get(&hash).context("peer sent a blob that was not requested")?;
+                Some(Message::BlobChunk {
+                    hash,
+                    offset,
+                    last,
+                    data,
+                }) => {
+                    let size = *want
+                        .get(&hash)
+                        .context("peer sent a blob that was not requested")?;
                     if offset > size {
                         bail!("blob chunk beyond the declared size");
                     }
@@ -187,10 +215,26 @@ impl Node {
 
 /// `Output` followed by its chunks; the submitter writes the file before it
 /// sees any later frame.
-async fn send_output(link: &Link, path: crate::proto::ClientPath, hash: BlobHash, data: &[u8]) -> anyhow::Result<()> {
-    link.send(Message::Output { path, hash, size: data.len() as u64 }).await?;
+async fn send_output(
+    link: &Link,
+    path: crate::proto::ClientPath,
+    hash: BlobHash,
+    data: &[u8],
+) -> anyhow::Result<()> {
+    link.send(Message::Output {
+        path,
+        hash,
+        size: data.len() as u64,
+    })
+    .await?;
     for (offset, last, chunk) in cas::chunks(data) {
-        link.send(Message::BlobChunk { hash, offset, last, data: chunk }).await?;
+        link.send(Message::BlobChunk {
+            hash,
+            offset,
+            last,
+            data: chunk,
+        })
+        .await?;
     }
     Ok(())
 }

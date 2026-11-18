@@ -4,8 +4,8 @@
 use crate::proto::{Message, NodeId, PROTO_VERSION, PeerInfo};
 use anyhow::{Context, bail, ensure};
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
-    KeyUsagePurpose, PKCS_ED25519, SanType, SubjectPublicKeyInfo,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose, PKCS_ED25519, SanType, SubjectPublicKeyInfo,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -21,7 +21,9 @@ const MAX_PENDING_INVITES: usize = 32;
 const NODE_ID_URI_PREFIX: &str = "crabfarm:node:";
 const MAX_NODE_NAME: usize = 64;
 /// DER prefix of an Ed25519 SubjectPublicKeyInfo; the 32 raw key bytes follow.
-const ED25519_SPKI_PREFIX: [u8; 12] = [0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
+const ED25519_SPKI_PREFIX: [u8; 12] = [
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
 
 /// Loaded identity of this node.
 #[derive(Clone)]
@@ -68,7 +70,10 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn random_bytes<const N: usize>() -> [u8; N] {
@@ -98,8 +103,11 @@ fn write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts.open(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-    f.write_all(data).with_context(|| format!("write {}", tmp.display()))?;
+    let mut f = opts
+        .open(&tmp)
+        .with_context(|| format!("create {}", tmp.display()))?;
+    f.write_all(data)
+        .with_context(|| format!("write {}", tmp.display()))?;
     f.sync_all().ok();
     drop(f);
     std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
@@ -142,12 +150,21 @@ fn paths(data_dir: &Path) -> IdentityPaths {
 
 fn validate_node_name(name: &str) -> anyhow::Result<()> {
     ensure!(!name.is_empty(), "node name is empty");
-    ensure!(name.chars().count() <= MAX_NODE_NAME, "node name longer than {MAX_NODE_NAME} characters");
-    ensure!(!name.chars().any(char::is_control), "node name contains control characters");
+    ensure!(
+        name.chars().count() <= MAX_NODE_NAME,
+        "node name longer than {MAX_NODE_NAME} characters"
+    );
+    ensure!(
+        !name.chars().any(char::is_control),
+        "node name contains control characters"
+    );
     Ok(())
 }
 
-fn validity_from_now(back_secs: i64, ahead_secs: i64) -> anyhow::Result<(time::OffsetDateTime, time::OffsetDateTime)> {
+fn validity_from_now(
+    back_secs: i64,
+    ahead_secs: i64,
+) -> anyhow::Result<(time::OffsetDateTime, time::OffsetDateTime)> {
     let now = unix_now() as i64;
     Ok((
         time::OffsetDateTime::from_unix_timestamp(now - back_secs)?,
@@ -197,19 +214,35 @@ fn node_cert_params(spec: &NodeCertSpec<'_>) -> anyhow::Result<CertificateParams
 }
 
 fn ed25519_spki(public_key: &[u8]) -> anyhow::Result<SubjectPublicKeyInfo> {
-    ensure!(public_key.len() == 32, "public key must be a raw 32-byte Ed25519 key");
+    ensure!(
+        public_key.len() == 32,
+        "public key must be a raw 32-byte Ed25519 key"
+    );
     let mut der = ED25519_SPKI_PREFIX.to_vec();
     der.extend_from_slice(public_key);
     Ok(SubjectPublicKeyInfo::from_der(&der)?)
 }
 
 fn load_keypair(pkcs8: &[u8]) -> anyhow::Result<KeyPair> {
-    Ok(KeyPair::from_pkcs8_der_and_sign_algo(&PrivatePkcs8KeyDer::from(pkcs8), &PKCS_ED25519)?)
+    Ok(KeyPair::from_pkcs8_der_and_sign_algo(
+        &PrivatePkcs8KeyDer::from(pkcs8),
+        &PKCS_ED25519,
+    )?)
 }
 
-pub fn sign_node_cert_with(id: &Identity, spec: &NodeCertSpec<'_>, public_key: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let ca_key = id.ca_key_der.as_ref().context("this node does not hold the farm CA key")?;
-    let issuer = Issuer::from_ca_cert_der(&CertificateDer::from(id.ca_cert_der.as_slice()), load_keypair(ca_key)?)?;
+pub fn sign_node_cert_with(
+    id: &Identity,
+    spec: &NodeCertSpec<'_>,
+    public_key: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let ca_key = id
+        .ca_key_der
+        .as_ref()
+        .context("this node does not hold the farm CA key")?;
+    let issuer = Issuer::from_ca_cert_der(
+        &CertificateDer::from(id.ca_cert_der.as_slice()),
+        load_keypair(ca_key)?,
+    )?;
     let params = node_cert_params(spec)?;
     let cert = params.signed_by(&ed25519_spki(public_key)?, &issuer)?;
     Ok(cert.der().to_vec())
@@ -218,12 +251,20 @@ pub fn sign_node_cert_with(id: &Identity, spec: &NodeCertSpec<'_>, public_key: &
 /// CA side: sign a node certificate for `public_key` (raw Ed25519, 32 bytes).
 /// CN = node_name, SAN URI `crabfarm:node:<node id hex>`. 10-year validity.
 /// Both server-auth and client-auth EKUs: every node is both.
-pub fn sign_node_cert(id: &Identity, node_name: &str, node_id: NodeId, public_key: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub fn sign_node_cert(
+    id: &Identity,
+    node_name: &str,
+    node_id: NodeId,
+    public_key: &[u8],
+) -> anyhow::Result<Vec<u8>> {
     let (not_before, not_after) = validity_from_now(SKEW_SECS, TEN_YEARS_SECS)?;
     let spec = NodeCertSpec {
         node_name,
         node_id,
-        ekus: vec![ExtendedKeyUsagePurpose::ServerAuth, ExtendedKeyUsagePurpose::ClientAuth],
+        ekus: vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ],
         not_before,
         not_after,
     };
@@ -233,7 +274,8 @@ pub fn sign_node_cert(id: &Identity, node_name: &str, node_id: NodeId, public_ke
 /// Extract the node id from a peer certificate (SAN URI).
 pub fn node_id_from_cert(cert_der: &[u8]) -> anyhow::Result<NodeId> {
     use x509_parser::extensions::{GeneralName, ParsedExtension};
-    let (_, cert) = x509_parser::parse_x509_certificate(cert_der).map_err(|e| anyhow::anyhow!("parse certificate: {e}"))?;
+    let (_, cert) = x509_parser::parse_x509_certificate(cert_der)
+        .map_err(|e| anyhow::anyhow!("parse certificate: {e}"))?;
     let mut found: Option<NodeId> = None;
     for ext in cert.extensions() {
         if let ParsedExtension::SubjectAlternativeName(san) = ext.parsed_extension() {
@@ -242,8 +284,12 @@ pub fn node_id_from_cert(cert_der: &[u8]) -> anyhow::Result<NodeId> {
                     && let Some(h) = uri.strip_prefix(NODE_ID_URI_PREFIX)
                 {
                     ensure!(found.is_none(), "certificate carries more than one node id");
-                    let bytes = data_encoding::HEXLOWER.decode(h.as_bytes()).context("node id is not lowercase hex")?;
-                    let arr: [u8; 16] = bytes.try_into().map_err(|_| anyhow::anyhow!("node id is not 16 bytes"))?;
+                    let bytes = data_encoding::HEXLOWER
+                        .decode(h.as_bytes())
+                        .context("node id is not lowercase hex")?;
+                    let arr: [u8; 16] = bytes
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("node id is not 16 bytes"))?;
                     found = Some(NodeId(arr));
                 }
             }
@@ -254,7 +300,8 @@ pub fn node_id_from_cert(cert_der: &[u8]) -> anyhow::Result<NodeId> {
 
 /// CN of a certificate (the node name), for display only.
 pub fn node_name_from_cert(cert_der: &[u8]) -> anyhow::Result<String> {
-    let (_, cert) = x509_parser::parse_x509_certificate(cert_der).map_err(|e| anyhow::anyhow!("parse certificate: {e}"))?;
+    let (_, cert) = x509_parser::parse_x509_certificate(cert_der)
+        .map_err(|e| anyhow::anyhow!("parse certificate: {e}"))?;
     let cn = cert
         .subject()
         .iter_common_name()
@@ -317,9 +364,17 @@ pub fn load(data_dir: &Path) -> anyhow::Result<Option<Identity>> {
         return Ok(None);
     };
     let node_id_hex = String::from_utf8(read_req(&p.node_id)?).context("node.id is not text")?;
-    let id_bytes = data_encoding::HEXLOWER.decode(node_id_hex.trim().as_bytes()).context("node.id is not hex")?;
-    let node_id = NodeId(id_bytes.try_into().map_err(|_| anyhow::anyhow!("node.id is not 16 bytes"))?);
-    let blob_key: [u8; 32] = read_req(&p.blob_key)?.try_into().map_err(|_| anyhow::anyhow!("blob.key is not 32 bytes"))?;
+    let id_bytes = data_encoding::HEXLOWER
+        .decode(node_id_hex.trim().as_bytes())
+        .context("node.id is not hex")?;
+    let node_id = NodeId(
+        id_bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("node.id is not 16 bytes"))?,
+    );
+    let blob_key: [u8; 32] = read_req(&p.blob_key)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("blob.key is not 32 bytes"))?;
     let id = Identity {
         node_id,
         node_name: node_name_from_cert(&node_cert_der)?,
@@ -329,7 +384,10 @@ pub fn load(data_dir: &Path) -> anyhow::Result<Option<Identity>> {
         ca_key_der: read_opt(&p.ca_key)?,
         blob_key,
     };
-    ensure!(node_id_from_cert(&id.node_cert_der)? == id.node_id, "node.id does not match the node certificate");
+    ensure!(
+        node_id_from_cert(&id.node_cert_der)? == id.node_id,
+        "node.id does not match the node certificate"
+    );
     Ok(Some(id))
 }
 
@@ -347,36 +405,65 @@ pub struct JoinCode {
 /// The token is a bearer secret: `{:?}` must not print it.
 impl std::fmt::Debug for JoinCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JoinCode").field("token", &"<redacted>").field("cert_fp", &b32(&self.cert_fp)).field("addr", &self.addr).finish()
+        f.debug_struct("JoinCode")
+            .field("token", &"<redacted>")
+            .field("cert_fp", &b32(&self.cert_fp))
+            .field("addr", &self.addr)
+            .finish()
     }
 }
 
 fn b32(bytes: &[u8]) -> String {
-    data_encoding::BASE32_NOPAD.encode(bytes).to_ascii_lowercase()
+    data_encoding::BASE32_NOPAD
+        .encode(bytes)
+        .to_ascii_lowercase()
 }
 
 fn unb32_16(s: &str, what: &str) -> anyhow::Result<[u8; 16]> {
     let bytes = data_encoding::BASE32_NOPAD
         .decode(s.to_ascii_uppercase().as_bytes())
         .with_context(|| format!("join code {what} is not base32"))?;
-    bytes.try_into().map_err(|_| anyhow::anyhow!("join code {what} has the wrong length"))
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("join code {what} has the wrong length"))
 }
 
 impl JoinCode {
     pub fn encode(&self) -> String {
-        format!("cf1-{}-{}@{}", b32(&self.token), b32(&self.cert_fp), self.addr)
+        format!(
+            "cf1-{}-{}@{}",
+            b32(&self.token),
+            b32(&self.cert_fp),
+            self.addr
+        )
     }
 
     pub fn parse(s: &str) -> anyhow::Result<JoinCode> {
         let s = s.trim();
-        let rest = s.strip_prefix("cf1-").context("not a crabfarm join code (expected prefix cf1-)")?;
+        let rest = s
+            .strip_prefix("cf1-")
+            .context("not a crabfarm join code (expected prefix cf1-)")?;
         let (head, addr) = rest.split_once('@').context("join code has no @address")?;
-        let (token, fp) = head.split_once('-').context("join code has no fingerprint")?;
-        let (host, port) = addr.rsplit_once(':').context("join code address needs host:port")?;
+        let (token, fp) = head
+            .split_once('-')
+            .context("join code has no fingerprint")?;
+        let (host, port) = addr
+            .rsplit_once(':')
+            .context("join code address needs host:port")?;
         ensure!(!host.is_empty(), "join code host is empty");
-        ensure!(!addr.chars().any(|c| c.is_whitespace() || c == '@'), "join code address contains invalid characters");
-        ensure!(port.parse::<u16>().is_ok_and(|p| p != 0), "join code port is invalid");
-        Ok(JoinCode { token: unb32_16(token, "token")?, cert_fp: unb32_16(fp, "fingerprint")?, addr: addr.to_string() })
+        ensure!(
+            !addr.chars().any(|c| c.is_whitespace() || c == '@'),
+            "join code address contains invalid characters"
+        );
+        ensure!(
+            port.parse::<u16>().is_ok_and(|p| p != 0),
+            "join code port is invalid"
+        );
+        Ok(JoinCode {
+            token: unb32_16(token, "token")?,
+            cert_fp: unb32_16(fp, "fingerprint")?,
+            addr: addr.to_string(),
+        })
     }
 }
 
@@ -420,7 +507,8 @@ impl InviteLock {
     fn acquire(data_dir: &Path) -> anyhow::Result<InviteLock> {
         let path = data_dir.join("farm").join("invites.lock");
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
         }
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -433,7 +521,10 @@ impl InviteLock {
             match file.try_lock() {
                 Ok(()) => return Ok(InviteLock(file)),
                 Err(std::fs::TryLockError::WouldBlock) => {
-                    ensure!(std::time::Instant::now() < deadline, "timed out waiting for the invite lock");
+                    ensure!(
+                        std::time::Instant::now() < deadline,
+                        "timed out waiting for the invite lock"
+                    );
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(std::fs::TryLockError::Error(e)) => return Err(e).context("lock invites"),
@@ -456,8 +547,10 @@ impl Invites {
     fn reload(&mut self, data_dir: &Path, now: u64) -> anyhow::Result<()> {
         let path = invite_path(data_dir);
         let file: InviteFile = match read_opt(&path)? {
-            Some(b) => toml::from_str(std::str::from_utf8(&b).context("invites.toml is not UTF-8")?)
-                .with_context(|| format!("parse {}", path.display()))?,
+            Some(b) => {
+                toml::from_str(std::str::from_utf8(&b).context("invites.toml is not UTF-8")?)
+                    .with_context(|| format!("parse {}", path.display()))?
+            }
             None => InviteFile::default(),
         };
         self.entries = file.invites;
@@ -467,7 +560,9 @@ impl Invites {
     }
 
     fn save(&self, data_dir: &Path) -> anyhow::Result<()> {
-        let text = toml::to_string(&InviteFile { invites: self.entries.clone() })?;
+        let text = toml::to_string(&InviteFile {
+            invites: self.entries.clone(),
+        })?;
         write_private(&invite_path(data_dir), text.as_bytes())
     }
 
@@ -485,9 +580,15 @@ impl Invites {
     pub(crate) fn issue_at(&mut self, data_dir: &Path, now: u64) -> anyhow::Result<[u8; 16]> {
         let _lock = InviteLock::acquire(data_dir)?;
         self.reload(data_dir, now)?;
-        ensure!(self.entries.len() < MAX_PENDING_INVITES, "too many pending invites");
+        ensure!(
+            self.entries.len() < MAX_PENDING_INVITES,
+            "too many pending invites"
+        );
         let token: [u8; 16] = random_bytes();
-        self.entries.push(InviteEntry { hash: hex(&token_hash(&token)), expires: now + INVITE_TTL_SECS });
+        self.entries.push(InviteEntry {
+            hash: hex(&token_hash(&token)),
+            expires: now + INVITE_TTL_SECS,
+        });
         self.save(data_dir)?;
         Ok(token)
     }
@@ -497,7 +598,12 @@ impl Invites {
         self.redeem_at(data_dir, token, unix_now())
     }
 
-    pub(crate) fn redeem_at(&mut self, data_dir: &Path, token: &[u8; 16], now: u64) -> anyhow::Result<bool> {
+    pub(crate) fn redeem_at(
+        &mut self,
+        data_dir: &Path,
+        token: &[u8; 16],
+        now: u64,
+    ) -> anyhow::Result<bool> {
         let _lock = InviteLock::acquire(data_dir)?;
         self.reload(data_dir, now)?;
         let want = hex(&token_hash(token));
@@ -521,19 +627,37 @@ impl Invites {
 /// Inviter side of a join: validate the request, consume the token, sign.
 /// Returns `JoinAccepted`, or an `Error` message (deliberately uniform for
 /// bad/used/expired tokens so the answer is no oracle).
-pub fn handle_join(id: &Identity, invites: &mut Invites, data_dir: &Path, request: &Message) -> anyhow::Result<Message> {
-    let Message::JoinRequest { token, node_name, public_key } = request else {
-        return Ok(Message::Error { message: "expected a join request".into() });
+pub fn handle_join(
+    id: &Identity,
+    invites: &mut Invites,
+    data_dir: &Path,
+    request: &Message,
+) -> anyhow::Result<Message> {
+    let Message::JoinRequest {
+        token,
+        node_name,
+        public_key,
+    } = request
+    else {
+        return Ok(Message::Error {
+            message: "expected a join request".into(),
+        });
     };
     if id.ca_key_der.is_none() {
-        return Ok(Message::Error { message: "this node cannot sign certificates".into() });
+        return Ok(Message::Error {
+            message: "this node cannot sign certificates".into(),
+        });
     }
     // Validate the request shape before burning the single-use token.
     if validate_node_name(node_name).is_err() || public_key.len() != 32 {
-        return Ok(Message::Error { message: "invalid join request".into() });
+        return Ok(Message::Error {
+            message: "invalid join request".into(),
+        });
     }
     if !invites.redeem(data_dir, token)? {
-        return Ok(Message::Error { message: "invalid or expired invite".into() });
+        return Ok(Message::Error {
+            message: "invalid or expired invite".into(),
+        });
     }
     let known_peers = crate::discovery::PeerBook::load(data_dir)?.peers;
     // The CA picks the id: a joiner must not be able to ask for a certificate
@@ -545,7 +669,12 @@ pub fn handle_join(id: &Identity, invites: &mut Invites, data_dir: &Path, reques
         }
     };
     let node_cert_der = sign_node_cert(id, node_name, node_id, public_key)?;
-    Ok(Message::JoinAccepted { node_id, node_cert_der, ca_cert_der: id.ca_cert_der.clone(), known_peers })
+    Ok(Message::JoinAccepted {
+        node_id,
+        node_cert_der,
+        ca_cert_der: id.ca_cert_der.clone(),
+        known_peers,
+    })
 }
 
 // ---------------------------------------------------------------- join: joiner
@@ -563,18 +692,24 @@ pub(crate) fn install_join_response(
     ca_cert_der: Vec<u8>,
 ) -> anyhow::Result<Identity> {
     {
-        let (_, ca) = x509_parser::parse_x509_certificate(&ca_cert_der).map_err(|e| anyhow::anyhow!("parse CA certificate: {e}"))?;
-        let (_, node) =
-            x509_parser::parse_x509_certificate(&node_cert_der).map_err(|e| anyhow::anyhow!("parse node certificate: {e}"))?;
+        let (_, ca) = x509_parser::parse_x509_certificate(&ca_cert_der)
+            .map_err(|e| anyhow::anyhow!("parse CA certificate: {e}"))?;
+        let (_, node) = x509_parser::parse_x509_certificate(&node_cert_der)
+            .map_err(|e| anyhow::anyhow!("parse node certificate: {e}"))?;
         ensure!(ca.is_ca(), "CA certificate is not a CA");
-        ca.verify_signature(None).map_err(|_| anyhow::anyhow!("CA certificate is not self-signed"))?;
-        node.verify_signature(Some(ca.public_key())).map_err(|_| anyhow::anyhow!("node certificate is not signed by the CA"))?;
+        ca.verify_signature(None)
+            .map_err(|_| anyhow::anyhow!("CA certificate is not self-signed"))?;
+        node.verify_signature(Some(ca.public_key()))
+            .map_err(|_| anyhow::anyhow!("node certificate is not signed by the CA"))?;
         ensure!(
             node.public_key().subject_public_key.data.as_ref() == node_kp.public_key_raw(),
             "node certificate is for a different key"
         );
     }
-    ensure!(node_id_from_cert(&node_cert_der)? == node_id, "node certificate is for a different node id");
+    ensure!(
+        node_id_from_cert(&node_cert_der)? == node_id,
+        "node certificate is for a different node id"
+    );
     let id = Identity {
         node_id,
         node_name: node_name.to_string(),
@@ -591,16 +726,26 @@ pub(crate) fn install_join_response(
 /// Joiner side: connect to `code.addr`, pin the inviter cert by fingerprint,
 /// send `JoinRequest`, receive `JoinAccepted`, write identity files. Returns
 /// the identity and the peers the inviter knows (the inviter itself included).
-pub async fn join(data_dir: &Path, node_name: &str, code: &JoinCode) -> anyhow::Result<(Identity, Vec<PeerInfo>)> {
+pub async fn join(
+    data_dir: &Path,
+    node_name: &str,
+    code: &JoinCode,
+) -> anyhow::Result<(Identity, Vec<PeerInfo>)> {
     use crate::transport::FramedConn;
     validate_node_name(node_name)?;
     let p = paths(data_dir);
-    ensure!(!p.node_crt.exists() && !p.ca_crt.exists(), "this machine already has a farm identity in {}", data_dir.display());
+    ensure!(
+        !p.node_crt.exists() && !p.ca_crt.exists(),
+        "this machine already has a farm identity in {}",
+        data_dir.display()
+    );
 
     let node_kp = KeyPair::generate_for(&PKCS_ED25519)?;
     let cfg = crate::transport::join_client_config(code.cert_fp)?;
     let connect = async {
-        let tcp = tokio::net::TcpStream::connect(&code.addr).await.with_context(|| format!("connect to {}", code.addr))?;
+        let tcp = tokio::net::TcpStream::connect(&code.addr)
+            .await
+            .with_context(|| format!("connect to {}", code.addr))?;
         tcp.set_nodelay(true).ok();
         let name = ServerName::try_from("crabfarm.local").context("server name")?;
         tokio_rustls::TlsConnector::from(cfg)
@@ -608,9 +753,16 @@ pub async fn join(data_dir: &Path, node_name: &str, code: &JoinCode) -> anyhow::
             .await
             .context("TLS handshake (is the join code's fingerprint right?)")
     };
-    let stream = tokio::time::timeout(Duration::from_secs(5), connect).await.context("join connect timed out")??;
-    let inviter_cert =
-        stream.get_ref().1.peer_certificates().and_then(|c| c.first()).map(|c| c.to_vec()).context("inviter sent no certificate")?;
+    let stream = tokio::time::timeout(Duration::from_secs(5), connect)
+        .await
+        .context("join connect timed out")??;
+    let inviter_cert = stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|c| c.first())
+        .map(|c| c.to_vec())
+        .context("inviter sent no certificate")?;
     let inviter_id = node_id_from_cert(&inviter_cert)?;
     let inviter_name = node_name_from_cert(&inviter_cert).unwrap_or_default();
 
@@ -621,18 +773,39 @@ pub async fn join(data_dir: &Path, node_name: &str, code: &JoinCode) -> anyhow::
         public_key: node_kp.public_key_raw().to_vec(),
     })
     .await?;
-    let reply = tokio::time::timeout(Duration::from_secs(10), conn.recv()).await.context("join reply timed out")??;
+    let reply = tokio::time::timeout(Duration::from_secs(10), conn.recv())
+        .await
+        .context("join reply timed out")??;
     let (node_id, node_cert_der, ca_cert_der, mut known_peers) = match reply {
-        Some(Message::JoinAccepted { node_id, node_cert_der, ca_cert_der, known_peers }) => {
-            (node_id, node_cert_der, ca_cert_der, known_peers)
+        Some(Message::JoinAccepted {
+            node_id,
+            node_cert_der,
+            ca_cert_der,
+            known_peers,
+        }) => (node_id, node_cert_der, ca_cert_der, known_peers),
+        Some(Message::Error { message }) => {
+            bail!("join refused: {}", crate::proto::log_safe(&message))
         }
-        Some(Message::Error { message }) => bail!("join refused: {}", crate::proto::log_safe(&message)),
-        Some(_) => bail!("unexpected reply to join request (this node speaks protocol {PROTO_VERSION})"),
+        Some(_) => {
+            bail!("unexpected reply to join request (this node speaks protocol {PROTO_VERSION})")
+        }
         None => bail!("inviter closed the connection"),
     };
-    let id = install_join_response(data_dir, node_name, node_id, &node_kp, node_cert_der, ca_cert_der)?;
+    let id = install_join_response(
+        data_dir,
+        node_name,
+        node_id,
+        &node_kp,
+        node_cert_der,
+        ca_cert_der,
+    )?;
     known_peers.retain(|p| p.node_id != inviter_id && p.node_id != id.node_id);
-    known_peers.push(PeerInfo { node_id: inviter_id, node_name: inviter_name, addrs: vec![code.addr.clone()], last_seen: unix_now() });
+    known_peers.push(PeerInfo {
+        node_id: inviter_id,
+        node_name: inviter_name,
+        addrs: vec![code.addr.clone()],
+        last_seen: unix_now(),
+    });
     Ok((id, known_peers))
 }
 
@@ -641,7 +814,11 @@ mod tests {
     use super::*;
 
     fn sample() -> JoinCode {
-        JoinCode { token: [7; 16], cert_fp: [0xab; 16], addr: "192.168.1.5:47070".into() }
+        JoinCode {
+            token: [7; 16],
+            cert_fp: [0xab; 16],
+            addr: "192.168.1.5:47070".into(),
+        }
     }
 
     #[test]
@@ -653,17 +830,30 @@ mod tests {
         assert_eq!(s, s.to_ascii_lowercase());
         assert_eq!(JoinCode::parse(&s).unwrap(), c);
         assert_eq!(JoinCode::parse(&format!("  {s}\n")).unwrap(), c);
-        let v6 = JoinCode { addr: "[fe80::1]:47070".into(), ..sample() };
+        let v6 = JoinCode {
+            addr: "[fe80::1]:47070".into(),
+            ..sample()
+        };
         assert_eq!(JoinCode::parse(&v6.encode()).unwrap(), v6);
-        let named = JoinCode { addr: "desk.tailnet:1".into(), ..sample() };
+        let named = JoinCode {
+            addr: "desk.tailnet:1".into(),
+            ..sample()
+        };
         assert_eq!(JoinCode::parse(&named.encode()).unwrap(), named);
     }
 
     #[test]
     fn join_code_exact_format() {
         // Pins the documented layout: base32 lowercase, no padding.
-        let c = JoinCode { token: [0; 16], cert_fp: [0xff; 16], addr: "h:1".into() };
-        assert_eq!(c.encode(), "cf1-aaaaaaaaaaaaaaaaaaaaaaaaaa-77777777777777777777777774@h:1");
+        let c = JoinCode {
+            token: [0; 16],
+            cert_fp: [0xff; 16],
+            addr: "h:1".into(),
+        };
+        assert_eq!(
+            c.encode(),
+            "cf1-aaaaaaaaaaaaaaaaaaaaaaaaaa-77777777777777777777777774@h:1"
+        );
     }
 
     #[test]
@@ -684,11 +874,11 @@ mod tests {
             format!("{head}@host:70000"),
             format!("{head}@host:x"),
             format!("{head}@ho st:1"),
-            format!("cf1-{tok}@{addr}"),                  // no fingerprint
-            format!("cf1-{tok}1-{fp}@{addr}"),            // '1' is not in the base32 alphabet
-            format!("cf1-{}-{fp}@{addr}", &tok[..20]),    // short token
-            format!("cf1-{tok}-{}@{addr}", &fp[..20]),    // short fingerprint
-            format!("cf1-{tok}a-{fp}@{addr}"),            // long token
+            format!("cf1-{tok}@{addr}"),               // no fingerprint
+            format!("cf1-{tok}1-{fp}@{addr}"),         // '1' is not in the base32 alphabet
+            format!("cf1-{}-{fp}@{addr}", &tok[..20]), // short token
+            format!("cf1-{tok}-{}@{addr}", &fp[..20]), // short fingerprint
+            format!("cf1-{tok}a-{fp}@{addr}"),         // long token
             format!("{good}@x:1"),
         ];
         for s in bad {
@@ -701,14 +891,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(load(dir.path()).unwrap().is_none());
         let id = create(dir.path(), "alpha").unwrap();
-        assert!(create(dir.path(), "again").is_err(), "must not overwrite an existing farm");
+        assert!(
+            create(dir.path(), "again").is_err(),
+            "must not overwrite an existing farm"
+        );
         let back = load(dir.path()).unwrap().unwrap();
         assert_eq!(back.node_id, id.node_id);
         assert_eq!(back.node_name, "alpha");
         assert_eq!(back.short_farm_id().len(), 32);
         assert!(back.ca_key_der.is_some());
         assert_eq!(node_id_from_cert(&back.node_cert_der).unwrap(), id.node_id);
-        assert!(node_id_from_cert(&back.ca_cert_der).is_err(), "CA has no node id");
+        assert!(
+            node_id_from_cert(&back.ca_cert_der).is_err(),
+            "CA has no node id"
+        );
         let dbg = format!("{back:?}");
         assert!(!dbg.contains("node_key") && !dbg.contains("blob_key"));
 
@@ -717,16 +913,30 @@ mod tests {
         assert!(!cert.is_ca());
         let span = cert.validity().not_after.timestamp() - cert.validity().not_before.timestamp();
         assert!(span > 9 * 365 * 24 * 3600, "about ten years");
-        let ekus = cert.extensions().iter().find_map(|e| match e.parsed_extension() {
-            ParsedExtension::ExtendedKeyUsage(k) => Some(k.clone()),
-            _ => None,
-        });
+        let ekus = cert
+            .extensions()
+            .iter()
+            .find_map(|e| match e.parsed_extension() {
+                ParsedExtension::ExtendedKeyUsage(k) => Some(k.clone()),
+                _ => None,
+            });
         let ekus = ekus.unwrap();
         assert!(ekus.server_auth && ekus.client_auth);
         let (_, ca) = x509_parser::parse_x509_certificate(&back.ca_cert_der).unwrap();
         assert!(ca.is_ca());
-        assert_eq!(ca.basic_constraints().unwrap().unwrap().value.path_len_constraint, Some(0));
-        assert_eq!(ca.public_key().algorithm.algorithm.to_id_string(), "1.3.101.112", "Ed25519 CA");
+        assert_eq!(
+            ca.basic_constraints()
+                .unwrap()
+                .unwrap()
+                .value
+                .path_len_constraint,
+            Some(0)
+        );
+        assert_eq!(
+            ca.public_key().algorithm.algorithm.to_id_string(),
+            "1.3.101.112",
+            "Ed25519 CA"
+        );
         assert!(cert.verify_signature(Some(ca.public_key())).is_ok());
     }
 
@@ -737,7 +947,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         create(dir.path(), "alpha").unwrap();
         for f in ["farm/ca.key", "node.key", "blob.key"] {
-            let mode = std::fs::metadata(dir.path().join(f)).unwrap().permissions().mode() & 0o777;
+            let mode = std::fs::metadata(dir.path().join(f))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             assert_eq!(mode, 0o600, "{f}");
         }
     }
@@ -752,7 +966,13 @@ mod tests {
         assert!(!node.redeem(dir.path(), &[0u8; 16]).unwrap(), "wrong token");
         assert!(node.redeem(dir.path(), &t).unwrap());
         assert!(!node.redeem(dir.path(), &t).unwrap(), "reused token");
-        assert!(!Invites::load(dir.path()).unwrap().redeem(dir.path(), &t).unwrap(), "reuse across processes");
+        assert!(
+            !Invites::load(dir.path())
+                .unwrap()
+                .redeem(dir.path(), &t)
+                .unwrap(),
+            "reuse across processes"
+        );
     }
 
     #[test]
@@ -769,20 +989,32 @@ mod tests {
                 let path = path.clone();
                 std::thread::spawn(move || {
                     let mut inv = Invites::default();
-                    (0..EACH).map(|_| inv.issue(&path).unwrap()).collect::<Vec<_>>()
+                    (0..EACH)
+                        .map(|_| inv.issue(&path).unwrap())
+                        .collect::<Vec<_>>()
                 })
             })
             .collect();
-        let tokens: Vec<[u8; 16]> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        let tokens: Vec<[u8; 16]> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
         assert_eq!(tokens.len(), THREADS * EACH);
-        assert_eq!(Invites::load(&path).unwrap().entries.len(), tokens.len(), "an issue was lost");
+        assert_eq!(
+            Invites::load(&path).unwrap().entries.len(),
+            tokens.len(),
+            "an issue was lost"
+        );
         // Racing redeemers: every token redeems exactly once overall.
         let handles: Vec<_> = (0..THREADS)
             .map(|_| {
                 let (path, tokens) = (path.clone(), tokens.clone());
                 std::thread::spawn(move || {
                     let mut inv = Invites::default();
-                    tokens.iter().filter(|t| inv.redeem(&path, t).unwrap()).count()
+                    tokens
+                        .iter()
+                        .filter(|t| inv.redeem(&path, t).unwrap())
+                        .count()
                 })
             })
             .collect();
@@ -793,9 +1025,16 @@ mod tests {
 
     #[test]
     fn join_code_debug_hides_the_token() {
-        let c = JoinCode { token: [7; 16], cert_fp: [0xab; 16], addr: "h:1".into() };
+        let c = JoinCode {
+            token: [7; 16],
+            cert_fp: [0xab; 16],
+            addr: "h:1".into(),
+        };
         let dbg = format!("{c:?}");
-        assert!(!dbg.contains(&b32(&c.token)) && !dbg.contains("[7"), "{dbg}");
+        assert!(
+            !dbg.contains(&b32(&c.token)) && !dbg.contains("[7"),
+            "{dbg}"
+        );
         assert!(dbg.contains("h:1") && dbg.contains("redacted"));
     }
 
@@ -805,9 +1044,16 @@ mod tests {
         let mut inv = Invites::default();
         let t0 = 1_000_000;
         let t = inv.issue_at(dir.path(), t0).unwrap();
-        assert!(!inv.redeem_at(dir.path(), &t, t0 + INVITE_TTL_SECS).unwrap(), "expired at exactly the TTL");
+        assert!(
+            !inv.redeem_at(dir.path(), &t, t0 + INVITE_TTL_SECS).unwrap(),
+            "expired at exactly the TTL"
+        );
         let t2 = inv.issue_at(dir.path(), t0).unwrap();
-        assert!(inv.redeem_at(dir.path(), &t2, t0 + INVITE_TTL_SECS - 1).unwrap(), "valid just before");
+        assert!(
+            inv.redeem_at(dir.path(), &t2, t0 + INVITE_TTL_SECS - 1)
+                .unwrap(),
+            "valid just before"
+        );
     }
 
     #[test]
@@ -834,25 +1080,47 @@ mod tests {
             public_key: pk,
         };
         // Bad key length / name are refused and do not burn the token.
-        for bad in [req(token, vec![1; 31], "x"), req(token, pk.clone(), ""), req(token, pk.clone(), "a\nb")] {
-            assert!(matches!(handle_join(&ca_node, &mut inv, a.path(), &bad).unwrap(), Message::Error { .. }));
+        for bad in [
+            req(token, vec![1; 31], "x"),
+            req(token, pk.clone(), ""),
+            req(token, pk.clone(), "a\nb"),
+        ] {
+            assert!(matches!(
+                handle_join(&ca_node, &mut inv, a.path(), &bad).unwrap(),
+                Message::Error { .. }
+            ));
         }
         // A joined node (no CA key) cannot sign even with a valid token.
         let t = inv.issue(a.path()).unwrap();
-        let Message::JoinAccepted { node_id, node_cert_der, ca_cert_der, .. } =
-            handle_join(&ca_node, &mut inv, a.path(), &req(t, pk.clone(), "beta")).unwrap()
+        let Message::JoinAccepted {
+            node_id,
+            node_cert_der,
+            ca_cert_der,
+            ..
+        } = handle_join(&ca_node, &mut inv, a.path(), &req(t, pk.clone(), "beta")).unwrap()
         else {
             panic!("expected JoinAccepted")
         };
-        let joined = install_join_response(b.path(), "beta", node_id, &kp, node_cert_der, ca_cert_der).unwrap();
+        let joined =
+            install_join_response(b.path(), "beta", node_id, &kp, node_cert_der, ca_cert_der)
+                .unwrap();
         let t = inv.issue(b.path()).unwrap();
         let reply = handle_join(&joined, &mut inv, b.path(), &req(t, pk.clone(), "gamma")).unwrap();
         assert!(matches!(reply, Message::Error { .. }));
         // The original token still works (nothing above consumed it).
-        let ok = handle_join(&ca_node, &mut inv, a.path(), &req(token, pk.clone(), "delta")).unwrap();
+        let ok = handle_join(
+            &ca_node,
+            &mut inv,
+            a.path(),
+            &req(token, pk.clone(), "delta"),
+        )
+        .unwrap();
         assert!(matches!(ok, Message::JoinAccepted { .. }));
         // Not a join request at all.
-        assert!(matches!(handle_join(&ca_node, &mut inv, a.path(), &Message::Started).unwrap(), Message::Error { .. }));
+        assert!(matches!(
+            handle_join(&ca_node, &mut inv, a.path(), &Message::Started).unwrap(),
+            Message::Error { .. }
+        ));
     }
 
     #[test]
@@ -864,8 +1132,17 @@ mod tests {
         let mut seen = Vec::new();
         for i in 0..3 {
             let token = inv.issue(a.path()).unwrap();
-            let req = Message::JoinRequest { token, node_name: format!("n{i}"), public_key: kp.public_key_raw().to_vec() };
-            let Message::JoinAccepted { node_id, node_cert_der, .. } = handle_join(&ca_node, &mut inv, a.path(), &req).unwrap() else {
+            let req = Message::JoinRequest {
+                token,
+                node_name: format!("n{i}"),
+                public_key: kp.public_key_raw().to_vec(),
+            };
+            let Message::JoinAccepted {
+                node_id,
+                node_cert_der,
+                ..
+            } = handle_join(&ca_node, &mut inv, a.path(), &req).unwrap()
+            else {
                 panic!("expected JoinAccepted")
             };
             // The certificate carries exactly the id the CA reported, and it is
@@ -892,14 +1169,31 @@ mod tests {
             let r = install_join_response(d.path(), "me", nid, kp, cert, ca);
             (r.is_ok(), load(d.path()).unwrap().is_some())
         };
-        assert_eq!(try_install(ok_cert.clone(), ca_node.ca_cert_der.clone(), nid, &mine), (true, true));
+        assert_eq!(
+            try_install(ok_cert.clone(), ca_node.ca_cert_der.clone(), nid, &mine),
+            (true, true)
+        );
         // Certificate for somebody else's key.
-        assert_eq!(try_install(ok_cert.clone(), ca_node.ca_cert_der.clone(), nid, &other), (false, false));
+        assert_eq!(
+            try_install(ok_cert.clone(), ca_node.ca_cert_der.clone(), nid, &other),
+            (false, false)
+        );
         // Certificate for another node id.
-        assert_eq!(try_install(ok_cert.clone(), ca_node.ca_cert_der.clone(), NodeId([6; 16]), &mine), (false, false));
+        assert_eq!(
+            try_install(
+                ok_cert.clone(),
+                ca_node.ca_cert_der.clone(),
+                NodeId([6; 16]),
+                &mine
+            ),
+            (false, false)
+        );
         // Certificate from a different CA than the one handed over.
         let b = tempfile::tempdir().unwrap();
         let foreign = create(b.path(), "foreign").unwrap();
-        assert_eq!(try_install(ok_cert, foreign.ca_cert_der.clone(), nid, &mine), (false, false));
+        assert_eq!(
+            try_install(ok_cert, foreign.ca_cert_der.clone(), nid, &mine),
+            (false, false)
+        );
     }
 }

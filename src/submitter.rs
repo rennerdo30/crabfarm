@@ -8,7 +8,9 @@ use crate::depgraph::is_proc_macro_lib;
 use crate::inputs::{self, CollectError};
 use crate::link::Link;
 use crate::node::{Node, lock};
-use crate::proto::{BlobHash, ClientPath, EnvValue, InputFile, JobId, JobSpec, LocalReason, Message, NodeId};
+use crate::proto::{
+    BlobHash, ClientPath, EnvValue, InputFile, JobId, JobSpec, LocalReason, Message, NodeId,
+};
 use crate::scheduler::{self, Candidate, Choice, JobNeeds};
 use anyhow::bail;
 use std::collections::{HashMap, HashSet};
@@ -64,16 +66,27 @@ struct RunningGuard {
 
 impl RunningGuard {
     fn new(node: &Arc<Node>, remote: bool) -> RunningGuard {
-        let c = if remote { &node.running_remote } else { &node.running_local };
+        let c = if remote {
+            &node.running_remote
+        } else {
+            &node.running_local
+        };
         c.fetch_add(1, Ordering::Relaxed);
         node.status_changed();
-        RunningGuard { node: node.clone(), remote }
+        RunningGuard {
+            node: node.clone(),
+            remote,
+        }
     }
 }
 
 impl Drop for RunningGuard {
     fn drop(&mut self) {
-        let c = if self.remote { &self.node.running_remote } else { &self.node.running_local };
+        let c = if self.remote {
+            &self.node.running_remote
+        } else {
+            &self.node.running_local
+        };
         c.fetch_sub(1, Ordering::Relaxed);
         self.node.status_changed();
     }
@@ -105,7 +118,10 @@ pub fn output_allowed(out_dir: &ClientPath, produces: &[ClientPath], p: &ClientP
 
 /// True when `path` lies under one of the configured prefixes.
 pub fn under_prefix(prefixes: &[String], path: &ClientPath) -> bool {
-    prefixes.iter().filter_map(|p| ClientPath::parse(path.style, p)).any(|p| path.starts_with(&p))
+    prefixes
+        .iter()
+        .filter_map(|p| ClientPath::parse(path.style, p))
+        .any(|p| path.starts_with(&p))
 }
 
 /// Write `data` next to `dest` into a temporary file and return its path.
@@ -115,7 +131,10 @@ fn write_temp(dest: &std::path::Path, data: &[u8]) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     let mut tag = [0u8; 6];
     rand::fill(&mut tag[..]);
-    let tmp = parent.join(format!(".crabfarm-{}.tmp", data_encoding::HEXLOWER.encode(&tag)));
+    let tmp = parent.join(format!(
+        ".crabfarm-{}.tmp",
+        data_encoding::HEXLOWER.encode(&tag)
+    ));
     if let Err(e) = std::fs::write(&tmp, data) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("write {}", tmp.display()));
@@ -181,10 +200,13 @@ fn is_artifact_notice(m: &Message) -> bool {
 }
 
 fn env_path(spec: &JobSpec, name: &str) -> Option<ClientPath> {
-    spec.env.iter().find(|(k, _)| k == name).and_then(|(_, v)| match v {
-        EnvValue::Path(p) => Some(p.clone()),
-        EnvValue::Plain(_) => None,
-    })
+    spec.env
+        .iter()
+        .find(|(k, _)| k == name)
+        .and_then(|(_, v)| match v {
+            EnvValue::Path(p) => Some(p.clone()),
+            EnvValue::Plain(_) => None,
+        })
 }
 
 struct Built {
@@ -200,10 +222,24 @@ fn build_inputs(node: &Node, spec: &JobSpec, info: &SubmitInfo) -> Result<Built,
         .or_else(|| info.input.to_local().parent().map(PathBuf::from))
         .ok_or(LocalReason::NotEligible)?;
     let out_dir_env = env_path(spec, "OUT_DIR").map(|p| p.to_local());
-    let search: Vec<(String, PathBuf)> =
-        info.search_dirs.iter().filter(|(k, _)| k == "native" || k == "all").map(|(k, p)| (k.clone(), p.to_local())).collect();
-    let collected = inputs::collect(&pkg, out_dir_env.as_deref(), &search, &info.link_libs, spec.target.contains("msvc")).map_err(|e| {
-        tracing::debug!(crate_name = spec.crate_name.as_str(), "input collection: {e}");
+    let search: Vec<(String, PathBuf)> = info
+        .search_dirs
+        .iter()
+        .filter(|(k, _)| k == "native" || k == "all")
+        .map(|(k, p)| (k.clone(), p.to_local()))
+        .collect();
+    let collected = inputs::collect(
+        &pkg,
+        out_dir_env.as_deref(),
+        &search,
+        &info.link_libs,
+        spec.target.contains("msvc"),
+    )
+    .map_err(|e| {
+        tracing::debug!(
+            crate_name = spec.crate_name.as_str(),
+            "input collection: {e}"
+        );
         match e {
             CollectError::TooLarge => LocalReason::TooLarge,
             _ => LocalReason::NotEligible,
@@ -221,12 +257,20 @@ fn build_inputs(node: &Node, spec: &JobSpec, info: &SubmitInfo) -> Result<Built,
     let mut files: HashMap<BlobHash, PathBuf> = HashMap::new();
     let mut total = collected.total;
     let mut add = |path: PathBuf, executable: bool| -> Result<(), LocalReason> {
-        let client = ClientPath::from_local(&path, std::path::Path::new(".")).ok_or(LocalReason::NotEligible)?;
+        let client = ClientPath::from_local(&path, std::path::Path::new("."))
+            .ok_or(LocalReason::NotEligible)?;
         if !seen.insert(client.clone()) {
             return Ok(());
         }
-        let (hash, size) = lock(&node.hashes).hash(&client, &path).map_err(|_| LocalReason::NotEligible)?;
-        inputs_out.push(InputFile { path: client, hash, size, executable });
+        let (hash, size) = lock(&node.hashes)
+            .hash(&client, &path)
+            .map_err(|_| LocalReason::NotEligible)?;
+        inputs_out.push(InputFile {
+            path: client,
+            hash,
+            size,
+            executable,
+        });
         files.entry(hash).or_insert(path);
         Ok(())
     };
@@ -235,13 +279,21 @@ fn build_inputs(node: &Node, spec: &JobSpec, info: &SubmitInfo) -> Result<Built,
     }
     for c in closure {
         let local = c.to_local();
-        total = total.saturating_add(std::fs::metadata(&local).map(|m| m.len()).map_err(|_| LocalReason::UnknownDependency)?);
+        total = total.saturating_add(
+            std::fs::metadata(&local)
+                .map(|m| m.len())
+                .map_err(|_| LocalReason::UnknownDependency)?,
+        );
         if total > inputs::MAX_TOTAL {
             return Err(LocalReason::TooLarge);
         }
         add(local, false)?;
     }
-    Ok(Built { inputs: inputs_out, files, has_proc_macro })
+    Ok(Built {
+        inputs: inputs_out,
+        files,
+        has_proc_macro,
+    })
 }
 
 struct PeerView {
@@ -268,8 +320,22 @@ impl Node {
                         break;
                     }
                 }
-                Message::Submit { spec, rustc: _, produces, externs, input, search_dirs, link_libs } => {
-                    let info = SubmitInfo { produces, externs, input, search_dirs, link_libs };
+                Message::Submit {
+                    spec,
+                    rustc: _,
+                    produces,
+                    externs,
+                    input,
+                    search_dirs,
+                    link_libs,
+                } => {
+                    let info = SubmitInfo {
+                        produces,
+                        externs,
+                        input,
+                        search_dirs,
+                        link_libs,
+                    };
                     self.handle_submit(&mut link, spec, info).await;
                     break;
                 }
@@ -294,28 +360,45 @@ impl Node {
             RemoteEnd::Done => {
                 // The wrapper may reject the result (compile error of a
                 // non-registry crate, env-dep mismatch) and ask for a slot.
-                if let Ok(Some(Message::RetryLocal { reason })) = tokio::time::timeout(RETRY_WAIT, wrapper.recv()).await {
+                if let Ok(Some(Message::RetryLocal { reason })) =
+                    tokio::time::timeout(RETRY_WAIT, wrapper.recv()).await
+                {
                     self.local_phase(wrapper, reason, &info).await;
                 }
             }
             RemoteEnd::Fallback(why) => {
-                tracing::debug!(crate_name = plan.spec.crate_name.as_str(), "remote job failed: {why}");
+                tracing::debug!(
+                    crate_name = plan.spec.crate_name.as_str(),
+                    "remote job failed: {why}"
+                );
                 self.count("remote_failed", 1);
-                self.local_phase(wrapper, LocalReason::RemoteFailed, &info).await;
+                self.local_phase(wrapper, LocalReason::RemoteFailed, &info)
+                    .await;
             }
             RemoteEnd::Tainted => {
-                tracing::info!(crate_name = plan.spec.crate_name.as_str(), "remote output embeds the sandbox path, rerunning locally");
-                self.local_phase(wrapper, LocalReason::SandboxPathInOutput, &info).await;
+                tracing::info!(
+                    crate_name = plan.spec.crate_name.as_str(),
+                    "remote output embeds the sandbox path, rerunning locally"
+                );
+                self.local_phase(wrapper, LocalReason::SandboxPathInOutput, &info)
+                    .await;
             }
         }
     }
 
     /// Wait for a local slot (FIFO), hand it to the wrapper, and wait until its
     /// rustc is done.
-    async fn local_phase(self: &Arc<Self>, wrapper: &mut Link, reason: LocalReason, info: &SubmitInfo) {
+    async fn local_phase(
+        self: &Arc<Self>,
+        wrapper: &mut Link,
+        reason: LocalReason,
+        info: &SubmitInfo,
+    ) {
         self.count_local(reason);
         lock(&self.depgraph).begin(&info.produces, &info.externs);
-        let Ok(permit) = self.local_sem.clone().acquire_owned().await else { return };
+        let Ok(permit) = self.local_sem.clone().acquire_owned().await else {
+            return;
+        };
         let _running = RunningGuard::new(self, false);
         if wrapper.send(Message::RunLocal { reason }).await.is_err() {
             lock(&self.depgraph).finish(&info.produces, false);
@@ -336,7 +419,12 @@ impl Node {
 
     /// Eligible peers with a free slot, and whether any peer was eligible at all.
     fn peer_views(&self, spec: &JobSpec) -> (Vec<PeerView>, bool) {
-        let needs = JobNeeds { toolchain: &spec.toolchain, target: &spec.target, needs_host: spec.needs_host, local_host: &self.host_triple };
+        let needs = JobNeeds {
+            toolchain: &spec.toolchain,
+            target: &spec.target,
+            needs_host: spec.needs_host,
+            local_host: &self.host_triple,
+        };
         let mut any = false;
         let mut views = Vec::new();
         for (id, p) in lock(&self.peers).iter() {
@@ -345,9 +433,17 @@ impl Node {
                 continue;
             }
             any = true;
-            let free = st.slots_total.saturating_sub(st.slots_busy).saturating_sub(p.pending);
+            let free = st
+                .slots_total
+                .saturating_sub(st.slots_busy)
+                .saturating_sub(p.pending);
             if free > 0 {
-                views.push(PeerView { id: *id, free, speed: st.speed.max(1), bandwidth: p.bandwidth_bps });
+                views.push(PeerView {
+                    id: *id,
+                    free,
+                    speed: st.speed.max(1),
+                    bandwidth: p.bandwidth_bps,
+                });
             }
         }
         // Stable order for equal scores.
@@ -355,7 +451,11 @@ impl Node {
         (views, any)
     }
 
-    async fn plan(self: &Arc<Self>, mut spec: JobSpec, info: &SubmitInfo) -> Result<Plan, LocalReason> {
+    async fn plan(
+        self: &Arc<Self>,
+        mut spec: JobSpec,
+        info: &SubmitInfo,
+    ) -> Result<Plan, LocalReason> {
         // DESIGN section 10: configured prefixes never leave the machine.
         let manifest = env_path(&spec, "CARGO_MANIFEST_DIR");
         let mut roots = vec![&info.input];
@@ -368,16 +468,31 @@ impl Node {
         let local_free = self.local_sem.available_permits() as u32;
         let (views, any) = self.peer_views(&spec);
         if views.is_empty() {
-            return Err(if any { LocalReason::PeersBusy } else { LocalReason::NoPeer });
+            return Err(if any {
+                LocalReason::PeersBusy
+            } else {
+                LocalReason::NoPeer
+            });
         }
-        let cands: Vec<Candidate> =
-            views.iter().map(|v| Candidate { free_slots: v.free, speed: v.speed, upload_bytes: 0, bandwidth_bps: v.bandwidth }).collect();
+        let cands: Vec<Candidate> = views
+            .iter()
+            .map(|v| Candidate {
+                free_slots: v.free,
+                speed: v.speed,
+                upload_bytes: 0,
+                bandwidth_bps: v.bandwidth,
+            })
+            .collect();
         if scheduler::choose(local_free, self.cfg.prefer_remote, &cands) == Choice::Local {
             return Err(LocalReason::LocalSlotFree);
         }
 
         // Inputs cost disk and CPU; only now that a peer looks better.
-        let _prep = self.prep_sem.acquire().await.map_err(|_| LocalReason::NotEligible)?;
+        let _prep = self
+            .prep_sem
+            .acquire()
+            .await
+            .map_err(|_| LocalReason::NotEligible)?;
         let node = self.clone();
         let spec_for_build = spec.clone();
         let info_for_build = SubmitInfo {
@@ -387,9 +502,11 @@ impl Node {
             search_dirs: info.search_dirs.clone(),
             link_libs: info.link_libs.clone(),
         };
-        let built = tokio::task::spawn_blocking(move || build_inputs(&node, &spec_for_build, &info_for_build))
-            .await
-            .map_err(|_| LocalReason::NotEligible)??;
+        let built = tokio::task::spawn_blocking(move || {
+            build_inputs(&node, &spec_for_build, &info_for_build)
+        })
+        .await
+        .map_err(|_| LocalReason::NotEligible)??;
 
         spec.needs_host |= built.has_proc_macro;
         spec.no_retain = !self.cfg.retain_blobs || sensitive;
@@ -405,7 +522,11 @@ impl Node {
         // the upload is known now.
         let (views, any) = self.peer_views(&spec);
         if views.is_empty() {
-            return Err(if any { LocalReason::PeersBusy } else { LocalReason::NoPeer });
+            return Err(if any {
+                LocalReason::PeersBusy
+            } else {
+                LocalReason::NoPeer
+            });
         }
         let cands: Vec<Candidate> = {
             let peers = lock(&self.peers);
@@ -413,8 +534,18 @@ impl Node {
                 .iter()
                 .map(|v| {
                     let sent = peers.get(&v.id).map(|p| &p.sent);
-                    let upload: u64 = spec.inputs.iter().filter(|i| !sent.is_some_and(|s| s.contains(&i.hash))).map(|i| i.size).sum();
-                    Candidate { free_slots: v.free, speed: v.speed, upload_bytes: upload, bandwidth_bps: v.bandwidth }
+                    let upload: u64 = spec
+                        .inputs
+                        .iter()
+                        .filter(|i| !sent.is_some_and(|s| s.contains(&i.hash)))
+                        .map(|i| i.size)
+                        .sum();
+                    Candidate {
+                        free_slots: v.free,
+                        speed: v.speed,
+                        upload_bytes: upload,
+                        bandwidth_bps: v.bandwidth,
+                    }
                 })
                 .collect()
         };
@@ -424,20 +555,37 @@ impl Node {
         };
         let mut order: Vec<usize> = (0..views.len()).filter(|i| *i != first).collect();
         order.sort_by_key(|i| std::cmp::Reverse(cands[*i].score()));
-        let targets: Vec<NodeId> = std::iter::once(first).chain(order).map(|i| views[i].id).collect();
+        let targets: Vec<NodeId> = std::iter::once(first)
+            .chain(order)
+            .map(|i| views[i].id)
+            .collect();
 
         if let Some(p) = lock(&self.peers).get_mut(&targets[0]) {
             p.pending += 1;
         }
-        Ok(Plan { spec, targets: targets.clone(), files: built.files, pending: std::sync::Mutex::new(Some(PendingGuard { node: self.clone(), peer: targets[0] })) })
+        Ok(Plan {
+            spec,
+            targets: targets.clone(),
+            files: built.files,
+            pending: std::sync::Mutex::new(Some(PendingGuard {
+                node: self.clone(),
+                peer: targets[0],
+            })),
+        })
     }
 
     // --------------------------------------------------------------- remote
 
     async fn open_job_link(self: &Arc<Self>, peer: NodeId, job_id: JobId) -> Option<Link> {
-        let addrs = lock(&self.peers).get(&peer).map(|p| p.info.addrs.clone()).unwrap_or_default();
+        let addrs = lock(&self.peers)
+            .get(&peer)
+            .map(|p| p.info.addrs.clone())
+            .unwrap_or_default();
         for a in addrs {
-            let Ok((pid, _hello, conn)) = crate::transport::connect(&self.tls, &self.id, &a).await else { continue };
+            let Ok((pid, _hello, conn)) = crate::transport::connect(&self.tls, &self.id, &a).await
+            else {
+                continue;
+            };
             if pid != peer {
                 continue;
             }
@@ -454,7 +602,12 @@ impl Node {
         None
     }
 
-    async fn run_remote(self: &Arc<Self>, wrapper: &Link, plan: &Plan, info: &SubmitInfo) -> RemoteEnd {
+    async fn run_remote(
+        self: &Arc<Self>,
+        wrapper: &Link,
+        plan: &Plan,
+        info: &SubmitInfo,
+    ) -> RemoteEnd {
         let _running = RunningGuard::new(self, true);
         for target in plan.targets.iter().take(2) {
             let Some(link) = self.open_job_link(*target, plan.spec.job_id).await else {
@@ -464,7 +617,11 @@ impl Node {
             let started = Instant::now();
             let end = self.drive_remote(wrapper, link, plan, info, *target).await;
             if matches!(end, RemoteEnd::Done) {
-                tracing::debug!(crate_name = plan.spec.crate_name.as_str(), ms = started.elapsed().as_millis() as u64, "remote job done");
+                tracing::debug!(
+                    crate_name = plan.spec.crate_name.as_str(),
+                    ms = started.elapsed().as_millis() as u64,
+                    "remote job done"
+                );
             }
             return end;
         }
@@ -472,8 +629,18 @@ impl Node {
     }
 
     /// Run the job on one open job connection and apply what comes back.
-    async fn drive_remote(self: &Arc<Self>, wrapper: &Link, mut link: Link, plan: &Plan, info: &SubmitInfo, target: NodeId) -> RemoteEnd {
-        match self.drive_remote_inner(wrapper, &mut link, plan, info, target).await {
+    async fn drive_remote(
+        self: &Arc<Self>,
+        wrapper: &Link,
+        mut link: Link,
+        plan: &Plan,
+        info: &SubmitInfo,
+        target: NodeId,
+    ) -> RemoteEnd {
+        match self
+            .drive_remote_inner(wrapper, &mut link, plan, info, target)
+            .await
+        {
             Ok(end) => {
                 link.close().await;
                 end
@@ -495,7 +662,11 @@ impl Node {
         target: NodeId,
     ) -> anyhow::Result<RemoteEnd> {
         let spec = &plan.spec;
-        link.send(Message::JobRequest { spec: spec.clone(), blob_key: self.id.blob_key }).await?;
+        link.send(Message::JobRequest {
+            spec: spec.clone(),
+            blob_key: self.id.blob_key,
+        })
+        .await?;
         let idle = Duration::from_secs(self.cfg.job_timeout_min.max(1) * 60 + 120);
         let mut pending: Option<(Assembler, ClientPath, BlobHash, u64)> = None;
         // Outputs are applied at `Exit`, not on arrival, so a tainted job leaves
@@ -506,10 +677,16 @@ impl Node {
         let mut held: Vec<Message> = Vec::new();
         let mut holding = false;
         loop {
-            let m = tokio::time::timeout(idle, link.recv()).await.map_err(|_| anyhow::anyhow!("peer silent"))?;
-            let Some(m) = m else { bail!("connection to the peer lost") };
+            let m = tokio::time::timeout(idle, link.recv())
+                .await
+                .map_err(|_| anyhow::anyhow!("peer silent"))?;
+            let Some(m) = m else {
+                bail!("connection to the peer lost")
+            };
             match m {
-                Message::NeedBlobs { hashes } => self.upload_blobs(link, plan, target, &hashes).await?,
+                Message::NeedBlobs { hashes } => {
+                    self.upload_blobs(link, plan, target, &hashes).await?
+                }
                 Message::Started => {}
                 Message::Stderr { line } => {
                     if pending.is_some() {
@@ -547,8 +724,15 @@ impl Node {
                     }
                     pending = Some((Assembler::default(), path, hash, size));
                 }
-                Message::BlobChunk { hash, offset, last, data } => {
-                    let Some((asm, path, want, size)) = pending.as_mut() else { bail!("blob chunk without an output") };
+                Message::BlobChunk {
+                    hash,
+                    offset,
+                    last,
+                    data,
+                } => {
+                    let Some((asm, path, want, size)) = pending.as_mut() else {
+                        bail!("blob chunk without an output")
+                    };
                     if hash != *want || offset > *size {
                         bail!("unexpected blob chunk");
                     }
@@ -559,7 +743,8 @@ impl Node {
                         let dest = path.to_local();
                         let n = plain.len() as u64;
                         let to = dest.clone();
-                        let tmp = tokio::task::spawn_blocking(move || write_temp(&to, &plain)).await??;
+                        let tmp =
+                            tokio::task::spawn_blocking(move || write_temp(&to, &plain)).await??;
                         staged.add(tmp, dest);
                         self.count("bytes_down", n);
                         pending = None;
@@ -584,7 +769,14 @@ impl Node {
                         staged.discard();
                     }
                     lock(&self.depgraph).finish(&info.produces, code == 0);
-                    self.count(if code == 0 { "remote_ok" } else { "remote_exit_nonzero" }, 1);
+                    self.count(
+                        if code == 0 {
+                            "remote_ok"
+                        } else {
+                            "remote_exit_nonzero"
+                        },
+                        1,
+                    );
                     for m in held.drain(..) {
                         if wrapper.send(m).await.is_err() {
                             let _ = link.send(Message::Cancel).await;
@@ -603,17 +795,29 @@ impl Node {
                     wrapper.send(Message::Exit { code }).await.ok();
                     return Ok(RemoteEnd::Done);
                 }
-                Message::Error { message } => bail!("peer reported: {}", crate::proto::log_safe(&message)),
+                Message::Error { message } => {
+                    bail!("peer reported: {}", crate::proto::log_safe(&message))
+                }
                 _ => bail!("unexpected message from the peer"),
             }
         }
     }
 
-    async fn upload_blobs(self: &Arc<Self>, link: &Link, plan: &Plan, target: NodeId, hashes: &[BlobHash]) -> anyhow::Result<()> {
+    async fn upload_blobs(
+        self: &Arc<Self>,
+        link: &Link,
+        plan: &Plan,
+        target: NodeId,
+        hashes: &[BlobHash],
+    ) -> anyhow::Result<()> {
         let started = Instant::now();
         let mut wire = 0u64;
         for h in hashes {
-            let path = plan.files.get(h).ok_or_else(|| anyhow::anyhow!("peer asked for a blob this job does not have"))?.clone();
+            let path = plan
+                .files
+                .get(h)
+                .ok_or_else(|| anyhow::anyhow!("peer asked for a blob this job does not have"))?
+                .clone();
             let data = tokio::task::spawn_blocking(move || std::fs::read(path)).await??;
             // The file may have changed since it was hashed; the build is then
             // not what cargo asked for, so do not ship it.
@@ -622,7 +826,13 @@ impl Node {
             }
             for (offset, last, chunk) in cas::chunks(&data) {
                 wire += chunk.len() as u64;
-                link.send(Message::BlobChunk { hash: *h, offset, last, data: chunk }).await?;
+                link.send(Message::BlobChunk {
+                    hash: *h,
+                    offset,
+                    last,
+                    data: chunk,
+                })
+                .await?;
             }
         }
         self.count("bytes_up", wire);
@@ -654,27 +864,53 @@ mod tests {
     #[test]
     fn output_inside_out_dir_is_allowed() {
         let out = win(r"C:\proj\target\release\deps");
-        assert!(output_allowed(&out, &[], &win(r"C:\proj\target\release\deps\libx-1.rlib")));
-        assert!(output_allowed(&out, &[], &win(r"C:\proj\target\release\deps\sub\x.d")));
+        assert!(output_allowed(
+            &out,
+            &[],
+            &win(r"C:\proj\target\release\deps\libx-1.rlib")
+        ));
+        assert!(output_allowed(
+            &out,
+            &[],
+            &win(r"C:\proj\target\release\deps\sub\x.d")
+        ));
         // Windows paths compare case-insensitively.
-        assert!(output_allowed(&out, &[], &win(r"c:\PROJ\target\release\deps\x.rmeta")));
+        assert!(output_allowed(
+            &out,
+            &[],
+            &win(r"c:\PROJ\target\release\deps\x.rmeta")
+        ));
     }
 
     #[test]
     fn output_outside_out_dir_is_refused() {
         let out = win(r"C:\proj\target\release\deps");
-        assert!(!output_allowed(&out, &[], &win(r"C:\proj\target\release\deps2\x.rlib")));
+        assert!(!output_allowed(
+            &out,
+            &[],
+            &win(r"C:\proj\target\release\deps2\x.rlib")
+        ));
         assert!(!output_allowed(&out, &[], &win(r"C:\proj\src\lib.rs")));
-        assert!(!output_allowed(&out, &[], &win(r"D:\proj\target\release\deps\x.rlib")));
+        assert!(!output_allowed(
+            &out,
+            &[],
+            &win(r"D:\proj\target\release\deps\x.rlib")
+        ));
         assert!(!output_allowed(&out, &[], &out));
     }
 
     #[test]
     fn hand_built_paths_with_dot_dot_are_refused() {
         let out = win(r"C:\proj\target\deps");
-        let evil = ClientPath { style: PathStyle::Windows, path: r"C:\proj\target\deps\..\..\src\lib.rs".into() };
+        let evil = ClientPath {
+            style: PathStyle::Windows,
+            path: r"C:\proj\target\deps\..\..\src\lib.rs".into(),
+        };
         assert!(!output_allowed(&out, &[], &evil));
-        let rel = ClientPath { style: PathStyle::Windows, path: r"deps\x.rlib".into() };
+        let rel = ClientPath {
+            style: PathStyle::Windows,
+            path: r"deps\x.rlib".into(),
+        };
         assert!(!output_allowed(&out, &[], &rel));
     }
 
@@ -683,7 +919,11 @@ mod tests {
         let out = posix("/p/target/deps");
         let extra = posix("/p/other/x.rlib");
         assert!(output_allowed(&out, std::slice::from_ref(&extra), &extra));
-        assert!(!output_allowed(&out, std::slice::from_ref(&extra), &posix("/p/other/y.rlib")));
+        assert!(!output_allowed(
+            &out,
+            std::slice::from_ref(&extra),
+            &posix("/p/other/y.rlib")
+        ));
     }
 
     #[test]
@@ -703,19 +943,32 @@ mod tests {
     #[test]
     fn staged_outputs_appear_only_on_commit_and_vanish_when_discarded() {
         let d = tempfile::tempdir().unwrap();
-        let (a, b) = (d.path().join("deps").join("liba.rlib"), d.path().join("deps").join("liba.rmeta"));
+        let (a, b) = (
+            d.path().join("deps").join("liba.rlib"),
+            d.path().join("deps").join("liba.rmeta"),
+        );
         let names = |dir: &std::path::Path| -> Vec<String> {
-            let mut v: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            let mut v: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
             v.sort();
             v
         };
         let mut st = Staged::default();
         st.add(write_temp(&a, b"rlib").unwrap(), a.clone());
         st.add(write_temp(&b, b"rmeta").unwrap(), b.clone());
-        assert!(!a.exists() && !b.exists(), "staged files must not be at their destination");
+        assert!(
+            !a.exists() && !b.exists(),
+            "staged files must not be at their destination"
+        );
         // A tainted job: everything staged is deleted, nothing is written.
         st.discard();
-        assert!(names(&d.path().join("deps")).is_empty(), "{:?}", names(&d.path().join("deps")));
+        assert!(
+            names(&d.path().join("deps")).is_empty(),
+            "{:?}",
+            names(&d.path().join("deps"))
+        );
         // Dropping staged files (error path) cleans up as well.
         {
             let mut lost = Staged::default();
@@ -728,15 +981,24 @@ mod tests {
         ok.add(write_temp(&b, b"rmeta").unwrap(), b.clone());
         ok.commit().unwrap();
         assert_eq!(std::fs::read(&a).unwrap(), b"rlib");
-        assert_eq!(names(&d.path().join("deps")), vec!["liba.rlib", "liba.rmeta"]);
+        assert_eq!(
+            names(&d.path().join("deps")),
+            vec!["liba.rlib", "liba.rmeta"]
+        );
     }
 
     #[test]
     fn artifact_notices_are_recognized() {
-        let n = Message::Stderr { line: r#"{"artifact":"C:\\t\\libx.rmeta","emit":"metadata"}"#.into() };
+        let n = Message::Stderr {
+            line: r#"{"artifact":"C:\\t\\libx.rmeta","emit":"metadata"}"#.into(),
+        };
         assert!(is_artifact_notice(&n));
-        assert!(!is_artifact_notice(&Message::Stderr { line: "warning: unused".into() }));
-        assert!(!is_artifact_notice(&Message::Stdout { line: r#"{"artifact":"x","emit":"link"}"#.into() }));
+        assert!(!is_artifact_notice(&Message::Stderr {
+            line: "warning: unused".into()
+        }));
+        assert!(!is_artifact_notice(&Message::Stdout {
+            line: r#"{"artifact":"x","emit":"link"}"#.into()
+        }));
     }
 
     #[test]
@@ -746,7 +1008,10 @@ mod tests {
         write_atomic(&dest, b"one").unwrap();
         write_atomic(&dest, b"two").unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"two");
-        let names: Vec<_> = std::fs::read_dir(dest.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        let names: Vec<_> = std::fs::read_dir(dest.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
         assert_eq!(names.len(), 1);
     }
 }

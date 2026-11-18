@@ -43,19 +43,33 @@ impl CandidateSet {
     /// True when (instance, addr) is kept after the call (already known or
     /// newly added); false when it was dropped.
     pub fn offer(&mut self, instance: &str, addr: &str) -> bool {
-        if self.entries.iter().any(|c| c.instance == instance && c.addr == addr) {
+        if self
+            .entries
+            .iter()
+            .any(|c| c.instance == instance && c.addr == addr)
+        {
             return true;
         }
         if self.entries.len() >= MAX_MDNS_CANDIDATES {
-            let Some(i) = self.entries.iter().position(|c| !c.verified) else { return false };
+            let Some(i) = self.entries.iter().position(|c| !c.verified) else {
+                return false;
+            };
             self.entries.remove(i);
         }
-        self.entries.push_back(Candidate { instance: instance.to_string(), addr: addr.to_string(), verified: false });
+        self.entries.push_back(Candidate {
+            instance: instance.to_string(),
+            addr: addr.to_string(),
+            verified: false,
+        });
         true
     }
 
     pub fn mark_verified(&mut self, instance: &str, addr: &str) {
-        if let Some(c) = self.entries.iter_mut().find(|c| c.instance == instance && c.addr == addr) {
+        if let Some(c) = self
+            .entries
+            .iter_mut()
+            .find(|c| c.instance == instance && c.addr == addr)
+        {
             c.verified = true;
         }
     }
@@ -80,18 +94,27 @@ pub struct ConnectLimiter {
 impl ConnectLimiter {
     /// True when an attempt may start now; the attempt is then counted.
     pub fn allow(&mut self, instance: &str, addr: &str, now: Instant) -> bool {
-        while self.recent.front().is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(1)) {
+        while self
+            .recent
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(1))
+        {
             self.recent.pop_front();
         }
         let key = (instance.to_string(), addr.to_string());
-        if self.last.get(&key).is_some_and(|t| now.duration_since(*t) < MDNS_RETRY_INTERVAL) {
+        if self
+            .last
+            .get(&key)
+            .is_some_and(|t| now.duration_since(*t) < MDNS_RETRY_INTERVAL)
+        {
             return false;
         }
         if self.recent.len() >= MDNS_CONNECTS_PER_SEC {
             return false;
         }
         if self.last.len() >= 4 * MAX_MDNS_CANDIDATES {
-            self.last.retain(|_, t| now.duration_since(*t) < MDNS_RETRY_INTERVAL);
+            self.last
+                .retain(|_, t| now.duration_since(*t) < MDNS_RETRY_INTERVAL);
         }
         self.recent.push_back(now);
         self.last.insert(key, now);
@@ -119,7 +142,8 @@ impl PeerBook {
 
     pub fn save(&self, data_dir: &Path) -> anyhow::Result<()> {
         let path = data_dir.join("peers.toml");
-        std::fs::create_dir_all(data_dir).with_context(|| format!("create {}", data_dir.display()))?;
+        std::fs::create_dir_all(data_dir)
+            .with_context(|| format!("create {}", data_dir.display()))?;
         let text = toml::to_string(self).context("encode peers")?;
         // Replace atomically: a node killed mid-write must not corrupt the book.
         let tmp = data_dir.join("peers.toml.tmp");
@@ -211,13 +235,22 @@ impl Mdns {
             .name("crabfarm-mdns".into())
             .spawn(move || {
                 while let Ok(ev) = events.recv() {
-                    let mdns_sd::ServiceEvent::ServiceResolved(svc) = ev else { continue };
+                    let mdns_sd::ServiceEvent::ServiceResolved(svc) = ev else {
+                        continue;
+                    };
                     if svc.get_property_val_str("f") != Some(farm.as_str()) {
                         continue;
                     }
                     // The instance name is the node id; anything else is not ours.
-                    let Some(instance) = svc.get_fullname().strip_suffix(&format!(".{MDNS_SERVICE}")) else { continue };
-                    if instance == own || instance.len() != 32 || !instance.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    let Some(instance) =
+                        svc.get_fullname().strip_suffix(&format!(".{MDNS_SERVICE}"))
+                    else {
+                        continue;
+                    };
+                    if instance == own
+                        || instance.len() != 32
+                        || !instance.bytes().all(|b| b.is_ascii_hexdigit())
+                    {
                         continue;
                     }
                     for ip in svc.get_addresses().iter().take(MAX_ADDRS_PER_SERVICE) {
@@ -252,17 +285,31 @@ mod tests {
     use super::*;
 
     fn peer(id: u8, name: &str, addrs: &[&str], seen: u64) -> PeerInfo {
-        PeerInfo { node_id: NodeId([id; 16]), node_name: name.into(), addrs: addrs.iter().map(|s| s.to_string()).collect(), last_seen: seen }
+        PeerInfo {
+            node_id: NodeId([id; 16]),
+            node_name: name.into(),
+            addrs: addrs.iter().map(|s| s.to_string()).collect(),
+            last_seen: seen,
+        }
     }
 
     #[test]
     fn merge_unions_addrs_keeps_max_seen_and_skips_self() {
         let me = NodeId([1; 16]);
         let mut book = PeerBook::default();
-        assert!(book.merge(&[peer(2, "b", &["10.0.0.2:47070"], 100), peer(1, "me", &["10.0.0.1:47070"], 5)], me));
+        assert!(book.merge(
+            &[
+                peer(2, "b", &["10.0.0.2:47070"], 100),
+                peer(1, "me", &["10.0.0.1:47070"], 5)
+            ],
+            me
+        ));
         assert_eq!(book.peers.len(), 1, "own id is never added");
 
-        assert!(book.merge(&[peer(2, "b", &["10.0.0.2:47070", "b.tailnet:47070"], 50)], me));
+        assert!(book.merge(
+            &[peer(2, "b", &["10.0.0.2:47070", "b.tailnet:47070"], 50)],
+            me
+        ));
         let b = &book.peers[0];
         assert_eq!(b.addrs, vec!["10.0.0.2:47070", "b.tailnet:47070"]);
         assert_eq!(b.last_seen, 100, "older report does not lower last_seen");
@@ -271,7 +318,10 @@ mod tests {
         assert_eq!(book.peers[0].last_seen, 200);
         assert_eq!(book.peers[0].node_name, "b2");
 
-        assert!(!book.merge(&[peer(2, "b2", &["b.tailnet:47070"], 200)], me), "no change reports false");
+        assert!(
+            !book.merge(&[peer(2, "b2", &["b.tailnet:47070"], 200)], me),
+            "no change reports false"
+        );
     }
 
     #[test]
@@ -291,7 +341,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(PeerBook::load(dir.path()).unwrap().peers.is_empty());
         let mut book = PeerBook::default();
-        book.merge(&[peer(2, "b", &["10.0.0.2:47070"], 100), peer(3, "c", &[], 0)], NodeId([1; 16]));
+        book.merge(
+            &[peer(2, "b", &["10.0.0.2:47070"], 100), peer(3, "c", &[], 0)],
+            NodeId([1; 16]),
+        );
         book.save(dir.path()).unwrap();
         let back = PeerBook::load(dir.path()).unwrap();
         assert_eq!(back.peers, book.peers);
@@ -321,7 +374,10 @@ mod tests {
             c.offer(&format!("fake{i}"), "10.9.9.9:1");
         }
         assert_eq!(c.len(), MAX_MDNS_CANDIDATES);
-        assert!(c.offer("real", "10.0.0.5:1") && c.len() == MAX_MDNS_CANDIDATES, "still known, not re-added");
+        assert!(
+            c.offer("real", "10.0.0.5:1") && c.len() == MAX_MDNS_CANDIDATES,
+            "still known, not re-added"
+        );
         // All verified and full: newcomers are dropped.
         let mut full = CandidateSet::default();
         for i in 0..MAX_MDNS_CANDIDATES {
@@ -337,11 +393,19 @@ mod tests {
         let t0 = Instant::now();
         let mut l = ConnectLimiter::default();
         assert!(l.allow("a", "x:1", t0));
-        assert!(!l.allow("a", "x:1", t0 + Duration::from_secs(29)), "same candidate within 30 s");
-        assert!(l.allow("a", "x:1", t0 + Duration::from_secs(30)), "after 30 s again");
+        assert!(
+            !l.allow("a", "x:1", t0 + Duration::from_secs(29)),
+            "same candidate within 30 s"
+        );
+        assert!(
+            l.allow("a", "x:1", t0 + Duration::from_secs(30)),
+            "after 30 s again"
+        );
         // Global: four new candidates per second.
         let mut l = ConnectLimiter::default();
-        let ok = (0..10).filter(|i| l.allow(&format!("c{i}"), "x:1", t0)).count();
+        let ok = (0..10)
+            .filter(|i| l.allow(&format!("c{i}"), "x:1", t0))
+            .count();
         assert_eq!(ok, MDNS_CONNECTS_PER_SEC);
         // A refused attempt does not burn the candidate's own slot.
         assert!(l.allow("c9", "x:1", t0 + Duration::from_secs(1)));
@@ -361,10 +425,28 @@ mod tests {
         let (tx_a, mut rx_a) = tokio::sync::mpsc::channel(MDNS_FOUND_QUEUE);
         let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(MDNS_FOUND_QUEUE);
         let (tx_c, mut rx_c) = tokio::sync::mpsc::channel(MDNS_FOUND_QUEUE);
-        let a = Mdns::start(NodeId([0xaa; 16]), "farm0000000000000000000000000001", 41001, tx_a).unwrap();
-        let b = Mdns::start(NodeId([0xbb; 16]), "farm0000000000000000000000000001", 41002, tx_b).unwrap();
+        let a = Mdns::start(
+            NodeId([0xaa; 16]),
+            "farm0000000000000000000000000001",
+            41001,
+            tx_a,
+        )
+        .unwrap();
+        let b = Mdns::start(
+            NodeId([0xbb; 16]),
+            "farm0000000000000000000000000001",
+            41002,
+            tx_b,
+        )
+        .unwrap();
         // Same network, other farm: must be invisible to a and b.
-        let c = Mdns::start(NodeId([0xcc; 16]), "farm0000000000000000000000000002", 41003, tx_c).unwrap();
+        let c = Mdns::start(
+            NodeId([0xcc; 16]),
+            "farm0000000000000000000000000002",
+            41003,
+            tx_c,
+        )
+        .unwrap();
         let want = "bb".repeat(16);
         let got = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             while let Some((id, addr)) = rx_a.recv().await {
@@ -379,7 +461,11 @@ mod tests {
         assert!(got.unwrap_or(false), "node a never saw node b");
         let seen_b = rx_b.try_recv().map(|(id, _)| id);
         assert_ne!(seen_b, Ok("cc".repeat(16)));
-        assert!(rx_c.try_recv().map(|(id, _)| id == "aa".repeat(16) || id == "bb".repeat(16)) != Ok(true));
+        assert!(
+            rx_c.try_recv()
+                .map(|(id, _)| id == "aa".repeat(16) || id == "bb".repeat(16))
+                != Ok(true)
+        );
         a.stop();
         b.stop();
         c.stop();

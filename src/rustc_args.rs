@@ -142,7 +142,9 @@ pub(crate) struct Tok {
 pub(crate) fn parse_flag(args: &[String], i: usize) -> Result<Option<Tok>, String> {
     let a = &args[i];
     let separate = |name: &'static str| -> Result<Option<Tok>, String> {
-        let v = args.get(i + 1).ok_or_else(|| format!("{a} without a value"))?;
+        let v = args
+            .get(i + 1)
+            .ok_or_else(|| format!("{a} without a value"))?;
         Ok(Some(Tok {
             name,
             value: v.clone(),
@@ -194,7 +196,9 @@ pub(crate) fn looks_absolute(style: PathStyle, s: &str) -> bool {
     match style {
         PathStyle::Posix => s.starts_with('/'),
         PathStyle::Windows => {
-            s.starts_with('\\') || s.starts_with('/') || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
+            s.starts_with('\\')
+                || s.starts_with('/')
+                || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
         }
     }
 }
@@ -221,20 +225,32 @@ impl Ctx<'_> {
     }
 
     fn join(&self, dir: &ClientPath, rel: &str) -> Option<ClientPath> {
-        let sep = if self.style == PathStyle::Windows { '\\' } else { '/' };
+        let sep = if self.style == PathStyle::Windows {
+            '\\'
+        } else {
+            '/'
+        };
         ClientPath::parse(self.style, &format!("{}{sep}{rel}", dir.path))
     }
 
     /// Build the argument for a path value: absolute values become structured
     /// paths, relative ones stay as written. `kind_prefix` is e.g. `dependency=`.
-    fn path_arg(&self, tok: &Tok, kind_prefix: &str, path_str: &str) -> Result<(Arg, ClientPath), String> {
+    fn path_arg(
+        &self,
+        tok: &Tok,
+        kind_prefix: &str,
+        path_str: &str,
+    ) -> Result<(Arg, ClientPath), String> {
         let cp = self.resolve(path_str)?;
         let prefix = format!("{}{kind_prefix}", tok.lead);
         let arg = if looks_absolute(self.style, path_str) {
             if prefix.is_empty() {
                 Arg::Path(cp.clone())
             } else {
-                Arg::PrefixedPath { prefix, path: cp.clone() }
+                Arg::PrefixedPath {
+                    prefix,
+                    path: cp.clone(),
+                }
             }
         } else {
             Arg::Plain(format!("{prefix}{path_str}"))
@@ -256,8 +272,13 @@ fn push_original(out: &mut Vec<Arg>, tok: &Tok) {
 
 fn classify_inner(args: &[String], opts: &ClassifyOptions) -> Result<RemoteCandidate, String> {
     let cwd_str = opts.cwd.to_str().ok_or("cwd is not UTF-8")?;
-    let cwd = ClientPath::parse(opts.style, cwd_str).ok_or("cwd is not an absolute path of the client style")?;
-    let cx = Ctx { style: opts.style, cwd, opts };
+    let cwd = ClientPath::parse(opts.style, cwd_str)
+        .ok_or("cwd is not an absolute path of the client style")?;
+    let cx = Ctx {
+        style: opts.style,
+        cwd,
+        opts,
+    };
 
     let mut out: Vec<Arg> = Vec::with_capacity(args.len() + 2);
     let mut crate_name: Option<String> = None;
@@ -277,7 +298,9 @@ fn classify_inner(args: &[String], opts: &ClassifyOptions) -> Result<RemoteCandi
     while i < args.len() {
         let a = &args[i];
         match a.as_str() {
-            "-vV" | "-V" | "--version" | "-h" | "--help" => return Err("version or help query".into()),
+            "-vV" | "-V" | "--version" | "-h" | "--help" => {
+                return Err("version or help query".into());
+            }
             "--test" => return Err("test harness build".into()),
             "-" => return Err("input from stdin".into()),
             "-g" | "-O" | "-v" | "--verbose" => {
@@ -299,7 +322,12 @@ fn classify_inner(args: &[String], opts: &ClassifyOptions) -> Result<RemoteCandi
                 "--sysroot" => return Err("--sysroot".into()),
                 "-Z" => return Err("-Z flag (allow list is empty)".into()),
                 "--crate-type" => {
-                    for t in tok.value.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                    for t in tok
+                        .value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                    {
                         if !crate_types.iter().any(|c| c == t) {
                             crate_types.push(t.to_string());
                         }
@@ -390,7 +418,10 @@ fn classify_inner(args: &[String], opts: &ClassifyOptions) -> Result<RemoteCandi
                                     let cp = cx.resolve(path)?;
                                     let prefix = format!("--emit={kind}=");
                                     out.push(if looks_absolute(cx.style, path) {
-                                        Arg::PrefixedPath { prefix, path: cp.clone() }
+                                        Arg::PrefixedPath {
+                                            prefix,
+                                            path: cp.clone(),
+                                        }
                                     } else {
                                         Arg::Plain(format!("{prefix}{path}"))
                                     });
@@ -405,8 +436,13 @@ fn classify_inner(args: &[String], opts: &ClassifyOptions) -> Result<RemoteCandi
                 "--remap-path-prefix" => {
                     // rustc splits FROM=TO at the last `=`.
                     let from = tok.value.rsplit_once('=').and_then(|(from, to)| {
-                        let cp = looks_absolute(cx.style, from).then(|| ClientPath::parse(cx.style, from)).flatten()?;
-                        Some(Arg::RemapFrom { from: cp, to: to.to_string() })
+                        let cp = looks_absolute(cx.style, from)
+                            .then(|| ClientPath::parse(cx.style, from))
+                            .flatten()?;
+                        Some(Arg::RemapFrom {
+                            from: cp,
+                            to: to.to_string(),
+                        })
                     });
                     match from {
                         Some(arg) => {
@@ -417,7 +453,10 @@ fn classify_inner(args: &[String], opts: &ClassifyOptions) -> Result<RemoteCandi
                     }
                 }
                 "-C" => {
-                    let (key, val) = tok.value.split_once('=').unwrap_or((tok.value.as_str(), ""));
+                    let (key, val) = tok
+                        .value
+                        .split_once('=')
+                        .unwrap_or((tok.value.as_str(), ""));
                     match key {
                         "incremental" => {
                             if cx.opts.strip_incremental {
@@ -426,7 +465,9 @@ fn classify_inner(args: &[String], opts: &ClassifyOptions) -> Result<RemoteCandi
                                 return Err("-C incremental".into());
                             }
                         }
-                        "target-cpu" if val == "native" => return Err("-C target-cpu=native".into()),
+                        "target-cpu" if val == "native" => {
+                            return Err("-C target-cpu=native".into());
+                        }
                         "profile-generate" | "profile-use" => return Err(format!("-C {key}")),
                         "linker" if looks_absolute(cx.style, val) => {
                             let (arg, _) = cx.path_arg(&tok, "linker=", val)?;
@@ -438,7 +479,9 @@ fn classify_inner(args: &[String], opts: &ClassifyOptions) -> Result<RemoteCandi
                         }
                         // Kept verbatim: only matters when linking a proc-macro on a same-host peer.
                         "link-arg" | "link-args" => push_original(&mut out, &tok),
-                        _ if looks_absolute(cx.style, val) => return Err(format!("-C {key} takes a path")),
+                        _ if looks_absolute(cx.style, val) => {
+                            return Err(format!("-C {key} takes a path"));
+                        }
                         _ => push_original(&mut out, &tok),
                     }
                 }
@@ -471,22 +514,34 @@ fn classify_inner(args: &[String], opts: &ClassifyOptions) -> Result<RemoteCandi
             return Err("more than one input".into());
         }
         let cp = cx.resolve(a)?;
-        out.push(if looks_absolute(cx.style, a) { Arg::Path(cp.clone()) } else { Arg::Plain(a.clone()) });
+        out.push(if looks_absolute(cx.style, a) {
+            Arg::Path(cp.clone())
+        } else {
+            Arg::Plain(a.clone())
+        });
         input = Some(cp);
         i += 1;
     }
 
     let input = input.ok_or("no input file")?;
-    let crate_name = crate_name.filter(|n| !n.is_empty()).ok_or("no --crate-name")?;
+    let crate_name = crate_name
+        .filter(|n| !n.is_empty())
+        .ok_or("no --crate-name")?;
     let out_dir = out_dir.ok_or("no --out-dir")?;
     // rustc's default is a binary; cargo always passes --crate-type for library builds.
     if crate_types.is_empty() {
         return Err("no --crate-type".into());
     }
-    if let Some(t) = crate_types.iter().find(|t| LINK_CRATE_TYPES.contains(&t.as_str())) {
+    if let Some(t) = crate_types
+        .iter()
+        .find(|t| LINK_CRATE_TYPES.contains(&t.as_str()))
+    {
         return Err(format!("crate type {t} links"));
     }
-    if let Some(t) = crate_types.iter().find(|t| !matches!(t.as_str(), "lib" | "rlib" | "proc-macro")) {
+    if let Some(t) = crate_types
+        .iter()
+        .find(|t| !matches!(t.as_str(), "lib" | "rlib" | "proc-macro"))
+    {
         return Err(format!("unknown crate type {t}"));
     }
     let is_proc_macro = crate_types.iter().any(|t| t == "proc-macro");
@@ -506,7 +561,16 @@ fn classify_inner(args: &[String], opts: &ClassifyOptions) -> Result<RemoteCandi
         }
     };
 
-    let produces = produces(&cx, &out_dir, &crate_name, &extra, is_proc_macro, &emits, &emit_paths, o_path)?;
+    let produces = produces(
+        &cx,
+        &out_dir,
+        &crate_name,
+        &extra,
+        is_proc_macro,
+        &emits,
+        &emit_paths,
+        o_path,
+    )?;
 
     Ok(RemoteCandidate {
         args: out,
@@ -554,7 +618,8 @@ fn produces(
                     (_, true) => proc_macro_file.clone(),
                     _ => format!("lib{name}{extra}.rlib"),
                 };
-                cx.join(out_dir, &file).ok_or("cannot build output file name")?
+                cx.join(out_dir, &file)
+                    .ok_or("cannot build output file name")?
             }
         };
         if !out.contains(&path) {
@@ -665,8 +730,7 @@ mod tests {
     }
 
     /// A minimal remote-eligible library invocation to append flags to.
-    const BASE: &str =
-        "--crate-name foo --edition=2024 src/lib.rs --crate-type lib --emit=dep-info,metadata,link --out-dir E:/w/tgt/debug/deps";
+    const BASE: &str = "--crate-name foo --edition=2024 src/lib.rs --crate-type lib --emit=dep-info,metadata,link --out-dir E:/w/tgt/debug/deps";
 
     // ---- real cargo command lines (cargo 1.100, `cargo build -v`, Windows, shortened target dir) ----
 
@@ -705,7 +769,10 @@ mod tests {
         assert_eq!(r.target, WIN_HOST);
         assert_eq!(r.input, cp(r"E:\w\proj\dep\src\lib.rs"));
         assert_eq!(r.out_dir, cp(r"E:\w\tgt\debug\deps"));
-        assert_eq!(r.search_dirs, vec![("dependency".to_string(), cp(r"E:\w\tgt\debug\deps"))]);
+        assert_eq!(
+            r.search_dirs,
+            vec![("dependency".to_string(), cp(r"E:\w\tgt\debug\deps"))]
+        );
         assert!(!r.is_proc_macro);
         assert_eq!(
             r.produces,
@@ -742,7 +809,10 @@ mod tests {
         assert_eq!(r.crate_types, vec!["proc-macro"]);
         // `--extern proc_macro` has no path.
         assert!(r.externs.is_empty());
-        assert_eq!(r.produces, vec![cp(r"E:\w\tgt\debug\deps\pm-9086cc66bfef8fef.dll")]);
+        assert_eq!(
+            r.produces,
+            vec![cp(r"E:\w\tgt\debug\deps\pm-9086cc66bfef8fef.dll")]
+        );
         assert_eq!(r.emits, vec!["dep-info", "link"]);
     }
 
@@ -762,7 +832,11 @@ mod tests {
         }));
         // Value of the separate `--extern` is preceded by its own flag argument.
         let flat = render_args(&r.args, &|p| p.path.clone());
-        assert!(flat.windows(2).any(|w| w[0] == "--extern" && w[1].starts_with("pm=E:")), "{flat:?}");
+        assert!(
+            flat.windows(2)
+                .any(|w| w[0] == "--extern" && w[1].starts_with("pm=E:")),
+            "{flat:?}"
+        );
     }
 
     // ---- always local ----
@@ -775,7 +849,10 @@ mod tests {
         }
         local(&v("--print cfg"), &o);
         local(&v("--print=cfg"), &o);
-        local(&v("--crate-name x --print file-names --crate-type lib src/lib.rs"), &o);
+        local(
+            &v("--crate-name x --print file-names --crate-type lib src/lib.rs"),
+            &o,
+        );
     }
 
     #[test]
@@ -795,8 +872,14 @@ mod tests {
             assert!(why.contains(t), "{why}");
         }
         // Linking type anywhere in a repeated or comma separated list.
-        local(&v("--crate-name foo src/lib.rs --crate-type lib --crate-type=cdylib --out-dir E:/o"), &o);
-        local(&v("--crate-name foo src/lib.rs --crate-type=rlib,dylib --out-dir E:/o"), &o);
+        local(
+            &v("--crate-name foo src/lib.rs --crate-type lib --crate-type=cdylib --out-dir E:/o"),
+            &o,
+        );
+        local(
+            &v("--crate-name foo src/lib.rs --crate-type=rlib,dylib --out-dir E:/o"),
+            &o,
+        );
     }
 
     #[test]
@@ -807,8 +890,17 @@ mod tests {
     #[test]
     fn local_unsupported_emit() {
         let o = opts(true);
-        for e in ["asm", "llvm-ir", "llvm-bc", "obj", "mir", "link,asm", "dep-info,obj=E:/o/x.o"] {
-            let line = format!("--crate-name foo src/lib.rs --crate-type lib --emit={e} --out-dir E:/o");
+        for e in [
+            "asm",
+            "llvm-ir",
+            "llvm-bc",
+            "obj",
+            "mir",
+            "link,asm",
+            "dep-info,obj=E:/o/x.o",
+        ] {
+            let line =
+                format!("--crate-name foo src/lib.rs --crate-type lib --emit={e} --out-dir E:/o");
             local(&v(&line), &o);
         }
     }
@@ -825,10 +917,20 @@ mod tests {
     #[test]
     fn strip_incremental_removes_every_spelling() {
         let o = opts(true);
-        for inc in ["-C incremental=E:/i", "-Cincremental=E:/i", "--codegen=incremental=E:/i", "--codegen incremental=E:/i"] {
+        for inc in [
+            "-C incremental=E:/i",
+            "-Cincremental=E:/i",
+            "--codegen=incremental=E:/i",
+            "--codegen incremental=E:/i",
+        ] {
             let r = remote(&v(&format!("{BASE} {inc} -C opt-level=3")), &o);
             let flat = render_args(&r.args, &|p| p.path.clone());
-            assert!(!flat.iter().any(|a| a.contains("incremental") || a.contains("E:/i")), "{inc}: {flat:?}");
+            assert!(
+                !flat
+                    .iter()
+                    .any(|a| a.contains("incremental") || a.contains("E:/i")),
+                "{inc}: {flat:?}"
+            );
             assert!(flat.contains(&"opt-level=3".to_string()), "{inc}: {flat:?}");
         }
     }
@@ -865,8 +967,14 @@ mod tests {
         assert!(r.args.contains(&Arg::Plain("--mystery=value".into())));
         // Posix client: a leading slash is absolute.
         let p = posix_opts("x86_64-unknown-linux-gnu");
-        local(&v("--crate-name foo src/lib.rs --crate-type lib --out-dir /o --mystery=/abs"), &p);
-        remote(&v("--crate-name foo src/lib.rs --crate-type lib --out-dir /o --mystery=abs"), &p);
+        local(
+            &v("--crate-name foo src/lib.rs --crate-type lib --out-dir /o --mystery=/abs"),
+            &p,
+        );
+        remote(
+            &v("--crate-name foo src/lib.rs --crate-type lib --out-dir /o --mystery=abs"),
+            &p,
+        );
     }
 
     #[test]
@@ -889,15 +997,29 @@ mod tests {
     #[test]
     fn local_unknown_or_mixed_crate_types() {
         let o = opts(true);
-        local(&v("--crate-name foo src/lib.rs --crate-type weird --out-dir E:/o"), &o);
-        local(&v("--crate-name foo src/lib.rs --crate-type proc-macro --crate-type lib --out-dir E:/o"), &o);
+        local(
+            &v("--crate-name foo src/lib.rs --crate-type weird --out-dir E:/o"),
+            &o,
+        );
+        local(
+            &v(
+                "--crate-name foo src/lib.rs --crate-type proc-macro --crate-type lib --out-dir E:/o",
+            ),
+            &o,
+        );
     }
 
     #[test]
     fn local_drive_relative_and_dotdot_escapes() {
         let o = opts(true);
-        local(&v("--crate-name foo C:lib.rs --crate-type lib --out-dir E:/o"), &o);
-        local(&v("--crate-name foo ../../../../x.rs --crate-type lib --out-dir E:/o"), &o);
+        local(
+            &v("--crate-name foo C:lib.rs --crate-type lib --out-dir E:/o"),
+            &o,
+        );
+        local(
+            &v("--crate-name foo ../../../../x.rs --crate-type lib --out-dir E:/o"),
+            &o,
+        );
     }
 
     // ---- accepted spellings ----
@@ -905,9 +1027,15 @@ mod tests {
     #[test]
     fn crate_types_repeated_and_comma_separated() {
         let o = opts(true);
-        let r = remote(&v("--crate-name foo src/lib.rs --crate-type lib --crate-type rlib --out-dir E:/o"), &o);
+        let r = remote(
+            &v("--crate-name foo src/lib.rs --crate-type lib --crate-type rlib --out-dir E:/o"),
+            &o,
+        );
         assert_eq!(r.crate_types, vec!["lib", "rlib"]);
-        let r = remote(&v("--crate-name foo src/lib.rs --crate-type=lib,rlib --out-dir E:/o"), &o);
+        let r = remote(
+            &v("--crate-name foo src/lib.rs --crate-type=lib,rlib --out-dir E:/o"),
+            &o,
+        );
         assert_eq!(r.crate_types, vec!["lib", "rlib"]);
         // Both produce the same single rlib.
         assert_eq!(r.produces.len(), 1);
@@ -917,8 +1045,14 @@ mod tests {
     fn emit_spellings() {
         let o = opts(true);
         let b = "--crate-name foo src/lib.rs --crate-type lib --out-dir E:/o";
-        assert_eq!(remote(&v(&format!("{b} --emit=metadata")), &o).emits, vec!["metadata"]);
-        assert_eq!(remote(&v(&format!("{b} --emit metadata,link")), &o).emits, vec!["metadata", "link"]);
+        assert_eq!(
+            remote(&v(&format!("{b} --emit=metadata")), &o).emits,
+            vec!["metadata"]
+        );
+        assert_eq!(
+            remote(&v(&format!("{b} --emit metadata,link")), &o).emits,
+            vec!["metadata", "link"]
+        );
         // Absent: rustc defaults to link.
         let r = remote(&v(b), &o);
         assert_eq!(r.emits, vec!["link"]);
@@ -927,7 +1061,10 @@ mod tests {
         let r = remote(&v(&format!("{b} --emit=link=E:/x/foo.rlib,dep-info")), &o);
         assert_eq!(r.emits, vec!["link", "dep-info"]);
         assert_eq!(r.produces, vec![cp(r"E:\x\foo.rlib")]);
-        assert!(r.args.contains(&Arg::PrefixedPath { prefix: "--emit=link=".into(), path: cp(r"E:\x\foo.rlib") }));
+        assert!(r.args.contains(&Arg::PrefixedPath {
+            prefix: "--emit=link=".into(),
+            path: cp(r"E:\x\foo.rlib")
+        }));
         assert!(r.args.contains(&Arg::Plain("--emit=dep-info".into())));
     }
 
@@ -937,12 +1074,31 @@ mod tests {
         let b = "--crate-name foo src/lib.rs --crate-type lib --out-dir E:/o";
         let r = remote(&v(&format!("{b} --extern serde --extern=std2")), &o);
         assert!(r.externs.is_empty());
-        let r = remote(&v(&format!("{b} --extern a=E:/d/liba.rlib --extern=b=E:/d/libb.rmeta")), &o);
-        assert_eq!(r.externs, vec![cp(r"E:\d\liba.rlib"), cp(r"E:\d\libb.rmeta")]);
-        assert!(r.args.contains(&Arg::PrefixedPath { prefix: "--extern=b=".into(), path: cp(r"E:\d\libb.rmeta") }));
-        let r = remote(&v(&format!("{b} --extern priv:a=E:/d/liba.rlib --extern noprelude:b=E:/d/libb.rlib")), &o);
+        let r = remote(
+            &v(&format!(
+                "{b} --extern a=E:/d/liba.rlib --extern=b=E:/d/libb.rmeta"
+            )),
+            &o,
+        );
+        assert_eq!(
+            r.externs,
+            vec![cp(r"E:\d\liba.rlib"), cp(r"E:\d\libb.rmeta")]
+        );
+        assert!(r.args.contains(&Arg::PrefixedPath {
+            prefix: "--extern=b=".into(),
+            path: cp(r"E:\d\libb.rmeta")
+        }));
+        let r = remote(
+            &v(&format!(
+                "{b} --extern priv:a=E:/d/liba.rlib --extern noprelude:b=E:/d/libb.rlib"
+            )),
+            &o,
+        );
         assert_eq!(r.externs.len(), 2);
-        assert!(r.args.contains(&Arg::PrefixedPath { prefix: "priv:a=".into(), path: cp(r"E:\d\liba.rlib") }));
+        assert!(r.args.contains(&Arg::PrefixedPath {
+            prefix: "priv:a=".into(),
+            path: cp(r"E:\d\liba.rlib")
+        }));
         // A relative extern path is resolved for the input list but stays relative in the args.
         let r = remote(&v(&format!("{b} --extern a=deps/liba.rlib")), &o);
         assert_eq!(r.externs, vec![cp(r"E:\w\proj\deps\liba.rlib")]);
@@ -953,8 +1109,17 @@ mod tests {
     fn search_dir_spellings() {
         let o = opts(true);
         let b = "--crate-name foo src/lib.rs --crate-type lib --out-dir E:/o";
-        let r = remote(&v(&format!("{b} -L E:/a -LE:/b -L native=E:/c -Ldependency=E:/d -L all=E:/e -L framework=E:/f")), &o);
-        let got: Vec<(String, String)> = r.search_dirs.iter().map(|(k, p)| (k.clone(), p.path.clone())).collect();
+        let r = remote(
+            &v(&format!(
+                "{b} -L E:/a -LE:/b -L native=E:/c -Ldependency=E:/d -L all=E:/e -L framework=E:/f"
+            )),
+            &o,
+        );
+        let got: Vec<(String, String)> = r
+            .search_dirs
+            .iter()
+            .map(|(k, p)| (k.clone(), p.path.clone()))
+            .collect();
         assert_eq!(
             got,
             vec![
@@ -968,12 +1133,21 @@ mod tests {
         );
         // Spelling is preserved when rendered.
         let flat = render_args(&r.args, &|p| p.path.clone());
-        for s in [r"E:\a", r"-LE:\b", r"native=E:\c", r"-Ldependency=E:\d", r"all=E:\e"] {
+        for s in [
+            r"E:\a",
+            r"-LE:\b",
+            r"native=E:\c",
+            r"-Ldependency=E:\d",
+            r"all=E:\e",
+        ] {
             assert!(flat.contains(&s.to_string()), "{s} in {flat:?}");
         }
         // A path that merely contains `=` after a non-kind prefix is a plain path (Posix).
         let p = posix_opts("x86_64-unknown-linux-gnu");
-        let r = remote(&v("--crate-name foo src/lib.rs --crate-type lib --out-dir /o -L /a=b/c"), &p);
+        let r = remote(
+            &v("--crate-name foo src/lib.rs --crate-type lib --out-dir /o -L /a=b/c"),
+            &p,
+        );
         assert_eq!(r.search_dirs[0].0, "all");
         assert_eq!(r.search_dirs[0].1.path, "/a=b/c");
     }
@@ -981,9 +1155,19 @@ mod tests {
     #[test]
     fn codegen_spellings_keep_form() {
         let o = opts(true);
-        let r = remote(&v(&format!("{BASE} -C opt-level=3 -Copt-level=2 --codegen opt-level=1 --codegen=lto=thin")), &o);
+        let r = remote(
+            &v(&format!(
+                "{BASE} -C opt-level=3 -Copt-level=2 --codegen opt-level=1 --codegen=lto=thin"
+            )),
+            &o,
+        );
         let flat = render_args(&r.args, &|p| p.path.clone());
-        for s in ["opt-level=3", "-Copt-level=2", "opt-level=1", "--codegen=lto=thin"] {
+        for s in [
+            "opt-level=3",
+            "-Copt-level=2",
+            "opt-level=1",
+            "--codegen=lto=thin",
+        ] {
             assert!(flat.contains(&s.to_string()), "{s} in {flat:?}");
         }
     }
@@ -992,8 +1176,17 @@ mod tests {
     fn link_lib_spellings() {
         let o = opts(true);
         let b = "--crate-name foo src/lib.rs --crate-type lib --out-dir E:/o";
-        let r = remote(&v(&format!("{b} -l z -lm -l static=foo -l static:+bundle=bar -l dylib=baz:renamed -lstatic:-bundle,+whole-archive=q")), &o);
-        let got: Vec<(&str, &str)> = r.link_libs.iter().map(|(k, n)| (k.as_str(), n.as_str())).collect();
+        let r = remote(
+            &v(&format!(
+                "{b} -l z -lm -l static=foo -l static:+bundle=bar -l dylib=baz:renamed -lstatic:-bundle,+whole-archive=q"
+            )),
+            &o,
+        );
+        let got: Vec<(&str, &str)> = r
+            .link_libs
+            .iter()
+            .map(|(k, n)| (k.as_str(), n.as_str()))
+            .collect();
         assert_eq!(
             got,
             vec![
@@ -1015,8 +1208,16 @@ mod tests {
         assert!(r.args.contains(&Arg::Plain("linker=rust-lld".into())));
         // Absolute path stays structured for the executor to decide.
         let r = remote(&v(&format!("{BASE} -Clinker=E:/t/lld.exe")), &o);
-        assert!(r.args.contains(&Arg::PrefixedPath { prefix: "-Clinker=".into(), path: cp(r"E:\t\lld.exe") }));
-        let r = remote(&v(&format!("{BASE} -C link-arg=E:/x/y.lib -C link-args=-fuse-ld=lld")), &o);
+        assert!(r.args.contains(&Arg::PrefixedPath {
+            prefix: "-Clinker=".into(),
+            path: cp(r"E:\t\lld.exe")
+        }));
+        let r = remote(
+            &v(&format!(
+                "{BASE} -C link-arg=E:/x/y.lib -C link-args=-fuse-ld=lld"
+            )),
+            &o,
+        );
         assert!(r.args.contains(&Arg::Plain("link-arg=E:/x/y.lib".into())));
     }
 
@@ -1024,25 +1225,52 @@ mod tests {
     fn remap_path_prefix() {
         let o = opts(true);
         let r = remote(&v(&format!("{BASE} --remap-path-prefix E:/w=/src")), &o);
-        assert!(r.args.windows(2).any(|w| w[0] == Arg::Plain("--remap-path-prefix".into())
-            && w[1] == Arg::RemapFrom { from: cp(r"E:\w"), to: "/src".into() }));
+        assert!(
+            r.args
+                .windows(2)
+                .any(|w| w[0] == Arg::Plain("--remap-path-prefix".into())
+                    && w[1]
+                        == Arg::RemapFrom {
+                            from: cp(r"E:\w"),
+                            to: "/src".into()
+                        })
+        );
         let r = remote(&v(&format!("{BASE} --remap-path-prefix=E:/w=/src")), &o);
         assert!(r.args.iter().any(|a| matches!(a, Arg::RemapFrom { .. })));
         // A FROM that is not a client path stays verbatim.
-        let r = remote(&v(&format!("{BASE} --remap-path-prefix=/rustc/abc=/rustc")), &o);
-        assert!(r.args.contains(&Arg::Plain("--remap-path-prefix=/rustc/abc=/rustc".into())));
+        let r = remote(
+            &v(&format!("{BASE} --remap-path-prefix=/rustc/abc=/rustc")),
+            &o,
+        );
+        assert!(
+            r.args
+                .contains(&Arg::Plain("--remap-path-prefix=/rustc/abc=/rustc".into()))
+        );
         // Rendering maps FROM only.
-        let flat = render_args(&remote(&v(&format!("{BASE} --remap-path-prefix E:/w=E:/keep")), &o).args, &|p| format!("<{}>", p.path));
+        let flat = render_args(
+            &remote(&v(&format!("{BASE} --remap-path-prefix E:/w=E:/keep")), &o).args,
+            &|p| format!("<{}>", p.path),
+        );
         assert!(flat.contains(&r"<E:\w>=E:/keep".to_string()), "{flat:?}");
     }
 
     #[test]
     fn dash_o_maps_single_output() {
         let o = opts(true);
-        let r = remote(&v("--crate-name foo src/lib.rs --crate-type rlib --emit=link -o E:/o/libfoo.rlib --out-dir E:/o"), &o);
+        let r = remote(
+            &v(
+                "--crate-name foo src/lib.rs --crate-type rlib --emit=link -o E:/o/libfoo.rlib --out-dir E:/o",
+            ),
+            &o,
+        );
         assert_eq!(r.produces, vec![cp(r"E:\o\libfoo.rlib")]);
         assert!(r.args.contains(&Arg::Path(cp(r"E:\o\libfoo.rlib"))));
-        local(&v("--crate-name foo src/lib.rs --crate-type rlib --emit=metadata,link -o E:/o/x --out-dir E:/o"), &o);
+        local(
+            &v(
+                "--crate-name foo src/lib.rs --crate-type rlib --emit=metadata,link -o E:/o/x --out-dir E:/o",
+            ),
+            &o,
+        );
     }
 
     #[test]
@@ -1053,24 +1281,39 @@ mod tests {
         assert_eq!(r.target, "x86_64-unknown-linux-gnu");
         let r = remote(&v(&format!("{BASE} --target=aarch64-apple-darwin")), &o);
         assert_eq!(r.target, "aarch64-apple-darwin");
-        assert_eq!(render_args(&r.args, &|p| p.path.clone()).iter().filter(|a| a.contains("--target")).count(), 1);
+        assert_eq!(
+            render_args(&r.args, &|p| p.path.clone())
+                .iter()
+                .filter(|a| a.contains("--target"))
+                .count(),
+            1
+        );
     }
 
     #[test]
     fn absolute_input_is_a_structured_path() {
         let o = opts(true);
-        let r = remote(&v("--crate-name foo E:/w/proj/src/lib.rs --crate-type lib --out-dir E:/o"), &o);
+        let r = remote(
+            &v("--crate-name foo E:/w/proj/src/lib.rs --crate-type lib --out-dir E:/o"),
+            &o,
+        );
         assert_eq!(r.input, cp(r"E:\w\proj\src\lib.rs"));
         assert!(r.args.contains(&Arg::Path(cp(r"E:\w\proj\src\lib.rs"))));
         // Relative input resolves against the cwd.
-        let r = remote(&v("--crate-name foo src/lib.rs --crate-type lib --out-dir E:/o"), &o);
+        let r = remote(
+            &v("--crate-name foo src/lib.rs --crate-type lib --out-dir E:/o"),
+            &o,
+        );
         assert_eq!(r.input, cp(r"E:\w\proj\src\lib.rs"));
     }
 
     #[test]
     fn unc_paths_are_structured() {
         let o = opts(true);
-        let r = remote(&v(r"--crate-name foo //srv/share/p/lib.rs --crate-type lib --out-dir \\srv\share\o"), &o);
+        let r = remote(
+            &v(r"--crate-name foo //srv/share/p/lib.rs --crate-type lib --out-dir \\srv\share\o"),
+            &o,
+        );
         assert_eq!(r.input, cp(r"\\srv\share\p\lib.rs"));
         assert_eq!(r.out_dir, cp(r"\\srv\share\o"));
     }
@@ -1088,7 +1331,11 @@ mod tests {
             ("x86_64-unknown-freebsd", "libpm-abc.so"),
         ] {
             let r = remote(&v(line), &posix_opts(host));
-            let names: Vec<&str> = r.produces.iter().map(|p| p.path.rsplit('/').next().unwrap_or("")).collect();
+            let names: Vec<&str> = r
+                .produces
+                .iter()
+                .map(|p| p.path.rsplit('/').next().unwrap_or(""))
+                .collect();
             assert_eq!(names, vec![file, "libpm-abc.rmeta"], "{host}");
         }
     }
@@ -1096,9 +1343,16 @@ mod tests {
     #[test]
     fn produces_library_only_not_dep_info() {
         let r = remote(&v(&format!("{BASE} -C extra-filename=-x1")), &opts(true));
-        let names: Vec<&str> = r.produces.iter().map(|p| p.path.rsplit('\\').next().unwrap_or("")).collect();
+        let names: Vec<&str> = r
+            .produces
+            .iter()
+            .map(|p| p.path.rsplit('\\').next().unwrap_or(""))
+            .collect();
         assert_eq!(names, vec!["libfoo-x1.rmeta", "libfoo-x1.rlib"]);
-        let r = remote(&v("--crate-name foo src/lib.rs --crate-type lib --emit=dep-info --out-dir E:/o"), &opts(true));
+        let r = remote(
+            &v("--crate-name foo src/lib.rs --crate-type lib --emit=dep-info --out-dir E:/o"),
+            &opts(true),
+        );
         assert!(r.produces.is_empty());
     }
 
@@ -1120,7 +1374,16 @@ mod tests {
         let out = expand_argfiles(&args).expect("expand");
         assert_eq!(
             out,
-            ["--crate-name", "foo", "--cfg", "feature=\"a b\"", "--crate-type", "lib", "--edition=2024", "src/lib.rs"]
+            [
+                "--crate-name",
+                "foo",
+                "--cfg",
+                "feature=\"a b\"",
+                "--crate-type",
+                "lib",
+                "--edition=2024",
+                "src/lib.rs"
+            ]
         );
     }
 
@@ -1135,7 +1398,11 @@ mod tests {
 
     #[test]
     fn argfile_plain_args_and_lone_at_pass_through() {
-        let a = vec!["--crate-name".to_string(), "@".to_string(), "x@y".to_string()];
+        let a = vec![
+            "--crate-name".to_string(),
+            "@".to_string(),
+            "x@y".to_string(),
+        ];
         assert_eq!(expand_argfiles(&a).expect("expand"), a);
     }
 
@@ -1143,7 +1410,10 @@ mod tests {
     fn argfile_expanded_line_classifies_like_inline() {
         let dir = tempfile::tempdir().expect("tempdir");
         let f = dir.path().join("a.args");
-        let body: String = cargo_line(REL_DEP_LIB).into_iter().map(|a| a + "\n").collect();
+        let body: String = cargo_line(REL_DEP_LIB)
+            .into_iter()
+            .map(|a| a + "\n")
+            .collect();
         std::fs::write(&f, body).expect("write");
         let expanded = expand_argfiles(&[format!("@{}", f.display())]).expect("expand");
         let r = remote(&expanded, &opts(false));
@@ -1159,10 +1429,19 @@ mod tests {
             Arg::Plain("--crate-name".into()),
             Arg::Plain("foo".into()),
             Arg::Path(p(r"C:\a\lib.rs")),
-            Arg::PrefixedPath { prefix: "--out-dir=".into(), path: p(r"C:\a\out") },
-            Arg::PrefixedPath { prefix: "foo=".into(), path: p(r"C:\a\libfoo.rlib") },
+            Arg::PrefixedPath {
+                prefix: "--out-dir=".into(),
+                path: p(r"C:\a\out"),
+            },
+            Arg::PrefixedPath {
+                prefix: "foo=".into(),
+                path: p(r"C:\a\libfoo.rlib"),
+            },
             Arg::Plain("--remap-path-prefix".into()),
-            Arg::RemapFrom { from: p(r"C:\a"), to: "/x".into() },
+            Arg::RemapFrom {
+                from: p(r"C:\a"),
+                to: "/x".into(),
+            },
         ];
         let out = render_args(&args, &|c| format!("<{}>", c.path));
         assert_eq!(

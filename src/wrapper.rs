@@ -28,18 +28,29 @@ pub fn run(rustc: &str, args: &[String]) -> i32 {
         }
         return passthrough(rustc, args);
     }
-    let Ok(data_dir) = config::data_dir() else { return passthrough(rustc, args) };
+    let Ok(data_dir) = config::data_dir() else {
+        return passthrough(rustc, args);
+    };
 
-    if args.iter().any(|a| a == "-vV" || a == "--version" || a == "-V") {
+    if args
+        .iter()
+        .any(|a| a == "-vV" || a == "--version" || a == "-V")
+    {
         return version_probe(rustc, args, &data_dir);
     }
     // No node running: nothing to gain from classifying.
     if !ipc::port_path(&data_dir).exists() {
         return passthrough(rustc, args);
     }
-    let Ok(expanded) = rustc_args::expand_argfiles(args) else { return passthrough(rustc, args) };
-    let Ok(cwd) = std::env::current_dir() else { return passthrough(rustc, args) };
-    let Some(tc) = toolchain_id(rustc, &data_dir, &cwd) else { return passthrough(rustc, args) };
+    let Ok(expanded) = rustc_args::expand_argfiles(args) else {
+        return passthrough(rustc, args);
+    };
+    let Ok(cwd) = std::env::current_dir() else {
+        return passthrough(rustc, args);
+    };
+    let Some(tc) = toolchain_id(rustc, &data_dir, &cwd) else {
+        return passthrough(rustc, args);
+    };
     let cfg = Config::load(&data_dir).unwrap_or_default();
     let opts = ClassifyOptions {
         host_triple: &tc.host,
@@ -60,7 +71,10 @@ pub fn run(rustc: &str, args: &[String]) -> i32 {
 
 /// True when the program's file stem is `rustc` (also `rustc.exe`).
 pub fn is_plain_rustc(program: &str) -> bool {
-    Path::new(program).file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.eq_ignore_ascii_case("rustc"))
+    Path::new(program)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("rustc"))
 }
 
 /// Run rustc with inherited stdio.
@@ -79,11 +93,20 @@ fn passthrough(rustc: &str, args: &[String]) -> i32 {
 fn rustc_cache_key(rustc: &str, cwd: &Path) -> Option<String> {
     let path = resolve_in_path(rustc)?;
     let meta = std::fs::metadata(&path).ok()?;
-    let mtime = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
     let rustup = std::env::var("RUSTUP_TOOLCHAIN").unwrap_or_default();
     // A rustup proxy picks the toolchain from the environment, and without
     // RUSTUP_TOOLCHAIN from the directory.
-    let dir = if rustup.is_empty() { cwd.to_string_lossy().into_owned() } else { String::new() };
+    let dir = if rustup.is_empty() {
+        cwd.to_string_lossy().into_owned()
+    } else {
+        String::new()
+    };
     let text = format!("{}|{}|{}|{rustup}|{dir}", path.display(), meta.len(), mtime);
     Some(blake3::hash(text.as_bytes()).to_hex().to_string())
 }
@@ -93,7 +116,11 @@ fn resolve_in_path(rustc: &str) -> Option<PathBuf> {
     if p.components().count() > 1 || p.is_absolute() {
         return Some(p.to_path_buf());
     }
-    let exts: &[&str] = if cfg!(windows) { &["exe", "cmd", "bat"] } else { &[""] };
+    let exts: &[&str] = if cfg!(windows) {
+        &["exe", "cmd", "bat"]
+    } else {
+        &[""]
+    };
     for dir in std::env::split_paths(&std::env::var_os("PATH")?) {
         for ext in exts {
             let mut c = dir.join(rustc);
@@ -163,7 +190,13 @@ fn version_probe(rustc: &str, args: &[String], data_dir: &Path) -> i32 {
 
 // -------------------------------------------------------------- environment
 
-const PATH_ENV: [&str; 5] = ["OUT_DIR", "CARGO_MANIFEST_DIR", "CARGO_MANIFEST_PATH", "CARGO_TARGET_TMPDIR", "CARGO_RUSTC_CURRENT_DIR"];
+const PATH_ENV: [&str; 5] = [
+    "OUT_DIR",
+    "CARGO_MANIFEST_DIR",
+    "CARGO_MANIFEST_PATH",
+    "CARGO_TARGET_TMPDIR",
+    "CARGO_RUSTC_CURRENT_DIR",
+];
 
 /// DESIGN section 9: the variables a job gets from the submitter.
 pub fn is_forwarded(name: &str, extra: &[String]) -> bool {
@@ -175,7 +208,17 @@ pub fn is_forwarded(name: &str, extra: &[String]) -> bool {
     up == "CARGO"
         || up.starts_with("CARGO_")
         || up.starts_with("DEP_")
-        || matches!(up.as_str(), "OUT_DIR" | "RUSTC_BOOTSTRAP" | "TARGET" | "HOST" | "PROFILE" | "NUM_JOBS" | "OPT_LEVEL" | "DEBUG")
+        || matches!(
+            up.as_str(),
+            "OUT_DIR"
+                | "RUSTC_BOOTSTRAP"
+                | "TARGET"
+                | "HOST"
+                | "PROFILE"
+                | "NUM_JOBS"
+                | "OPT_LEVEL"
+                | "DEBUG"
+        )
         || extra.iter().any(|e| e.eq_ignore_ascii_case(name))
 }
 
@@ -185,9 +228,14 @@ fn is_path_env(name: &str) -> bool {
 }
 
 /// Forwarded variables of `vars`; values of the path variables become client paths.
-pub fn forwarded_env(vars: impl Iterator<Item = (String, String)>, extra: &[String]) -> Vec<(String, EnvValue)> {
+pub fn forwarded_env(
+    vars: impl Iterator<Item = (String, String)>,
+    extra: &[String],
+) -> Vec<(String, EnvValue)> {
     let mut out: Vec<(String, EnvValue)> = vars
-        .filter(|(k, _)| is_forwarded(k, extra) && (crate::guard::extra_env_name_ok(k) || is_forwarded(k, &[])))
+        .filter(|(k, _)| {
+            is_forwarded(k, extra) && (crate::guard::extra_env_name_ok(k) || is_forwarded(k, &[]))
+        })
         .map(|(k, v)| {
             let value = if is_path_env(&k) {
                 match ClientPath::parse(host_style(), &v) {
@@ -272,12 +320,18 @@ pub fn extra_filename(args: &[String]) -> String {
 
 /// Where rustc wrote the dep-info of this invocation.
 fn dep_info_file(cand: &RemoteCandidate, args: &[String]) -> PathBuf {
-    cand.out_dir.to_local().join(format!("{}{}.d", cand.crate_name, extra_filename(args)))
+    cand.out_dir
+        .to_local()
+        .join(format!("{}{}.d", cand.crate_name, extra_filename(args)))
 }
 
 /// Names a freshly written `.d` file lists as env dependencies that are set
 /// here but were not part of the job's environment.
-pub fn missing_env_deps(dep_info: &str, forwarded: &HashSet<String>, is_set: impl Fn(&str) -> bool) -> Vec<String> {
+pub fn missing_env_deps(
+    dep_info: &str,
+    forwarded: &HashSet<String>,
+    is_set: impl Fn(&str) -> bool,
+) -> Vec<String> {
     rewrite::env_deps(dep_info)
         .into_iter()
         .filter(|n| is_set(n) && !forwarded.contains(&n.to_ascii_uppercase()))
@@ -291,7 +345,10 @@ enum Verdict {
     /// Finished; exit with this code.
     Exit(i32),
     /// Run rustc here. `printed` is true when remote stderr was already shown.
-    Local { printed: bool, reason: Option<LocalReason> },
+    Local {
+        printed: bool,
+        reason: Option<LocalReason>,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -305,18 +362,35 @@ fn submit(
     cwd: &Path,
     expanded: &[String],
 ) -> i32 {
-    let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return passthrough(rustc, args) };
-    let Ok(mut conn) = rt.block_on(ipc::connect(data_dir)) else { return passthrough(rustc, args) };
-    let Some(cwd_client) = ClientPath::from_local(cwd, cwd) else { return passthrough(rustc, args) };
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return passthrough(rustc, args);
+    };
+    let Ok(mut conn) = rt.block_on(ipc::connect(data_dir)) else {
+        return passthrough(rustc, args);
+    };
+    let Some(cwd_client) = ClientPath::from_local(cwd, cwd) else {
+        return passthrough(rustc, args);
+    };
 
     let mut extra = cfg.forward_env.clone();
     extra.extend(learned_env(data_dir, &cand.crate_name));
     let env = forwarded_env(std::env::vars(), &extra);
     // Names beyond DESIGN section 9; the executor accepts only these.
-    let extra_env: Vec<String> = env.iter().map(|(k, _)| k.clone()).filter(|k| !is_forwarded(k, &[])).collect();
+    let extra_env: Vec<String> = env
+        .iter()
+        .map(|(k, _)| k.clone())
+        .filter(|k| !is_forwarded(k, &[]))
+        .collect();
     let forwarded: HashSet<String> = env.iter().map(|(k, _)| k.to_ascii_uppercase()).collect();
     let spec = JobSpec {
-        job_id: JobId({ let mut b = [0u8; 16]; rand::fill(&mut b[..]); b }),
+        job_id: JobId({
+            let mut b = [0u8; 16];
+            rand::fill(&mut b[..]);
+            b
+        }),
         toolchain: tc,
         target: cand.target.clone(),
         args: cand.args.clone(),
@@ -353,10 +427,20 @@ fn submit(
         let msg = match rt.block_on(conn.recv()) {
             Ok(Some(m)) => m,
             // The node went away mid-job: the farm side failed, build here.
-            Ok(None) | Err(_) => break Verdict::Local { printed, reason: None },
+            Ok(None) | Err(_) => {
+                break Verdict::Local {
+                    printed,
+                    reason: None,
+                };
+            }
         };
         match msg {
-            Message::RunLocal { reason } => break Verdict::Local { printed, reason: Some(reason) },
+            Message::RunLocal { reason } => {
+                break Verdict::Local {
+                    printed,
+                    reason: Some(reason),
+                };
+            }
             Message::Stderr { line } => {
                 if registry {
                     printed = true;
@@ -379,21 +463,39 @@ fn submit(
                     // are not real (inputs outside the package directory):
                     // judge it by a local run (DESIGN section 10).
                     buffered.clear();
-                    if rt.block_on(conn.send(&Message::RetryLocal { reason: LocalReason::RemoteCompileErrorRetry })).is_err() {
-                        break Verdict::Local { printed: false, reason: None };
+                    if rt
+                        .block_on(conn.send(&Message::RetryLocal {
+                            reason: LocalReason::RemoteCompileErrorRetry,
+                        }))
+                        .is_err()
+                    {
+                        break Verdict::Local {
+                            printed: false,
+                            reason: None,
+                        };
                     }
                     local_retry_allowed = false;
                     continue;
                 }
                 if code == 0 && local_retry_allowed {
                     let missing = std::fs::read_to_string(&dep_file)
-                        .map(|d| missing_env_deps(&d, &forwarded, |n| std::env::var_os(n).is_some()))
+                        .map(|d| {
+                            missing_env_deps(&d, &forwarded, |n| std::env::var_os(n).is_some())
+                        })
                         .unwrap_or_default();
                     if !missing.is_empty() {
                         remember_env(data_dir, &cand.crate_name, &missing);
                         buffered.clear();
-                        if rt.block_on(conn.send(&Message::RetryLocal { reason: LocalReason::EnvDependency })).is_err() {
-                            break Verdict::Local { printed: false, reason: None };
+                        if rt
+                            .block_on(conn.send(&Message::RetryLocal {
+                                reason: LocalReason::EnvDependency,
+                            }))
+                            .is_err()
+                        {
+                            break Verdict::Local {
+                                printed: false,
+                                reason: None,
+                            };
                         }
                         local_retry_allowed = false;
                         continue;
@@ -405,7 +507,12 @@ fn submit(
                 break Verdict::Exit(code);
             }
             // A node that answers with anything else is not one to rely on.
-            _ => break Verdict::Local { printed, reason: None },
+            _ => {
+                break Verdict::Local {
+                    printed,
+                    reason: None,
+                };
+            }
         }
     };
 
@@ -418,7 +525,10 @@ fn submit(
             let code = passthrough(rustc, args);
             if reason.is_some() {
                 // Releases the local slot the node reserved for this run.
-                let _ = rt.block_on(conn.send(&Message::LocalDone { code, produces: cand.produces.clone() }));
+                let _ = rt.block_on(conn.send(&Message::LocalDone {
+                    code,
+                    produces: cand.produces.clone(),
+                }));
             }
             code
         }
@@ -450,10 +560,30 @@ mod tests {
     #[test]
     fn forwarding_follows_the_design_list() {
         let extra = vec![v("MY_TOKEN_FREE")];
-        for n in ["CARGO_PKG_NAME", "CARGO", "DEP_FOO_ROOT", "OUT_DIR", "RUSTC_BOOTSTRAP", "TARGET", "HOST", "PROFILE", "NUM_JOBS", "OPT_LEVEL", "DEBUG", "MY_TOKEN_FREE"] {
+        for n in [
+            "CARGO_PKG_NAME",
+            "CARGO",
+            "DEP_FOO_ROOT",
+            "OUT_DIR",
+            "RUSTC_BOOTSTRAP",
+            "TARGET",
+            "HOST",
+            "PROFILE",
+            "NUM_JOBS",
+            "OPT_LEVEL",
+            "DEBUG",
+            "MY_TOKEN_FREE",
+        ] {
             assert!(is_forwarded(n, &extra), "{n} must be forwarded");
         }
-        for n in ["PATH", "HOME", "SystemRoot", "RUSTFLAGS", "CARGO_MAKEFLAGS", "USERPROFILE"] {
+        for n in [
+            "PATH",
+            "HOME",
+            "SystemRoot",
+            "RUSTFLAGS",
+            "CARGO_MAKEFLAGS",
+            "USERPROFILE",
+        ] {
             assert!(!is_forwarded(n, &extra), "{n} must not be forwarded");
         }
     }
@@ -461,9 +591,18 @@ mod tests {
     #[test]
     fn only_rustc_runs_remotely() {
         assert!(is_plain_rustc("rustc"));
-        assert!(is_plain_rustc(r"C:\Users\me\.rustup\toolchains\stable\bin\rustc.exe"));
+        assert!(is_plain_rustc(
+            r"C:\Users\me\.rustup\toolchains\stable\bin\rustc.exe"
+        ));
         assert!(is_plain_rustc("/usr/bin/rustc"));
-        for p in ["clippy-driver", r"C:\x\clippy-driver.exe", "/x/rustdoc", "rustc-wrapper", "cargo-clippy", "miri"] {
+        for p in [
+            "clippy-driver",
+            r"C:\x\clippy-driver.exe",
+            "/x/rustdoc",
+            "rustc-wrapper",
+            "cargo-clippy",
+            "miri",
+        ] {
             assert!(!is_plain_rustc(p), "{p}");
         }
     }
@@ -471,7 +610,13 @@ mod tests {
     #[test]
     fn configured_names_that_would_change_the_peer_are_not_forwarded() {
         let extra = vec![v("PATH"), v("LD_PRELOAD"), v("RUSTC_WRAPPER"), v("MY_FLAG")];
-        let vars = vec![(v("PATH"), v("p")), (v("LD_PRELOAD"), v("l")), (v("RUSTC_WRAPPER"), v("w")), (v("MY_FLAG"), v("1")), (v("RUSTC_BOOTSTRAP"), v("1"))];
+        let vars = vec![
+            (v("PATH"), v("p")),
+            (v("LD_PRELOAD"), v("l")),
+            (v("RUSTC_WRAPPER"), v("w")),
+            (v("MY_FLAG"), v("1")),
+            (v("RUSTC_BOOTSTRAP"), v("1")),
+        ];
         let env = forwarded_env(vars.into_iter(), &extra);
         let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(names, vec!["MY_FLAG", "RUSTC_BOOTSTRAP"]);
@@ -491,16 +636,25 @@ mod tests {
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
         assert!(matches!(get("OUT_DIR"), Some(EnvValue::Path(_))));
         assert_eq!(get("CARGO_PKG_NAME"), Some(EnvValue::Plain(v("x"))));
-        assert_eq!(get("CARGO_MANIFEST_DIR"), Some(EnvValue::Plain(v("relative/not/absolute"))));
+        assert_eq!(
+            get("CARGO_MANIFEST_DIR"),
+            Some(EnvValue::Plain(v("relative/not/absolute")))
+        );
         assert_eq!(get("PATH"), None);
     }
 
     #[test]
     fn extra_filename_spellings() {
         let a = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(extra_filename(&a(&["-C", "extra-filename=-abc", "x.rs"])), "-abc");
+        assert_eq!(
+            extra_filename(&a(&["-C", "extra-filename=-abc", "x.rs"])),
+            "-abc"
+        );
         assert_eq!(extra_filename(&a(&["-Cextra-filename=-def"])), "-def");
-        assert_eq!(extra_filename(&a(&["--codegen", "extra-filename=-g"])), "-g");
+        assert_eq!(
+            extra_filename(&a(&["--codegen", "extra-filename=-g"])),
+            "-g"
+        );
         assert_eq!(extra_filename(&a(&["--codegen=extra-filename=-h"])), "-h");
         assert_eq!(extra_filename(&a(&["-C", "opt-level=3"])), "");
     }
@@ -508,7 +662,11 @@ mod tests {
     #[test]
     fn registry_detection_uses_cargo_home() {
         let home = ClientPath::parse(PathStyle::Posix, "/home/u/.cargo").unwrap();
-        let reg = ClientPath::parse(PathStyle::Posix, "/home/u/.cargo/registry/src/x/serde/src/lib.rs").unwrap();
+        let reg = ClientPath::parse(
+            PathStyle::Posix,
+            "/home/u/.cargo/registry/src/x/serde/src/lib.rs",
+        )
+        .unwrap();
         let own = ClientPath::parse(PathStyle::Posix, "/home/u/proj/src/lib.rs").unwrap();
         assert!(is_registry_crate(&reg, Some(&home)));
         assert!(!is_registry_crate(&own, Some(&home)));

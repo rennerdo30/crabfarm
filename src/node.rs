@@ -58,18 +58,27 @@ pub struct InboundPermit {
 
 impl InboundLimits {
     pub fn new(max_all: usize, max_unauthenticated: usize) -> InboundLimits {
-        InboundLimits { all: Arc::new(Semaphore::new(max_all)), unauthenticated: Arc::new(Semaphore::new(max_unauthenticated)) }
+        InboundLimits {
+            all: Arc::new(Semaphore::new(max_all)),
+            unauthenticated: Arc::new(Semaphore::new(max_unauthenticated)),
+        }
     }
 
     pub fn admit(&self) -> Option<InboundPermit> {
         let all = self.all.clone().try_acquire_owned().ok()?;
         let unauth = self.unauthenticated.clone().try_acquire_owned().ok()?;
-        Some(InboundPermit { _all: all, unauthenticated: Some(unauth) })
+        Some(InboundPermit {
+            _all: all,
+            unauthenticated: Some(unauth),
+        })
     }
 }
 
 pub fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// What the node knows about one peer.
@@ -142,7 +151,10 @@ pub fn reachable_addrs(listen: SocketAddr) -> Vec<String> {
     if !listen.ip().is_unspecified() {
         return vec![listen.to_string()];
     }
-    lan_ipv4s().into_iter().map(|ip| format!("{ip}:{}", listen.port())).collect()
+    lan_ipv4s()
+        .into_iter()
+        .map(|ip| format!("{ip}:{}", listen.port()))
+        .collect()
 }
 
 /// Non-loopback, non-link-local IPv4 addresses of this machine.
@@ -170,10 +182,19 @@ impl Node {
     }
 
     pub fn counters_snapshot(&self) -> Vec<(String, u64)> {
-        let mut v: Vec<(String, u64)> = lock(&self.counters).iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let mut v: Vec<(String, u64)> = lock(&self.counters)
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
         v.push(("local_slots".into(), self.cfg.local_slots as u64));
-        v.push(("running_local".into(), self.running_local.load(Ordering::Relaxed) as u64));
-        v.push(("running_remote".into(), self.running_remote.load(Ordering::Relaxed) as u64));
+        v.push((
+            "running_local".into(),
+            self.running_local.load(Ordering::Relaxed) as u64,
+        ));
+        v.push((
+            "running_remote".into(),
+            self.running_remote.load(Ordering::Relaxed) as u64,
+        ));
         v
     }
 
@@ -213,7 +234,11 @@ impl Node {
             if cur >= self.cfg.slots {
                 return None;
             }
-            if self.serving.compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            if self
+                .serving
+                .compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
                 self.status_changed();
                 return Some(SlotGuard(self.clone()));
             }
@@ -223,7 +248,12 @@ impl Node {
     pub fn peer_infos_for_status(&self) -> Vec<(PeerInfo, Option<Status>)> {
         let mut v: Vec<(PeerInfo, Option<Status>)> = lock(&self.peers)
             .values()
-            .map(|p| (p.info.clone(), if p.conns > 0 { p.status.clone() } else { None }))
+            .map(|p| {
+                (
+                    p.info.clone(),
+                    if p.conns > 0 { p.status.clone() } else { None },
+                )
+            })
             .collect();
         v.sort_by(|a, b| a.0.node_name.cmp(&b.0.node_name));
         v
@@ -263,7 +293,9 @@ impl Node {
                 if p.node_id == self.id.node_id {
                     continue;
                 }
-                let e = peers.entry(p.node_id).or_insert_with(|| PeerState::new(p.clone()));
+                let e = peers
+                    .entry(p.node_id)
+                    .or_insert_with(|| PeerState::new(p.clone()));
                 if e.info.addrs != p.addrs {
                     e.info.addrs = p.addrs.clone();
                 }
@@ -289,13 +321,21 @@ impl Node {
     fn peer_connected(&self, id: NodeId, name: &str, host: &str) {
         let mut peers = lock(&self.peers);
         let e = peers.entry(id).or_insert_with(|| {
-            PeerState::new(PeerInfo { node_id: id, node_name: name.to_string(), addrs: Vec::new(), last_seen: unix_now() })
+            PeerState::new(PeerInfo {
+                node_id: id,
+                node_name: name.to_string(),
+                addrs: Vec::new(),
+                last_seen: unix_now(),
+            })
         });
         e.conns += 1;
         e.info.node_name = name.to_string();
         e.info.last_seen = unix_now();
         e.host_triple = host.to_string();
-        tracing::info!(peer = crate::proto::log_safe(name).as_str(), "peer connected");
+        tracing::info!(
+            peer = crate::proto::log_safe(name).as_str(),
+            "peer connected"
+        );
     }
 
     fn peer_disconnected(&self, id: NodeId) {
@@ -304,7 +344,10 @@ impl Node {
             e.conns = e.conns.saturating_sub(1);
             if e.conns == 0 {
                 e.status = None;
-                tracing::info!(peer = crate::proto::log_safe(&e.info.node_name).as_str(), "peer disconnected");
+                tracing::info!(
+                    peer = crate::proto::log_safe(&e.info.node_name).as_str(),
+                    "peer disconnected"
+                );
             }
         }
     }
@@ -348,20 +391,29 @@ impl Node {
                 }
                 continue;
             }
-            let addrs = lock(&self.peers).get(&id).map(|p| p.info.addrs.clone()).unwrap_or_default();
+            let addrs = lock(&self.peers)
+                .get(&id)
+                .map(|p| p.info.addrs.clone())
+                .unwrap_or_default();
             let mut connected = false;
             for a in addrs {
                 match transport::connect(&self.tls, &self.id, &a).await {
                     Ok((pid, hello, conn)) if pid == id => {
                         connected = true;
-                        self.clone().run_control(pid, hello, Link::new(conn), None).await;
+                        self.clone()
+                            .run_control(pid, hello, Link::new(conn), None)
+                            .await;
                         break;
                     }
                     Ok(_) => tracing::debug!("address {a} answered as a different node"),
                     Err(e) => tracing::debug!("dial {a}: {e:#}"),
                 }
             }
-            backoff = if connected { Duration::from_secs(1) } else { (backoff * 2).min(MAX_BACKOFF) };
+            backoff = if connected {
+                Duration::from_secs(1)
+            } else {
+                (backoff * 2).min(MAX_BACKOFF)
+            };
             if self.sleep_or_shutdown(backoff).await {
                 return;
             }
@@ -381,7 +433,12 @@ impl Node {
                         Message::Hello { node_name, .. } => node_name.clone(),
                         _ => String::new(),
                     };
-                    self.learn_peers(&[PeerInfo { node_id: pid, node_name: name, addrs: vec![addr.clone()], last_seen: unix_now() }]);
+                    self.learn_peers(&[PeerInfo {
+                        node_id: pid,
+                        node_name: name,
+                        addrs: vec![addr.clone()],
+                        last_seen: unix_now(),
+                    }]);
                     if self.has_control(pid) {
                         // Already connected the other way round.
                         drop(conn);
@@ -391,7 +448,9 @@ impl Node {
                         continue;
                     }
                     backoff = Duration::from_secs(1);
-                    self.clone().run_control(pid, hello, Link::new(conn), None).await;
+                    self.clone()
+                        .run_control(pid, hello, Link::new(conn), None)
+                        .await;
                 }
                 Err(e) => {
                     tracing::debug!("dial {addr}: {e:#}");
@@ -407,7 +466,12 @@ impl Node {
     /// One connection attempt to an mDNS-learned candidate. A candidate that
     /// does not prove to be the farm member it announced is forgotten; a real
     /// member is handed to the normal per-node dial loop by `learn_peers`.
-    async fn try_mdns_candidate(self: Arc<Self>, instance: String, addr: String, cands: Arc<Mutex<CandidateSet>>) {
+    async fn try_mdns_candidate(
+        self: Arc<Self>,
+        instance: String,
+        addr: String,
+        cands: Arc<Mutex<CandidateSet>>,
+    ) {
         match transport::connect(&self.tls, &self.id, &addr).await {
             Ok((pid, hello, conn)) => {
                 if pid.to_hex() != instance {
@@ -419,11 +483,18 @@ impl Node {
                     Message::Hello { node_name, .. } => node_name.clone(),
                     _ => String::new(),
                 };
-                self.learn_peers(&[PeerInfo { node_id: pid, node_name: name, addrs: vec![addr], last_seen: unix_now() }]);
+                self.learn_peers(&[PeerInfo {
+                    node_id: pid,
+                    node_name: name,
+                    addrs: vec![addr],
+                    last_seen: unix_now(),
+                }]);
                 if self.has_control(pid) {
                     return;
                 }
-                self.clone().run_control(pid, hello, Link::new(conn), None).await;
+                self.clone()
+                    .run_control(pid, hello, Link::new(conn), None)
+                    .await;
             }
             Err(e) => tracing::debug!("mDNS candidate {addr}: {e:#}"),
         }
@@ -433,8 +504,21 @@ impl Node {
 
     /// Serve one control connection (either direction) until it ends.
     /// `first` is a message already read from an inbound connection.
-    async fn run_control(self: Arc<Self>, peer: NodeId, hello: Message, mut link: Link, first: Option<Message>) {
-        let Message::Hello { node_name, host_triple, .. } = &hello else { return };
+    async fn run_control(
+        self: Arc<Self>,
+        peer: NodeId,
+        hello: Message,
+        mut link: Link,
+        first: Option<Message>,
+    ) {
+        let Message::Hello {
+            node_name,
+            host_triple,
+            ..
+        } = &hello
+        else {
+            return;
+        };
         self.peer_connected(peer, node_name, host_triple);
         if let Err(e) = self.control_loop(peer, &mut link, first).await {
             tracing::debug!("control connection ended: {e:#}");
@@ -446,8 +530,16 @@ impl Node {
         link.send(Message::StatusUpdate(self.own_status())).await
     }
 
-    async fn control_loop(self: &Arc<Self>, peer: NodeId, link: &mut Link, first: Option<Message>) -> anyhow::Result<()> {
-        link.send(Message::PeerList { peers: self.gossip_list() }).await?;
+    async fn control_loop(
+        self: &Arc<Self>,
+        peer: NodeId,
+        link: &mut Link,
+        first: Option<Message>,
+    ) -> anyhow::Result<()> {
+        link.send(Message::PeerList {
+            peers: self.gossip_list(),
+        })
+        .await?;
         self.push_status(link).await?;
         if let Some(m) = first {
             self.on_control_message(peer, m);
@@ -524,7 +616,11 @@ impl Node {
         }
     }
 
-    async fn handle_inbound(self: Arc<Self>, tcp: tokio::net::TcpStream, mut permit: InboundPermit) -> anyhow::Result<()> {
+    async fn handle_inbound(
+        self: Arc<Self>,
+        tcp: tokio::net::TcpStream,
+        mut permit: InboundPermit,
+    ) -> anyhow::Result<()> {
         match transport::accept(&self.tls, &self.id, tcp).await? {
             // The join keeps its unauthenticated slot until the reply is sent.
             Accepted::Join { request, mut conn } => {
@@ -538,10 +634,16 @@ impl Node {
                 conn.send(&reply).await?;
                 Ok(())
             }
-            Accepted::Peer { node_id, hello, conn } => {
+            Accepted::Peer {
+                node_id,
+                hello,
+                conn,
+            } => {
                 permit.unauthenticated = None;
                 let mut link = Link::new_with_idle(conn, Some(JOB_IDLE));
-                let first = tokio::time::timeout(FIRST_MESSAGE, link.recv()).await.context("peer sent nothing after Hello")?;
+                let first = tokio::time::timeout(FIRST_MESSAGE, link.recv())
+                    .await
+                    .context("peer sent nothing after Hello")?;
                 match first {
                     Some(Message::Reserve { job_id }) => {
                         self.serve_job(node_id, link, job_id).await;
@@ -603,7 +705,10 @@ impl Node {
         match postcard::to_stdvec(&*hashes) {
             Ok(bytes) => {
                 let tmp = self.hashcache_path().with_extension("tmp");
-                if std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, self.hashcache_path())).is_err() {
+                if std::fs::write(&tmp, bytes)
+                    .and_then(|_| std::fs::rename(&tmp, self.hashcache_path()))
+                    .is_err()
+                {
                     tracing::warn!("could not save the hash cache");
                 }
             }
@@ -674,10 +779,21 @@ pub fn init_logging(data_dir: &Path) {
     let logs = data_dir.join("logs");
     let file = std::fs::create_dir_all(&logs)
         .ok()
-        .and_then(|_| std::fs::OpenOptions::new().create(true).append(true).open(logs.join("node.log")).ok())
+        .and_then(|_| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(logs.join("node.log"))
+                .ok()
+        })
         .map(|f| Arc::new(Mutex::new(f)));
-    let filter = tracing_subscriber::EnvFilter::try_from_env("CRABFARM_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).with_writer(Tee(file)).try_init();
+    let filter = tracing_subscriber::EnvFilter::try_from_env("CRABFARM_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_writer(Tee(file))
+        .try_init();
 }
 
 /// Run the node until `shutdown` is cancelled.
@@ -686,22 +802,30 @@ pub async fn run(data_dir: PathBuf, shutdown: CancellationToken) -> anyhow::Resu
     let id = farm::load(&data_dir)?
         .context("this machine is not part of a farm: run `crabfarm farm create` or `crabfarm farm join <code>` first")?;
     for d in ["jobs", "cache", "logs"] {
-        std::fs::create_dir_all(data_dir.join(d)).with_context(|| format!("create {d} directory"))?;
+        std::fs::create_dir_all(data_dir.join(d))
+            .with_context(|| format!("create {d} directory"))?;
     }
     // Sandboxes left by a crashed node hold plaintext sources: remove them now,
     // and keep retrying in the background what cannot be removed yet (CF-9).
     crate::exec::sweep_jobs(&data_dir.join("jobs"));
 
-    let listener = tokio::net::TcpListener::bind(&cfg.listen).await.with_context(|| format!("listen on {}", cfg.listen))?;
+    let listener = tokio::net::TcpListener::bind(&cfg.listen)
+        .await
+        .with_context(|| format!("listen on {}", cfg.listen))?;
     let listen_addr = listener.local_addr()?;
     let (ipc_listener, ipc_token) = ipc::bind(&data_dir).await?;
-    ipc::write_private(&data_dir.join("listen.addr"), listen_addr.to_string().as_bytes())?;
+    ipc::write_private(
+        &data_dir.join("listen.addr"),
+        listen_addr.to_string().as_bytes(),
+    )?;
 
     let dd = data_dir.clone();
     let auto = cfg.auto_install;
     let max_auto = cfg.max_auto_toolchains;
     let (toolchains, host_triple) = tokio::task::spawn_blocking(move || {
-        let host = crate::toolchain::query(Path::new("rustc")).map(|t| t.host).ok();
+        let host = crate::toolchain::query(Path::new("rustc"))
+            .map(|t| t.host)
+            .ok();
         (Toolchains::scan_with(&dd, auto, max_auto), host)
     })
     .await?;
@@ -717,11 +841,16 @@ pub async fn run(data_dir: PathBuf, shutdown: CancellationToken) -> anyhow::Resu
     tls.host_triple = host_triple.clone();
 
     let depgraph = DepGraph::load(&data_dir.join("depgraph.bin"));
-    let hashes: HashCache =
-        std::fs::read(data_dir.join("hashcache.bin")).ok().and_then(|b| postcard::from_bytes(&b).ok()).unwrap_or_default();
+    let hashes: HashCache = std::fs::read(data_dir.join("hashcache.bin"))
+        .ok()
+        .and_then(|b| postcard::from_bytes(&b).ok())
+        .unwrap_or_default();
     let (status_tx, _) = watch::channel(0u64);
     let node = Arc::new(Node {
-        store: BlobStore::open(&data_dir.join("cache"), cfg.cache_max_gb.saturating_mul(1 << 30))?,
+        store: BlobStore::open(
+            &data_dir.join("cache"),
+            cfg.cache_max_gb.saturating_mul(1 << 30),
+        )?,
         jobserver: NodeJobserver::new(cfg.slots)?,
         toolchains,
         peers: Mutex::new(HashMap::new()),
@@ -764,7 +893,12 @@ pub async fn run(data_dir: PathBuf, shutdown: CancellationToken) -> anyhow::Resu
     }
     let mdns = if node.cfg.mdns {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, String)>(MDNS_FOUND_QUEUE);
-        match Mdns::start(node.id.node_id, &node.id.short_farm_id(), listen_addr.port(), tx) {
+        match Mdns::start(
+            node.id.node_id,
+            &node.id.short_farm_id(),
+            listen_addr.port(),
+            tx,
+        ) {
             Ok(m) => {
                 let n = node.clone();
                 tokio::spawn(async move {
@@ -773,17 +907,23 @@ pub async fn run(data_dir: PathBuf, shutdown: CancellationToken) -> anyhow::Resu
                     let cands = Arc::new(Mutex::new(CandidateSet::default()));
                     let mut limiter = ConnectLimiter::default();
                     while let Some((instance, addr)) = rx.recv().await {
-                        if !lock(&cands).offer(&instance, &addr) || !limiter.allow(&instance, &addr, Instant::now()) {
+                        if !lock(&cands).offer(&instance, &addr)
+                            || !limiter.allow(&instance, &addr, Instant::now())
+                        {
                             continue;
                         }
                         let (n, cands) = (n.clone(), cands.clone());
-                        tokio::spawn(async move { n.try_mdns_candidate(instance, addr, cands).await });
+                        tokio::spawn(
+                            async move { n.try_mdns_candidate(instance, addr, cands).await },
+                        );
                     }
                 });
                 Some(m)
             }
             Err(e) => {
-                tracing::warn!("mDNS unavailable ({e:#}); only configured and learned peers are used");
+                tracing::warn!(
+                    "mDNS unavailable ({e:#}); only configured and learned peers are used"
+                );
                 None
             }
         }
@@ -821,7 +961,10 @@ mod tests {
         let l = InboundLimits::new(5, 2);
         let a = l.admit().unwrap();
         let b = l.admit().unwrap();
-        assert!(l.admit().is_none(), "third unauthenticated connection refused");
+        assert!(
+            l.admit().is_none(),
+            "third unauthenticated connection refused"
+        );
         // Authenticating frees the unauthenticated slot but keeps the connection slot.
         let mut a = a;
         a.unauthenticated = None;

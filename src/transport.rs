@@ -7,14 +7,18 @@ use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio_rustls::rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use tokio_rustls::rustls::client::WebPkiServerVerifier;
+use tokio_rustls::rustls::client::danger::{
+    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+};
 use tokio_rustls::rustls::crypto::{CryptoProvider, ring as ring_provider, verify_tls13_signature};
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use tokio_rustls::rustls::pki_types::{
+    CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime,
+};
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::{
-    CertificateError, ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore, ServerConfig,
-    SignatureScheme, version,
+    CertificateError, ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore,
+    ServerConfig, SignatureScheme, version,
 };
 
 /// Connect + handshake budget.
@@ -48,7 +52,11 @@ impl<S: AsyncWrite + Unpin + Send> FramedConn<S> {
     pub async fn send(&mut self, msg: &Message) -> anyhow::Result<()> {
         let body = postcard::to_stdvec(msg).context("encode frame")?;
         if body.len() > MAX_FRAME {
-            bail!("frame of {} bytes exceeds the {} byte limit", body.len(), MAX_FRAME);
+            bail!(
+                "frame of {} bytes exceeds the {} byte limit",
+                body.len(),
+                MAX_FRAME
+            );
         }
         // One write so the length prefix and body leave in the same TLS record burst.
         let mut buf = Vec::with_capacity(4 + body.len());
@@ -58,7 +66,6 @@ impl<S: AsyncWrite + Unpin + Send> FramedConn<S> {
         self.stream.flush().await.context("flush frame")?;
         Ok(())
     }
-
 }
 
 impl<S: AsyncRead + Unpin + Send> FramedConn<S> {
@@ -74,7 +81,11 @@ impl<S: AsyncRead + Unpin + Send> FramedConn<S> {
         let mut hdr = [0u8; 4];
         let mut got = 0;
         while got < 4 {
-            let n = self.stream.read(&mut hdr[got..]).await.context("read frame header")?;
+            let n = self
+                .stream
+                .read(&mut hdr[got..])
+                .await
+                .context("read frame header")?;
             if n == 0 {
                 if got == 0 {
                     return Ok(None);
@@ -90,7 +101,11 @@ impl<S: AsyncRead + Unpin + Send> FramedConn<S> {
         }
         // Grow with the bytes that actually arrive instead of trusting `len`.
         let mut body = Vec::new();
-        let read = (&mut self.stream).take(len as u64).read_to_end(&mut body).await.context("read frame body")?;
+        let read = (&mut self.stream)
+            .take(len as u64)
+            .read_to_end(&mut body)
+            .await
+            .context("read frame body")?;
         if read != len {
             bail!("connection closed inside a frame ({read} of {len} bytes)");
         }
@@ -104,7 +119,9 @@ fn provider() -> Arc<CryptoProvider> {
 
 fn farm_roots(id: &Identity) -> anyhow::Result<Arc<RootCertStore>> {
     let mut roots = RootCertStore::empty();
-    roots.add(CertificateDer::from(id.ca_cert_der.clone())).context("farm CA certificate")?;
+    roots
+        .add(CertificateDer::from(id.ca_cert_der.clone()))
+        .context("farm CA certificate")?;
     Ok(Arc::new(roots))
 }
 
@@ -135,16 +152,29 @@ impl ServerCertVerifier for FarmServerVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, TlsError> {
-        match self.inner.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now) {
-            Err(TlsError::InvalidCertificate(CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. })) => {
-                Ok(ServerCertVerified::assertion())
-            }
+        match self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Err(TlsError::InvalidCertificate(
+                CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. },
+            )) => Ok(ServerCertVerified::assertion()),
             other => other,
         }
     }
 
-    fn verify_tls12_signature(&self, _: &[u8], _: &CertificateDer<'_>, _: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, TlsError> {
-        Err(TlsError::PeerIncompatible(tokio_rustls::rustls::PeerIncompatible::Tls12NotOffered))
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        Err(TlsError::PeerIncompatible(
+            tokio_rustls::rustls::PeerIncompatible::Tls12NotOffered,
+        ))
     }
 
     fn verify_tls13_signature(
@@ -182,12 +212,21 @@ impl ServerCertVerifier for PinnedVerifier {
         if bool::from(got.ct_eq(&self.fp)) {
             Ok(ServerCertVerified::assertion())
         } else {
-            Err(TlsError::InvalidCertificate(CertificateError::ApplicationVerificationFailure))
+            Err(TlsError::InvalidCertificate(
+                CertificateError::ApplicationVerificationFailure,
+            ))
         }
     }
 
-    fn verify_tls12_signature(&self, _: &[u8], _: &CertificateDer<'_>, _: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, TlsError> {
-        Err(TlsError::PeerIncompatible(tokio_rustls::rustls::PeerIncompatible::Tls12NotOffered))
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        Err(TlsError::PeerIncompatible(
+            tokio_rustls::rustls::PeerIncompatible::Tls12NotOffered,
+        ))
     }
 
     fn verify_tls13_signature(
@@ -198,11 +237,18 @@ impl ServerCertVerifier for PinnedVerifier {
     ) -> Result<HandshakeSignatureValid, TlsError> {
         // The pin fixes the certificate; the handshake signature must still
         // prove the server holds its key.
-        verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.provider.signature_verification_algorithms.supported_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -222,7 +268,11 @@ fn default_host_triple() -> String {
 
 impl TlsContext {
     pub fn new(id: &Identity) -> anyhow::Result<TlsContext> {
-        Ok(TlsContext { server: server_config_optional_client_auth(id)?, client: client_config(id)?, host_triple: default_host_triple() })
+        Ok(TlsContext {
+            server: server_config_optional_client_auth(id)?,
+            client: client_config(id)?,
+            host_triple: default_host_triple(),
+        })
     }
 
     fn hello(&self, id: &Identity) -> Message {
@@ -240,7 +290,9 @@ impl TlsContext {
 /// servers certified by the farm CA.
 pub fn client_config(id: &Identity) -> anyhow::Result<Arc<ClientConfig>> {
     let p = provider();
-    let inner = WebPkiServerVerifier::builder_with_provider(farm_roots(id)?, p.clone()).build().context("server verifier")?;
+    let inner = WebPkiServerVerifier::builder_with_provider(farm_roots(id)?, p.clone())
+        .build()
+        .context("server verifier")?;
     let (chain, key) = own_cert_and_key(id);
     let cfg = ClientConfig::builder_with_provider(p)
         .with_protocol_versions(&[&version::TLS13])
@@ -257,21 +309,35 @@ pub type ServerStream = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
 
 /// First certificate of the peer's chain (leaf), if it sent any.
 fn peer_leaf(conn: &tokio_rustls::rustls::CommonState) -> Option<Vec<u8>> {
-    conn.peer_certificates().and_then(|c| c.first()).map(|c| c.to_vec())
+    conn.peer_certificates()
+        .and_then(|c| c.first())
+        .map(|c| c.to_vec())
 }
 
 /// Connect to a peer (`host:port`), TLS handshake, exchange `Hello`.
 /// Timeout 5 s for connect + handshake. Returns the peer's node id (from its
 /// certificate, checked against its Hello) and the framed stream.
-pub async fn connect(tls: &TlsContext, id: &Identity, addr: &str) -> anyhow::Result<(NodeId, Message, FramedConn<ClientStream>)> {
+pub async fn connect(
+    tls: &TlsContext,
+    id: &Identity,
+    addr: &str,
+) -> anyhow::Result<(NodeId, Message, FramedConn<ClientStream>)> {
     let handshake = async {
-        let tcp = tokio::net::TcpStream::connect(addr).await.with_context(|| format!("connect to {addr}"))?;
+        let tcp = tokio::net::TcpStream::connect(addr)
+            .await
+            .with_context(|| format!("connect to {addr}"))?;
         tcp.set_nodelay(true).ok();
         let name = ServerName::try_from(SERVER_NAME).context("server name")?;
-        tokio_rustls::TlsConnector::from(tls.client.clone()).connect(name, tcp).await.context("TLS handshake")
+        tokio_rustls::TlsConnector::from(tls.client.clone())
+            .connect(name, tcp)
+            .await
+            .context("TLS handshake")
     };
-    let stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await.with_context(|| format!("connect to {addr} timed out"))??;
-    let cert_id = node_id_from_cert(&peer_leaf(stream.get_ref().1).context("peer sent no certificate")?)?;
+    let stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
+        .await
+        .with_context(|| format!("connect to {addr} timed out"))??;
+    let cert_id =
+        node_id_from_cert(&peer_leaf(stream.get_ref().1).context("peer sent no certificate")?)?;
     let mut conn = FramedConn::new(stream);
     conn.send(&tls.hello(id)).await?;
     // A TLS 1.3 client finishes its handshake before the server has judged the
@@ -282,7 +348,9 @@ pub async fn connect(tls: &TlsContext, id: &Identity, addr: &str) -> anyhow::Res
         .context("peer closed or refused the connection")?;
     let hello = match first {
         Some(h @ Message::Hello { .. }) => h,
-        Some(Message::Error { message }) => bail!("peer refused: {}", crate::proto::log_safe(&message)),
+        Some(Message::Error { message }) => {
+            bail!("peer refused: {}", crate::proto::log_safe(&message))
+        }
         Some(_) => bail!("peer did not start with Hello"),
         None => bail!("peer closed the connection before Hello"),
     };
@@ -293,7 +361,9 @@ pub async fn connect(tls: &TlsContext, id: &Identity, addr: &str) -> anyhow::Res
 /// A Hello must carry our protocol version and the node id of the
 /// certificate it arrived under; otherwise a farm member could pose as another.
 fn check_hello(hello: &Message, cert_id: NodeId) -> anyhow::Result<()> {
-    let Message::Hello { proto, node_id, .. } = hello else { bail!("not a Hello") };
+    let Message::Hello { proto, node_id, .. } = hello else {
+        bail!("not a Hello")
+    };
     if *proto != PROTO_VERSION {
         bail!("peer speaks protocol {proto}, this node speaks {PROTO_VERSION}");
     }
@@ -307,21 +377,35 @@ fn check_hello(hello: &Message, cert_id: NodeId) -> anyhow::Result<()> {
 pub enum Accepted {
     /// An authenticated farm member (certificate verified against the farm CA,
     /// node id equal to the one in its Hello).
-    Peer { node_id: NodeId, hello: Message, conn: FramedConn<ServerStream> },
+    Peer {
+        node_id: NodeId,
+        hello: Message,
+        conn: FramedConn<ServerStream>,
+    },
     /// A first frame `JoinRequest` from a machine that may have no certificate.
     /// The caller passes `request` to `farm::handle_join` and answers on `conn`.
-    Join { request: Message, conn: FramedConn<ServerStream> },
+    Join {
+        request: Message,
+        conn: FramedConn<ServerStream>,
+    },
 }
 
 /// Server side of `connect` for an accepted TCP stream. Every connection
 /// whose first frame is not a `JoinRequest` must present a farm-signed
 /// client certificate.
-pub async fn accept(tls: &TlsContext, id: &Identity, tcp: tokio::net::TcpStream) -> anyhow::Result<Accepted> {
+pub async fn accept(
+    tls: &TlsContext,
+    id: &Identity,
+    tcp: tokio::net::TcpStream,
+) -> anyhow::Result<Accepted> {
     tcp.set_nodelay(true).ok();
-    let stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_rustls::TlsAcceptor::from(tls.server.clone()).accept(tcp))
-        .await
-        .context("TLS handshake timed out")?
-        .context("TLS handshake")?;
+    let stream = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        tokio_rustls::TlsAcceptor::from(tls.server.clone()).accept(tcp),
+    )
+    .await
+    .context("TLS handshake timed out")?
+    .context("TLS handshake")?;
     let client_cert = peer_leaf(stream.get_ref().1);
     let mut conn = FramedConn::new(stream);
     let first = tokio::time::timeout(HANDSHAKE_TIMEOUT, conn.recv_max(PRE_AUTH_MAX_FRAME))
@@ -335,11 +419,19 @@ pub async fn accept(tls: &TlsContext, id: &Identity, tcp: tokio::net::TcpStream)
             let cert_id = node_id_from_cert(&cert)?;
             if let Err(e) = check_hello(&hello, cert_id) {
                 // Best effort so an honest but outdated peer learns why.
-                let _ = conn.send(&Message::Error { message: e.to_string() }).await;
+                let _ = conn
+                    .send(&Message::Error {
+                        message: e.to_string(),
+                    })
+                    .await;
                 return Err(e);
             }
             conn.send(&tls.hello(id)).await?;
-            Ok(Accepted::Peer { node_id: cert_id, hello, conn })
+            Ok(Accepted::Peer {
+                node_id: cert_id,
+                hello,
+                conn,
+            })
         }
         _ => bail!("first frame was neither Hello nor JoinRequest"),
     }
@@ -353,7 +445,10 @@ pub fn join_client_config(cert_fp: [u8; 16]) -> anyhow::Result<Arc<ClientConfig>
         .with_protocol_versions(&[&version::TLS13])
         .context("TLS 1.3")?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedVerifier { fp: cert_fp, provider: p }))
+        .with_custom_certificate_verifier(Arc::new(PinnedVerifier {
+            fp: cert_fp,
+            provider: p,
+        }))
         .with_no_client_auth();
     Ok(Arc::new(cfg))
 }

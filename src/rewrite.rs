@@ -22,7 +22,10 @@ fn is_sep(b: u8) -> bool {
 fn matches_at(s: &str, at: usize, prefix: &str) -> Option<usize> {
     let end = at.checked_add(prefix.len())?;
     let hay = s.as_bytes().get(at..end)?;
-    let ok = hay.iter().zip(prefix.as_bytes()).all(|(a, b)| a == b || (is_sep(*a) && is_sep(*b)));
+    let ok = hay
+        .iter()
+        .zip(prefix.as_bytes())
+        .all(|(a, b)| a == b || (is_sep(*a) && is_sep(*b)));
     ok.then_some(end)
 }
 
@@ -36,7 +39,10 @@ impl Rewriter {
     pub fn new(pairs: Vec<(String, String)>, client_windows: bool) -> Self {
         let mut pairs = pairs;
         pairs.sort_by_key(|(s, _)| std::cmp::Reverse(s.len()));
-        Rewriter { pairs, client_windows }
+        Rewriter {
+            pairs,
+            client_windows,
+        }
     }
 
     /// Rewrite one stderr line. JSON lines (start with `{`) are parsed with
@@ -100,7 +106,10 @@ impl Rewriter {
             return None;
         }
         let mut pairs: Vec<(String, String)> = if dep {
-            self.pairs.iter().map(|(a, b)| (dep_escape(a), dep_escape(b))).collect()
+            self.pairs
+                .iter()
+                .map(|(a, b)| (dep_escape(a), dep_escape(b)))
+                .collect()
         } else {
             self.pairs.clone()
         };
@@ -113,7 +122,9 @@ impl Rewriter {
         let mut prev: Option<char> = None;
         let mut i = 0;
         while i < s.len() {
-            let Some(c) = s[i..].chars().next() else { break };
+            let Some(c) = s[i..].chars().next() else {
+                break;
+            };
             let rest = &s[i + c.len_utf8()..];
 
             // ANSI colour sequence: copy through, it separates tokens.
@@ -133,7 +144,11 @@ impl Rewriter {
             }
 
             // A match may be preceded by the verbatim marker `\\?\`.
-            let start = if c == '\\' && s[i..].starts_with(r"\\?\") { i + 4 } else { i };
+            let start = if c == '\\' && s[i..].starts_with(r"\\?\") {
+                i + 4
+            } else {
+                i
+            };
             if prev.is_none_or(|p| !p.is_alphanumeric()) {
                 let hit = pairs.iter().find_map(|(sb, cl)| {
                     let end = matches_at(s, start, sb)?;
@@ -200,7 +215,10 @@ pub fn artifact(line: &str) -> Option<(String, String)> {
     }
     let v: Value = serde_json::from_str(t).ok()?;
     let o = v.as_object()?;
-    Some((o.get("artifact")?.as_str()?.to_string(), o.get("emit")?.as_str()?.to_string()))
+    Some((
+        o.get("artifact")?.as_str()?.to_string(),
+        o.get("emit")?.as_str()?.to_string(),
+    ))
 }
 
 /// Names from `# env-dep:NAME` / `# env-dep:NAME=VALUE` lines of a dep-info file.
@@ -208,7 +226,13 @@ pub fn env_deps(dep_info: &str) -> Vec<String> {
     dep_info
         .lines()
         .filter_map(|l| l.strip_prefix("# env-dep:"))
-        .map(|rest| rest.trim_end_matches('\r').split('=').next().unwrap_or("").to_string())
+        .map(|rest| {
+            rest.trim_end_matches('\r')
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .to_string()
+        })
         .filter(|n| !n.is_empty())
         .collect()
 }
@@ -231,8 +255,14 @@ mod tests {
             r"  --> C:\proj\src\lib.rs:2:9"
         );
         // Token ends at `:digit`, whitespace, quotes, `)` and `,`; later slashes stay.
-        assert_eq!(r.text(r"E:\jobs\j1\root\C\a/b.rs:3 and 1/2"), r"C:\a\b.rs:3 and 1/2");
-        assert_eq!(r.text(r#"see "E:\jobs\j1\root\C\a/b" or a/b"#), r#"see "C:\a\b" or a/b"#);
+        assert_eq!(
+            r.text(r"E:\jobs\j1\root\C\a/b.rs:3 and 1/2"),
+            r"C:\a\b.rs:3 and 1/2"
+        );
+        assert_eq!(
+            r.text(r#"see "E:\jobs\j1\root\C\a/b" or a/b"#),
+            r#"see "C:\a\b" or a/b"#
+        );
         assert_eq!(r.text(r"(E:\jobs\j1\root\C\a/b), x/y"), r"(C:\a\b), x/y");
         assert_eq!(r.text(r"E:\jobs\j1\root\C\a/b, x/y"), r"C:\a\b, x/y");
     }
@@ -264,20 +294,29 @@ mod tests {
             ],
             true,
         );
-        assert_eq!(r.text(r"E:\j\root\UNC\srv\share\a/b.rs"), r"\\srv\share\a\b.rs");
+        assert_eq!(
+            r.text(r"E:\j\root\UNC\srv\share\a/b.rs"),
+            r"\\srv\share\a\b.rs"
+        );
         assert_eq!(r.text(r"E:\j\root\C\a/b.rs"), r"C:\a\b.rs");
     }
 
     #[test]
     fn posix_client_from_posix_peer() {
         let r = Rewriter::new(vec![("/data/jobs/j1/root/_".into(), "/".into())], false);
-        assert_eq!(r.text("--> /data/jobs/j1/root/_/home/me/src/lib.rs:1:1"), "--> /home/me/src/lib.rs:1:1");
+        assert_eq!(
+            r.text("--> /data/jobs/j1/root/_/home/me/src/lib.rs:1:1"),
+            "--> /home/me/src/lib.rs:1:1"
+        );
     }
 
     #[test]
     fn posix_client_from_windows_peer_converts_backslashes() {
         let r = Rewriter::new(vec![(r"E:\jobs\j1\root\_".into(), "/".into())], false);
-        assert_eq!(r.text(r"--> E:\jobs\j1\root\_\home\me\lib.rs:1:1"), "--> /home/me/lib.rs:1:1");
+        assert_eq!(
+            r.text(r"--> E:\jobs\j1\root\_\home\me\lib.rs:1:1"),
+            "--> /home/me/lib.rs:1:1"
+        );
     }
 
     // Shape of a real `--error-format=json --json=diagnostic-rendered-ansi` line.
@@ -314,11 +353,20 @@ mod tests {
         assert!(!out.contains("jobs"), "sandbox path left in: {out}");
         let v: Value = serde_json::from_str(&out).expect("still json");
         assert_eq!(v["spans"][0]["file_name"], r"C:\proj\src\lib.rs");
-        assert_eq!(v["children"][0]["spans"][0]["file_name"], r"C:\dep\src\lib.rs");
-        assert_eq!(v["children"][0]["message"], r"defined in C:\proj\src\lib.rs");
+        assert_eq!(
+            v["children"][0]["spans"][0]["file_name"],
+            r"C:\dep\src\lib.rs"
+        );
+        assert_eq!(
+            v["children"][0]["message"],
+            r"defined in C:\proj\src\lib.rs"
+        );
         let rendered = v["rendered"].as_str().expect("rendered");
         // ANSI escapes survive, the path after one is rewritten, slashes converted.
-        assert!(rendered.contains("\u{1b}[0mC:\\proj\\src\\lib.rs:2:9\u{1b}[0m"), "{rendered:?}");
+        assert!(
+            rendered.contains("\u{1b}[0mC:\\proj\\src\\lib.rs:2:9\u{1b}[0m"),
+            "{rendered:?}"
+        );
         // Numbers and nulls untouched.
         assert_eq!(v["spans"][0]["byte_start"], 10);
         assert!(v["code"]["explanation"].is_null());
@@ -353,7 +401,10 @@ mod tests {
             artifact(r#"{"artifact":"C:\\t\\libfoo-1.rmeta","emit":"metadata"}"#),
             Some((r"C:\t\libfoo-1.rmeta".to_string(), "metadata".to_string()))
         );
-        assert_eq!(artifact(r#"{"emit":"link","artifact":"/t/libfoo.rlib"}"#), Some(("/t/libfoo.rlib".into(), "link".into())));
+        assert_eq!(
+            artifact(r#"{"emit":"link","artifact":"/t/libfoo.rlib"}"#),
+            Some(("/t/libfoo.rlib".into(), "link".into()))
+        );
         assert_eq!(artifact(&json_diag()), None);
         assert_eq!(artifact("warning: x"), None);
         assert_eq!(artifact(r#"{"artifact":"x"}"#), None);

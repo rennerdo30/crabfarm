@@ -831,8 +831,16 @@ fn a_crate_that_reads_a_file_outside_its_package_is_never_served_stale() {
     let c = cache(&n.home);
     // `mac` has no proc macro of its own, so its result is kept; `user` runs
     // the macro, was never proven on a peer and is never kept.
-    assert_eq!((c.farm, c.stored), (0, 1), "{c:?}");
-    assert!(not_proven(&n.home) >= 1);
+    // (cargo runs rustc for `mac` twice, so `stored` counts it twice.)
+    assert_eq!(c.farm, 0, "{c:?}");
+    assert!(
+        c.stored >= 1 && c.local >= 2,
+        "mac is kept and served: {c:?}"
+    );
+    assert!(
+        not_proven(&n.home) >= 3,
+        "user ran three times and was never kept: {c:?}"
+    );
 }
 
 /// A crate that succeeded on a peer is proven hermetic: when it later builds

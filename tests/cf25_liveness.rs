@@ -180,6 +180,10 @@ async fn start_farm(
                                 let _ = conn.send(&Message::PeerList { peers: Vec::new() }).await;
                                 let _ = conn.send(&Message::StatusUpdate(status.clone())).await;
                             }
+                            // CF-30: cache questions travel on the control connection.
+                            Ok(Some(Message::CacheQuery { key })) => {
+                                let _ = conn.send(&Message::CacheMiss { key }).await;
+                            }
                             Ok(Some(Message::Reserve { job_id })) => {
                                 let _ = conn.send(&Message::Reserved { job_id }).await;
                                 let Ok(Some(Message::JobRequest { spec, .. })) = conn.recv().await

@@ -1084,7 +1084,15 @@ mod tests {
         // Not tool-affecting, and the point of `build_env`: still accepted.
         // `RUST_LOG` only makes rustc talk more (its output is diagnostics).
         // Build-script exports named after git data are plain strings.
-        for ok in ["CF_BUILT", "BUILD_ID", "RUST_LOG", "VERGEN_SHA", "GIT_HASH", "GIT_SHA", "GIT_COMMIT_DATE"] {
+        for ok in [
+            "CF_BUILT",
+            "BUILD_ID",
+            "RUST_LOG",
+            "VERGEN_SHA",
+            "GIT_HASH",
+            "GIT_SHA",
+            "GIT_COMMIT_DATE",
+        ] {
             assert!(build_env_name_ok(ok), "{ok}");
         }
     }

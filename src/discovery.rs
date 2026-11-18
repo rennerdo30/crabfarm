@@ -3,13 +3,101 @@
 
 use crate::proto::{NodeId, PROTO_VERSION, PeerInfo};
 use anyhow::Context;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 /// Gossip comes from farm members, but a buggy one must not grow the book
 /// without bound.
 const MAX_ADDRS_PER_PEER: usize = 16;
 const MAX_PEERS: usize = 1024;
 pub const MDNS_SERVICE: &str = "_crabfarm._tcp.local.";
+/// mDNS is unauthenticated multicast (the farm id in `f=` is readable by
+/// everyone on the LAN), so everything it feeds is bounded: the queue between
+/// the mDNS thread and the node, the candidates kept, and the connect rate.
+pub const MDNS_FOUND_QUEUE: usize = 64;
+pub const MAX_MDNS_CANDIDATES: usize = 64;
+/// One connection attempt per candidate per this long.
+pub const MDNS_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+/// New candidate connects per second, over all candidates.
+pub const MDNS_CONNECTS_PER_SEC: usize = 4;
+/// Addresses taken from one resolved service.
+const MAX_ADDRS_PER_SERVICE: usize = 8;
+
+struct Candidate {
+    instance: String,
+    addr: String,
+    /// A TLS handshake with this address proved a farm member.
+    verified: bool,
+}
+
+/// The mDNS-learned candidates this node keeps, deduplicated by
+/// (instance, addr) and capped. When full, a new candidate replaces the oldest
+/// one that never proved to be a farm member; if all are verified it is dropped.
+#[derive(Default)]
+pub struct CandidateSet {
+    entries: VecDeque<Candidate>,
+}
+
+impl CandidateSet {
+    /// True when (instance, addr) is kept after the call (already known or
+    /// newly added); false when it was dropped.
+    pub fn offer(&mut self, instance: &str, addr: &str) -> bool {
+        if self.entries.iter().any(|c| c.instance == instance && c.addr == addr) {
+            return true;
+        }
+        if self.entries.len() >= MAX_MDNS_CANDIDATES {
+            let Some(i) = self.entries.iter().position(|c| !c.verified) else { return false };
+            self.entries.remove(i);
+        }
+        self.entries.push_back(Candidate { instance: instance.to_string(), addr: addr.to_string(), verified: false });
+        true
+    }
+
+    pub fn mark_verified(&mut self, instance: &str, addr: &str) {
+        if let Some(c) = self.entries.iter_mut().find(|c| c.instance == instance && c.addr == addr) {
+            c.verified = true;
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Rate limit of connection attempts to mDNS candidates: one per candidate per
+/// [`MDNS_RETRY_INTERVAL`], at most [`MDNS_CONNECTS_PER_SEC`] per second overall.
+#[derive(Default)]
+pub struct ConnectLimiter {
+    last: HashMap<(String, String), Instant>,
+    recent: VecDeque<Instant>,
+}
+
+impl ConnectLimiter {
+    /// True when an attempt may start now; the attempt is then counted.
+    pub fn allow(&mut self, instance: &str, addr: &str, now: Instant) -> bool {
+        while self.recent.front().is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(1)) {
+            self.recent.pop_front();
+        }
+        let key = (instance.to_string(), addr.to_string());
+        if self.last.get(&key).is_some_and(|t| now.duration_since(*t) < MDNS_RETRY_INTERVAL) {
+            return false;
+        }
+        if self.recent.len() >= MDNS_CONNECTS_PER_SEC {
+            return false;
+        }
+        if self.last.len() >= 4 * MAX_MDNS_CANDIDATES {
+            self.last.retain(|_, t| now.duration_since(*t) < MDNS_RETRY_INTERVAL);
+        }
+        self.recent.push_back(now);
+        self.last.insert(key, now);
+        true
+    }
+}
 
 /// Known peers, persisted in `peers.toml`.
 #[derive(Default, Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -82,7 +170,8 @@ impl PeerBook {
 }
 
 /// mDNS advertisement + browsing for `_crabfarm._tcp.local.` filtered by
-/// short farm id. Found peers arrive on the channel as `(node id hex, addr)`.
+/// short farm id. Found peers arrive on the bounded channel as
+/// `(node id hex, addr)`; when it is full the event is dropped.
 pub struct Mdns {
     daemon: mdns_sd::ServiceDaemon,
     fullname: String,
@@ -93,7 +182,7 @@ impl Mdns {
         node_id: NodeId,
         short_farm_id: &str,
         port: u16,
-        found: tokio::sync::mpsc::UnboundedSender<(String, String)>,
+        found: tokio::sync::mpsc::Sender<(String, String)>,
     ) -> anyhow::Result<Mdns> {
         let daemon = mdns_sd::ServiceDaemon::new().context("start mDNS daemon")?;
         let own = node_id.to_hex();
@@ -131,14 +220,17 @@ impl Mdns {
                     if instance == own || instance.len() != 32 || !instance.bytes().all(|b| b.is_ascii_hexdigit()) {
                         continue;
                     }
-                    for ip in svc.get_addresses() {
+                    for ip in svc.get_addresses().iter().take(MAX_ADDRS_PER_SERVICE) {
                         let ip = ip.to_ip_addr();
                         let addr = match ip {
                             std::net::IpAddr::V4(v4) => format!("{v4}:{}", svc.get_port()),
                             std::net::IpAddr::V6(v6) => format!("[{v6}]:{}", svc.get_port()),
                         };
-                        if found.send((instance.to_string(), addr)).is_err() {
-                            return;
+                        match found.try_send((instance.to_string(), addr)) {
+                            Ok(()) => {}
+                            // Flooded or slow consumer: drop, never block or grow.
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
                         }
                     }
                 }
@@ -207,14 +299,68 @@ mod tests {
         assert!(PeerBook::load(dir.path()).is_err());
     }
 
+    #[test]
+    fn candidates_dedupe_and_cap() {
+        let mut c = CandidateSet::default();
+        assert!(c.offer("aa", "10.0.0.1:1"));
+        assert!(c.offer("aa", "10.0.0.1:1"));
+        assert_eq!(c.len(), 1, "same (instance, addr) is one candidate");
+        assert!(c.offer("aa", "10.0.0.2:1"));
+        assert_eq!(c.len(), 2, "same instance, other addr is another candidate");
+        // A flood of fake instances never grows the set past the cap.
+        for i in 0..10_000 {
+            c.offer(&format!("fake{i}"), "10.9.9.9:1");
+            assert!(c.len() <= MAX_MDNS_CANDIDATES);
+        }
+        assert_eq!(c.len(), MAX_MDNS_CANDIDATES);
+        // Verified members survive the flood; the flood replaces unverified ones.
+        let mut c = CandidateSet::default();
+        c.offer("real", "10.0.0.5:1");
+        c.mark_verified("real", "10.0.0.5:1");
+        for i in 0..1000 {
+            c.offer(&format!("fake{i}"), "10.9.9.9:1");
+        }
+        assert_eq!(c.len(), MAX_MDNS_CANDIDATES);
+        assert!(c.offer("real", "10.0.0.5:1") && c.len() == MAX_MDNS_CANDIDATES, "still known, not re-added");
+        // All verified and full: newcomers are dropped.
+        let mut full = CandidateSet::default();
+        for i in 0..MAX_MDNS_CANDIDATES {
+            full.offer(&format!("n{i}"), "a:1");
+            full.mark_verified(&format!("n{i}"), "a:1");
+        }
+        assert!(!full.offer("new", "a:1"));
+        assert_eq!(full.len(), MAX_MDNS_CANDIDATES);
+    }
+
+    #[test]
+    fn connect_limiter_per_candidate_and_global() {
+        let t0 = Instant::now();
+        let mut l = ConnectLimiter::default();
+        assert!(l.allow("a", "x:1", t0));
+        assert!(!l.allow("a", "x:1", t0 + Duration::from_secs(29)), "same candidate within 30 s");
+        assert!(l.allow("a", "x:1", t0 + Duration::from_secs(30)), "after 30 s again");
+        // Global: four new candidates per second.
+        let mut l = ConnectLimiter::default();
+        let ok = (0..10).filter(|i| l.allow(&format!("c{i}"), "x:1", t0)).count();
+        assert_eq!(ok, MDNS_CONNECTS_PER_SEC);
+        // A refused attempt does not burn the candidate's own slot.
+        assert!(l.allow("c9", "x:1", t0 + Duration::from_secs(1)));
+        // The per-candidate memory stays bounded.
+        let mut l = ConnectLimiter::default();
+        for i in 0..5000u64 {
+            l.allow(&format!("z{i}"), "x:1", t0 + Duration::from_secs(40 * i));
+        }
+        assert!(l.last.len() <= 4 * MAX_MDNS_CANDIDATES + 1);
+    }
+
     /// Needs working multicast on the machine; run by hand:
     /// `cargo test mdns_smoke -- --ignored`.
     #[tokio::test]
     #[ignore = "needs multicast"]
     async fn mdns_smoke() {
-        let (tx_a, mut rx_a) = tokio::sync::mpsc::unbounded_channel();
-        let (tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel();
-        let (tx_c, mut rx_c) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::channel(MDNS_FOUND_QUEUE);
+        let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(MDNS_FOUND_QUEUE);
+        let (tx_c, mut rx_c) = tokio::sync::mpsc::channel(MDNS_FOUND_QUEUE);
         let a = Mdns::start(NodeId([0xaa; 16]), "farm0000000000000000000000000001", 41001, tx_a).unwrap();
         let b = Mdns::start(NodeId([0xbb; 16]), "farm0000000000000000000000000001", 41002, tx_b).unwrap();
         // Same network, other farm: must be invisible to a and b.

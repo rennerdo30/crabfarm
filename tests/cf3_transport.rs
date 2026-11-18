@@ -295,7 +295,7 @@ async fn client_without_certificate_is_refused_unless_it_joins() {
 
     // A JoinRequest is the one frame allowed without a certificate (bad token here).
     let mut conn = raw_client(pinned, &l.addr).await.unwrap();
-    let req = Message::JoinRequest { token: [1; 16], node_name: "x".into(), node_id: NodeId([4; 16]), public_key: vec![0; 32] };
+    let req = Message::JoinRequest { token: [1; 16], node_name: "x".into(), public_key: vec![0; 32] };
     conn.send(&req).await.unwrap();
     assert_eq!(l.next().await, Ok("join"));
     assert!(matches!(within(conn.recv()).await.unwrap(), Some(Message::Error { .. })));

@@ -16,13 +16,17 @@ use std::io::Write;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 const MAGIC: &[u8; 4] = b"CFB1";
 const NONCE_LEN: usize = 24;
-/// Largest blob the `Assembler` accepts (DESIGN section 8 caps a job at 256 MiB
-/// of inputs; this is the hard ceiling against a misbehaving peer).
-pub const MAX_BLOB_BYTES: u64 = 1024 * 1024 * 1024;
+/// Largest blob the `Assembler` accepts: the DESIGN section 8 cap of 256 MiB.
+pub const MAX_BLOB_BYTES: u64 = 256 * 1024 * 1024;
+/// Concurrent assemblers (blobs in flight) and bytes held by them, per node
+/// (per process: one node runs per process).
+pub const MAX_ASSEMBLERS: usize = 64;
+pub const MAX_ASSEMBLER_BYTES: u64 = 1024 * 1024 * 1024;
 /// Temp files older than this are leftovers of a crash and are deleted by `evict`.
 const STALE_TMP: Duration = Duration::from_secs(24 * 3600);
 
@@ -251,21 +255,81 @@ fn compress(data: &[u8]) -> Vec<u8> {
     zstd::bulk::compress(data, 3).unwrap_or_else(|_| zstd::bulk::compress(data, 1).unwrap_or_default())
 }
 
-/// Reassembles chunks of one blob; verifies the hash at the end.
+/// Node-wide limit on blobs being reassembled. A peer opens an assembler by
+/// sending a first chunk, so without it one connection could hold unbounded
+/// memory by starting many blobs (or many connections could add up).
+pub struct AssemblyBudget {
+    max_blobs: usize,
+    max_bytes: u64,
+    blobs: AtomicUsize,
+    bytes: AtomicU64,
+}
+
+impl AssemblyBudget {
+    pub const fn new(max_blobs: usize, max_bytes: u64) -> AssemblyBudget {
+        AssemblyBudget { max_blobs, max_bytes, blobs: AtomicUsize::new(0), bytes: AtomicU64::new(0) }
+    }
+
+    fn acquire_blob(&self) -> bool {
+        self.blobs.try_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < self.max_blobs).then_some(n + 1)).is_ok()
+    }
+
+    fn acquire_bytes(&self, n: u64) -> bool {
+        self.bytes.try_update(Ordering::AcqRel, Ordering::Acquire, |b| b.checked_add(n).filter(|t| *t <= self.max_bytes)).is_ok()
+    }
+
+    /// Blobs and bytes currently held (tests and diagnostics).
+    pub fn in_flight(&self) -> (usize, u64) {
+        (self.blobs.load(Ordering::Acquire), self.bytes.load(Ordering::Acquire))
+    }
+}
+
+static NODE_BUDGET: AssemblyBudget = AssemblyBudget::new(MAX_ASSEMBLERS, MAX_ASSEMBLER_BYTES);
+
+/// Reassembles chunks of one blob; verifies the hash at the end. Every
+/// assembler counts against [`AssemblyBudget`] from its first chunk until it
+/// finishes or is dropped.
 pub struct Assembler {
     hash: Option<BlobHash>,
     buf: Vec<u8>,
     done: bool,
     limit: u64,
+    budget: &'static AssemblyBudget,
+    /// Registered with the budget (holds one blob slot).
+    counted: bool,
+    /// Bytes reserved in the budget.
+    held: u64,
 }
 
 impl Default for Assembler {
     fn default() -> Self {
-        Assembler { hash: None, buf: Vec::new(), done: false, limit: MAX_BLOB_BYTES }
+        Assembler::with_budget(&NODE_BUDGET)
+    }
+}
+
+impl Drop for Assembler {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
 impl Assembler {
+    /// An assembler drawing on `budget` instead of the node-wide one.
+    pub fn with_budget(budget: &'static AssemblyBudget) -> Assembler {
+        Assembler { hash: None, buf: Vec::new(), done: false, limit: MAX_BLOB_BYTES, budget, counted: false, held: 0 }
+    }
+
+    fn release(&mut self) {
+        if self.held > 0 {
+            self.budget.bytes.fetch_sub(self.held, Ordering::AcqRel);
+            self.held = 0;
+        }
+        if self.counted {
+            self.budget.blobs.fetch_sub(1, Ordering::AcqRel);
+            self.counted = false;
+        }
+    }
+
     /// Feed one chunk; returns the full plaintext when `last` and verified.
     /// Chunks must arrive in order (`offset` equals the bytes received so far).
     pub fn push(&mut self, hash: &BlobHash, offset: u64, last: bool, data: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
@@ -282,15 +346,33 @@ impl Assembler {
         }
         // Bounded decompression: a chunk can never legitimately exceed CHUNK_SIZE.
         let plain = zstd::bulk::decompress(data, CHUNK_SIZE).context("decompress chunk")?;
+        // `chunks()` cuts every blob at CHUNK_SIZE, so only the last chunk may be
+        // shorter; many tiny chunks would otherwise be a cheap way to inflate
+        // frame and bookkeeping overhead.
+        if !last && plain.len() != CHUNK_SIZE {
+            bail!("short non-final chunk for {hash:?} ({} bytes)", plain.len());
+        }
         if self.buf.len() as u64 + plain.len() as u64 > self.limit {
             bail!("blob {hash:?} exceeds {} bytes", self.limit);
         }
+        if !self.counted {
+            if !self.budget.acquire_blob() {
+                bail!("too many blobs in flight on this node");
+            }
+            self.counted = true;
+        }
+        if !self.budget.acquire_bytes(plain.len() as u64) {
+            bail!("too many blob bytes in flight on this node");
+        }
+        self.held += plain.len() as u64;
         self.buf.extend_from_slice(&plain);
         if !last {
             return Ok(None);
         }
         self.done = true;
         let out = std::mem::take(&mut self.buf);
+        // The caller owns the plaintext now; the slot is free for the next blob.
+        self.release();
         if BlobHash::of(&out) != *hash {
             bail!("blob hash mismatch after assembly ({hash:?})");
         }
@@ -494,14 +576,66 @@ mod tests {
         let mut a = Assembler::default();
         assert!(a.push(&BlobHash::of(&big), 0, true, &comp).is_err(), "chunk above CHUNK_SIZE");
 
-        // Same guard as the 1 GiB cap, with a small limit so the test is cheap.
-        let data = vec![3u8; 3000];
+        // Same guard as the 256 MiB cap, with a small limit so the test is cheap.
+        let data = vec![3u8; 3 * CHUNK_SIZE];
         let h = BlobHash::of(&data);
-        let comp = zstd::bulk::compress(&data[..1000], 3).unwrap();
-        let mut a = Assembler { limit: 2500, ..Assembler::default() };
+        let comp = zstd::bulk::compress(&data[..CHUNK_SIZE], 3).unwrap();
+        let mut a = Assembler::default();
+        a.limit = 2 * CHUNK_SIZE as u64 + 10;
         assert!(a.push(&h, 0, false, &comp).unwrap().is_none());
-        assert!(a.push(&h, 1000, false, &comp).unwrap().is_none());
-        assert!(a.push(&h, 2000, false, &comp).is_err(), "total above limit");
+        assert!(a.push(&h, CHUNK_SIZE as u64, false, &comp).unwrap().is_none());
+        assert!(a.push(&h, 2 * CHUNK_SIZE as u64, false, &comp).is_err(), "total above limit");
+    }
+
+    #[test]
+    fn blob_limit_is_the_design_cap() {
+        assert_eq!(MAX_BLOB_BYTES, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn assembler_rejects_short_non_final_chunk() {
+        let data = vec![4u8; 2 * CHUNK_SIZE];
+        let h = BlobHash::of(&data);
+        let short = zstd::bulk::compress(&data[..1000], 3).unwrap();
+        let mut a = Assembler::default();
+        assert!(a.push(&h, 0, false, &short).is_err(), "short chunk that is not the last");
+        // A short final chunk is normal.
+        let tail = vec![4u8; 1000];
+        let mut a = Assembler::default();
+        assert!(a.push(&BlobHash::of(&tail), 0, true, &short).unwrap().is_some());
+    }
+
+    #[test]
+    fn assembly_budget_caps_blobs_and_bytes_and_releases() {
+        static BLOBS: AssemblyBudget = AssemblyBudget::new(2, u64::MAX);
+        let chunk = |n: u8| {
+            let d = vec![n; CHUNK_SIZE];
+            (BlobHash::of(&d), zstd::bulk::compress(&d, 1).unwrap())
+        };
+        let (h1, c1) = chunk(1);
+        let (h2, c2) = chunk(2);
+        let (h3, c3) = chunk(3);
+        let (mut a, mut b, mut c) = (Assembler::with_budget(&BLOBS), Assembler::with_budget(&BLOBS), Assembler::with_budget(&BLOBS));
+        a.push(&h1, 0, false, &c1).unwrap();
+        b.push(&h2, 0, false, &c2).unwrap();
+        assert!(c.push(&h3, 0, false, &c3).is_err(), "third concurrent blob refused");
+        assert_eq!(BLOBS.in_flight().0, 2);
+        drop(a);
+        assert!(c.push(&h3, 0, false, &c3).is_ok(), "slot freed by drop");
+        drop((b, c));
+        assert_eq!(BLOBS.in_flight(), (0, 0));
+
+        // Bytes: room for one and a half chunks.
+        static BYTES: AssemblyBudget = AssemblyBudget::new(10, CHUNK_SIZE as u64 + CHUNK_SIZE as u64 / 2);
+        let (mut a, mut b) = (Assembler::with_budget(&BYTES), Assembler::with_budget(&BYTES));
+        a.push(&h1, 0, false, &c1).unwrap();
+        assert!(b.push(&h2, 0, false, &c2).is_err(), "second chunk exceeds the byte budget");
+        // A finished blob returns its bytes and its slot.
+        let small = vec![9u8; 10];
+        let mut f = Assembler::with_budget(&BYTES);
+        f.push(&BlobHash::of(&small), 0, true, &zstd::bulk::compress(&small, 1).unwrap()).unwrap().unwrap();
+        drop((a, b, f));
+        assert_eq!(BYTES.in_flight(), (0, 0));
     }
 
     #[test]

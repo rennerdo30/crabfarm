@@ -336,12 +336,19 @@ pub fn load(data_dir: &Path) -> anyhow::Result<Option<Identity>> {
 // ---------------------------------------------------------------- join code
 
 /// A parsed join code `cf1-<token>-<fp>@<host>:<port>`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct JoinCode {
     pub token: [u8; 16],
     /// First 16 bytes of SHA-256 of the inviter's node cert DER.
     pub cert_fp: [u8; 16],
     pub addr: String,
+}
+
+/// The token is a bearer secret: `{:?}` must not print it.
+impl std::fmt::Debug for JoinCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinCode").field("token", &"<redacted>").field("cert_fp", &b32(&self.cert_fp)).field("addr", &self.addr).finish()
+    }
 }
 
 fn b32(bytes: &[u8]) -> String {
@@ -392,9 +399,9 @@ struct InviteFile {
 /// Pending invites held by the inviting node in memory (and in
 /// `farm/invites.toml` so `crabfarm farm invite` can talk to a running node:
 /// the CLI writes the invite file, the node reads it on each join attempt).
-/// Read-modify-write is atomic per file replace; two processes redeeming the
-/// same token at the same instant could both succeed, which needs the
-/// 128-bit token and is accepted for P1 (the node serializes its own joins).
+/// Every load-modify-save runs under an exclusive lock on `invites.lock`, so
+/// the CLI (`issue`) and the node (`redeem`) never lose each other's update and
+/// a token cannot be redeemed twice by racing processes.
 #[derive(Default)]
 pub struct Invites {
     entries: Vec<InviteEntry>,
@@ -402,6 +409,43 @@ pub struct Invites {
 
 fn invite_path(data_dir: &Path) -> PathBuf {
     data_dir.join("farm").join("invites.toml")
+}
+
+/// Exclusive advisory lock on `farm/invites.lock`, released on drop (or when
+/// the process dies). Waits up to 10 s: the critical section is a tiny file
+/// read and replace.
+struct InviteLock(std::fs::File);
+
+impl InviteLock {
+    fn acquire(data_dir: &Path) -> anyhow::Result<InviteLock> {
+        let path = data_dir.join("farm").join("invites.lock");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(InviteLock(file)),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    ensure!(std::time::Instant::now() < deadline, "timed out waiting for the invite lock");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(e).context("lock invites"),
+            }
+        }
+    }
+}
+
+impl Drop for InviteLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 fn token_hash(token: &[u8; 16]) -> [u8; 32] {
@@ -439,6 +483,7 @@ impl Invites {
     }
 
     pub(crate) fn issue_at(&mut self, data_dir: &Path, now: u64) -> anyhow::Result<[u8; 16]> {
+        let _lock = InviteLock::acquire(data_dir)?;
         self.reload(data_dir, now)?;
         ensure!(self.entries.len() < MAX_PENDING_INVITES, "too many pending invites");
         let token: [u8; 16] = random_bytes();
@@ -453,6 +498,7 @@ impl Invites {
     }
 
     pub(crate) fn redeem_at(&mut self, data_dir: &Path, token: &[u8; 16], now: u64) -> anyhow::Result<bool> {
+        let _lock = InviteLock::acquire(data_dir)?;
         self.reload(data_dir, now)?;
         let want = hex(&token_hash(token));
         // Compare against every entry without early exit so timing does not
@@ -476,22 +522,30 @@ impl Invites {
 /// Returns `JoinAccepted`, or an `Error` message (deliberately uniform for
 /// bad/used/expired tokens so the answer is no oracle).
 pub fn handle_join(id: &Identity, invites: &mut Invites, data_dir: &Path, request: &Message) -> anyhow::Result<Message> {
-    let Message::JoinRequest { token, node_name, node_id, public_key } = request else {
+    let Message::JoinRequest { token, node_name, public_key } = request else {
         return Ok(Message::Error { message: "expected a join request".into() });
     };
     if id.ca_key_der.is_none() {
         return Ok(Message::Error { message: "this node cannot sign certificates".into() });
     }
     // Validate the request shape before burning the single-use token.
-    if validate_node_name(node_name).is_err() || public_key.len() != 32 || *node_id == id.node_id {
+    if validate_node_name(node_name).is_err() || public_key.len() != 32 {
         return Ok(Message::Error { message: "invalid join request".into() });
     }
     if !invites.redeem(data_dir, token)? {
         return Ok(Message::Error { message: "invalid or expired invite".into() });
     }
-    let node_cert_der = sign_node_cert(id, node_name, *node_id, public_key)?;
     let known_peers = crate::discovery::PeerBook::load(data_dir)?.peers;
-    Ok(Message::JoinAccepted { node_cert_der, ca_cert_der: id.ca_cert_der.clone(), known_peers })
+    // The CA picks the id: a joiner must not be able to ask for a certificate
+    // carrying an existing member's id.
+    let node_id = loop {
+        let candidate = NodeId(random_bytes());
+        if candidate != id.node_id && !known_peers.iter().any(|p| p.node_id == candidate) {
+            break candidate;
+        }
+    };
+    let node_cert_der = sign_node_cert(id, node_name, node_id, public_key)?;
+    Ok(Message::JoinAccepted { node_id, node_cert_der, ca_cert_der: id.ca_cert_der.clone(), known_peers })
 }
 
 // ---------------------------------------------------------------- join: joiner
@@ -544,7 +598,6 @@ pub async fn join(data_dir: &Path, node_name: &str, code: &JoinCode) -> anyhow::
     ensure!(!p.node_crt.exists() && !p.ca_crt.exists(), "this machine already has a farm identity in {}", data_dir.display());
 
     let node_kp = KeyPair::generate_for(&PKCS_ED25519)?;
-    let node_id = NodeId(random_bytes());
     let cfg = crate::transport::join_client_config(code.cert_fp)?;
     let connect = async {
         let tcp = tokio::net::TcpStream::connect(&code.addr).await.with_context(|| format!("connect to {}", code.addr))?;
@@ -565,14 +618,15 @@ pub async fn join(data_dir: &Path, node_name: &str, code: &JoinCode) -> anyhow::
     conn.send(&Message::JoinRequest {
         token: code.token,
         node_name: node_name.to_string(),
-        node_id,
         public_key: node_kp.public_key_raw().to_vec(),
     })
     .await?;
     let reply = tokio::time::timeout(Duration::from_secs(10), conn.recv()).await.context("join reply timed out")??;
-    let (node_cert_der, ca_cert_der, mut known_peers) = match reply {
-        Some(Message::JoinAccepted { node_cert_der, ca_cert_der, known_peers }) => (node_cert_der, ca_cert_der, known_peers),
-        Some(Message::Error { message }) => bail!("join refused: {message}"),
+    let (node_id, node_cert_der, ca_cert_der, mut known_peers) = match reply {
+        Some(Message::JoinAccepted { node_id, node_cert_der, ca_cert_der, known_peers }) => {
+            (node_id, node_cert_der, ca_cert_der, known_peers)
+        }
+        Some(Message::Error { message }) => bail!("join refused: {}", crate::proto::log_safe(&message)),
         Some(_) => bail!("unexpected reply to join request (this node speaks protocol {PROTO_VERSION})"),
         None => bail!("inviter closed the connection"),
     };
@@ -702,6 +756,50 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_issue_and_redeem_lose_no_update() {
+        // CLI-style issuers and node-style redeemers on one data dir, each with
+        // its own `Invites` (as separate processes have). Without the lock a
+        // load-modify-save pair overwrites the other's change.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        const THREADS: usize = 4;
+        const EACH: usize = 6;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let mut inv = Invites::default();
+                    (0..EACH).map(|_| inv.issue(&path).unwrap()).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let tokens: Vec<[u8; 16]> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        assert_eq!(tokens.len(), THREADS * EACH);
+        assert_eq!(Invites::load(&path).unwrap().entries.len(), tokens.len(), "an issue was lost");
+        // Racing redeemers: every token redeems exactly once overall.
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let (path, tokens) = (path.clone(), tokens.clone());
+                std::thread::spawn(move || {
+                    let mut inv = Invites::default();
+                    tokens.iter().filter(|t| inv.redeem(&path, t).unwrap()).count()
+                })
+            })
+            .collect();
+        let won: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(won, tokens.len(), "each token must redeem exactly once");
+        assert!(Invites::load(&path).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn join_code_debug_hides_the_token() {
+        let c = JoinCode { token: [7; 16], cert_fp: [0xab; 16], addr: "h:1".into() };
+        let dbg = format!("{c:?}");
+        assert!(!dbg.contains(&b32(&c.token)) && !dbg.contains("[7"), "{dbg}");
+        assert!(dbg.contains("h:1") && dbg.contains("redacted"));
+    }
+
+    #[test]
     fn invite_token_expires() {
         let dir = tempfile::tempdir().unwrap();
         let mut inv = Invites::default();
@@ -733,7 +831,6 @@ mod tests {
         let req = |token: [u8; 16], pk: Vec<u8>, name: &str| Message::JoinRequest {
             token,
             node_name: name.into(),
-            node_id: NodeId([9; 16]),
             public_key: pk,
         };
         // Bad key length / name are refused and do not burn the token.
@@ -742,11 +839,12 @@ mod tests {
         }
         // A joined node (no CA key) cannot sign even with a valid token.
         let t = inv.issue(a.path()).unwrap();
-        let Message::JoinAccepted { node_cert_der, ca_cert_der, .. } = handle_join(&ca_node, &mut inv, a.path(), &req(t, pk.clone(), "beta")).unwrap()
+        let Message::JoinAccepted { node_id, node_cert_der, ca_cert_der, .. } =
+            handle_join(&ca_node, &mut inv, a.path(), &req(t, pk.clone(), "beta")).unwrap()
         else {
             panic!("expected JoinAccepted")
         };
-        let joined = install_join_response(b.path(), "beta", NodeId([9; 16]), &kp, node_cert_der, ca_cert_der).unwrap();
+        let joined = install_join_response(b.path(), "beta", node_id, &kp, node_cert_der, ca_cert_der).unwrap();
         let t = inv.issue(b.path()).unwrap();
         let reply = handle_join(&joined, &mut inv, b.path(), &req(t, pk.clone(), "gamma")).unwrap();
         assert!(matches!(reply, Message::Error { .. }));
@@ -755,10 +853,30 @@ mod tests {
         assert!(matches!(ok, Message::JoinAccepted { .. }));
         // Not a join request at all.
         assert!(matches!(handle_join(&ca_node, &mut inv, a.path(), &Message::Started).unwrap(), Message::Error { .. }));
-        // A joiner claiming the inviter's own node id is refused.
-        let t = inv.issue(a.path()).unwrap();
-        let clash = Message::JoinRequest { token: t, node_name: "x".into(), node_id: ca_node.node_id, public_key: pk };
-        assert!(matches!(handle_join(&ca_node, &mut inv, a.path(), &clash).unwrap(), Message::Error { .. }));
+    }
+
+    #[test]
+    fn ca_chooses_the_node_id() {
+        let a = tempfile::tempdir().unwrap();
+        let ca_node = create(a.path(), "ca").unwrap();
+        let mut inv = Invites::default();
+        let kp = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+        let mut seen = Vec::new();
+        for i in 0..3 {
+            let token = inv.issue(a.path()).unwrap();
+            let req = Message::JoinRequest { token, node_name: format!("n{i}"), public_key: kp.public_key_raw().to_vec() };
+            let Message::JoinAccepted { node_id, node_cert_der, .. } = handle_join(&ca_node, &mut inv, a.path(), &req).unwrap() else {
+                panic!("expected JoinAccepted")
+            };
+            // The certificate carries exactly the id the CA reported, and it is
+            // nobody else's: not the CA's, not an earlier joiner's, not a value
+            // a joiner could have predicted (the old requests used [9; 16]).
+            assert_eq!(node_id_from_cert(&node_cert_der).unwrap(), node_id);
+            assert_ne!(node_id, ca_node.node_id);
+            assert_ne!(node_id, NodeId([9; 16]));
+            assert!(!seen.contains(&node_id));
+            seen.push(node_id);
+        }
     }
 
     #[test]

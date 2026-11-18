@@ -515,6 +515,39 @@ pub fn env_name_eq(a: &str, b: &str) -> bool {
     }
 }
 
+/// Variables that change what git does (repository location, config,
+/// helpers it runs, transport, tracing). `up` is upper-case.
+fn is_git_control_var(up: &str) -> bool {
+    const PREFIXES: &[&str] = &["GIT_CONFIG", "GIT_SSH", "GIT_SSL", "GIT_TRACE", "GIT_HTTP"];
+    const NAMES: &[&str] = &[
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+        "GIT_EXEC_PATH",
+        "GIT_ASKPASS",
+        "GIT_EDITOR",
+        "GIT_PAGER",
+        "GIT_SEQUENCE_EDITOR",
+        "GIT_PROXY_COMMAND",
+        "GIT_TEMPLATE_DIR",
+        "GIT_TERMINAL_PROMPT",
+        "GIT_ALLOW_PROTOCOL",
+        "GIT_PROTOCOL_FROM_USER",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_DIFF_OPTS",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_OPTIONAL_LOCKS",
+    ];
+    PREFIXES.iter().any(|p| up.starts_with(p)) || NAMES.contains(&up)
+}
+
 /// True when `name` is a variable the farm must never accept, even when the
 /// submitter lists it: it changes which program runs or how it is loaded, or
 /// belongs to the machine (search path, loader, wrappers, temp and home dirs).
@@ -533,7 +566,10 @@ fn never_forward(name: &str) -> bool {
         // network behaviour they change (CF-25). `RUST_LOG` is not here: it only
         // makes rustc print more, which the submitter treats as diagnostics.
         || up.starts_with("SSL_")
-        || up.starts_with("GIT_")
+        // git's own variables (git(1) "ENVIRONMENT VARIABLES"), not every
+        // `GIT_` name: build scripts commonly export `GIT_HASH`/`GIT_SHA`
+        // for `env!`, and those only become a string in the crate.
+        || is_git_control_var(&up)
         || up.starts_with("SSH_")
         || up.starts_with("PYTHON")
         || up.starts_with("PERL5")
@@ -1029,6 +1065,10 @@ mod tests {
             "SSL_CERT_FILE",
             "GIT_DIR",
             "GIT_SSH_COMMAND",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_KEY_0",
+            "GIT_ASKPASS",
+            "git_exec_path",
             "SSH_AUTH_SOCK",
             "PYTHONPATH",
             "PERL5LIB",
@@ -1043,7 +1083,8 @@ mod tests {
         }
         // Not tool-affecting, and the point of `build_env`: still accepted.
         // `RUST_LOG` only makes rustc talk more (its output is diagnostics).
-        for ok in ["CF_BUILT", "BUILD_ID", "RUST_LOG", "VERGEN_SHA"] {
+        // Build-script exports named after git data are plain strings.
+        for ok in ["CF_BUILT", "BUILD_ID", "RUST_LOG", "VERGEN_SHA", "GIT_HASH", "GIT_SHA", "GIT_COMMIT_DATE"] {
             assert!(build_env_name_ok(ok), "{ok}");
         }
     }

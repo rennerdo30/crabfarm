@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.svg" alt="crabfarm" width="160"></p>
+
 # crabfarm
 
 [![ci](https://github.com/rennerdo30/crabfarm/actions/workflows/ci.yml/badge.svg)](https://github.com/rennerdo30/crabfarm/actions/workflows/ci.yml)

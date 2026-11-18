@@ -1,62 +1,75 @@
-# Writes assets/crabfarm.ico (16, 24, 32, 48, 64 and 256 px, PNG entries) by
-# drawing the same crab as website/favicon.svg with System.Drawing, so the
-# installer icon matches the website. Windows only; the result is committed,
-# run this only to change the artwork.
+# Writes assets/crabfarm.ico (16, 24, 32, 48, 64 and 256 px, PNG entries)
+# from assets/logo.svg, so the installer icon is the same artwork as the
+# website and README. The SVG is rendered once at 512 px by headless Microsoft
+# Edge (transparent background) and scaled down with high-quality resampling.
+# Windows only; the result is committed, run this only to change the artwork.
 #   scripts\make-icon.ps1
 [CmdletBinding()]
-param([string]$Output = (Join-Path (Split-Path -Parent $PSScriptRoot) 'assets/crabfarm.ico'))
+param(
+    [string]$Svg = (Join-Path (Split-Path -Parent $PSScriptRoot) 'assets/logo.svg'),
+    [string]$Output = (Join-Path (Split-Path -Parent $PSScriptRoot) 'assets/crabfarm.ico')
+)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 $sizes = 16, 24, 32, 48, 64, 256
+$master = 512
 
-function New-CrabPng([int]$size) {
-    $bmp = [Drawing.Bitmap]::new($size, $size, [Drawing.Imaging.PixelFormat]::Format32bppArgb)
-    $g = [Drawing.Graphics]::FromImage($bmp)
-    $g.SmoothingMode = 'AntiAlias'
-    $g.Clear([Drawing.Color]::Transparent)
-    $k = $size / 32.0
-    function P([double]$x, [double]$y) { [Drawing.PointF]::new([single]($x * $k), [single]($y * $k)) }
-    # Rounded square, radius 7 of 32.
-    $r = 7 * $k; $d = 2 * $r; $s = [double]$size
-    $bg = [Drawing.Drawing2D.GraphicsPath]::new()
-    $bg.AddArc(0, 0, $d, $d, 180, 90); $bg.AddArc($s - $d, 0, $d, $d, 270, 90)
-    $bg.AddArc($s - $d, $s - $d, $d, $d, 0, 90); $bg.AddArc(0, $s - $d, $d, $d, 90, 90)
-    $bg.CloseFigure()
-    $g.FillPath([Drawing.SolidBrush]::new([Drawing.ColorTranslator]::FromHtml('#b8420f')), $bg)
-    $pen = [Drawing.Pen]::new([Drawing.Color]::White, [single](2.4 * $k))
-    $pen.StartCap = 'Round'; $pen.EndCap = 'Round'; $pen.LineJoin = 'Round'
-    foreach ($m in 1, -1) {
-        $x = { param($v) if ($m -eq 1) { $v } else { 32 - $v } }
-        $claw = [Drawing.Drawing2D.GraphicsPath]::new()
-        $claw.AddBezier((P (& $x 9) 12.5), (P (& $x 5.8) 11.9), (P (& $x 4) 9.5), (P (& $x 4.6) 6.5))
-        $g.DrawPath($pen, $claw)
-        $claw2 = [Drawing.Drawing2D.GraphicsPath]::new()
-        $claw2.AddBezier((P (& $x 4.6) 6.5), (P (& $x 7.2) 6.6), (P (& $x 9.1) 8.4), (P (& $x 9.5) 10.9))
-        $g.DrawPath($pen, $claw2)
-        $g.DrawLine($pen, (P (& $x 12.5) 24.5), (P (& $x 10.5) 27.5))
-        $g.FillEllipse([Drawing.Brushes]::White, [single]((& $x 13.2) * $k - 1.3 * $k), [single](17.5 * $k - 1.3 * $k), [single](2.6 * $k), [single](2.6 * $k))
+$edge = @(
+    "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
+    "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe"
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $edge) { throw 'Microsoft Edge not found; it renders the SVG.' }
+
+$work = Join-Path ([IO.Path]::GetTempPath()) ("crabfarm-icon-" + [guid]::NewGuid().ToString('n'))
+New-Item -ItemType Directory -Path $work | Out-Null
+try {
+    $svgUri = ([Uri](Resolve-Path $Svg).Path).AbsoluteUri
+    $html = Join-Path $work 'icon.html'
+    Set-Content -Path $html -Encoding utf8 -Value "<!doctype html><html><body style='margin:0;background:transparent'><img src='$svgUri' width='$master' height='$master' style='display:block'></body></html>"
+    $png = Join-Path $work 'master.png'
+    $args = @('--headless=new', '--disable-gpu', '--hide-scrollbars', '--default-background-color=00000000',
+              "--user-data-dir=$(Join-Path $work 'profile')", "--window-size=$master,$master",
+              "--screenshot=$png", ([Uri]$html).AbsoluteUri)
+    # Only this Edge process (recorded by its handle) is ever stopped.
+    $p = Start-Process -FilePath $edge -ArgumentList $args -PassThru -WindowStyle Hidden
+    if (-not $p.WaitForExit(60000)) { $p.Kill(); throw 'Edge did not finish rendering within 60 s.' }
+    if (-not (Test-Path $png)) { throw 'Edge produced no screenshot.' }
+
+    $src = [Drawing.Bitmap]::FromFile($png)
+    $entries = foreach ($s in $sizes) {
+        $bmp = [Drawing.Bitmap]::new($s, $s, [Drawing.Imaging.PixelFormat]::Format32bppArgb)
+        $g = [Drawing.Graphics]::FromImage($bmp)
+        $g.InterpolationMode = 'HighQualityBicubic'
+        $g.PixelOffsetMode = 'HighQuality'
+        $g.SmoothingMode = 'AntiAlias'
+        $g.Clear([Drawing.Color]::Transparent)
+        $g.DrawImage($src, 0, 0, $s, $s)
+        $g.Dispose()
+        $ms = [IO.MemoryStream]::new()
+        $bmp.Save($ms, [Drawing.Imaging.ImageFormat]::Png)
+        $bmp.Dispose()
+        , @($s, $ms.ToArray())
     }
-    $g.DrawEllipse($pen, [single](8 * $k), [single](13 * $k), [single](16 * $k), [single](11 * $k))
-    $ms = [IO.MemoryStream]::new()
-    $bmp.Save($ms, [Drawing.Imaging.ImageFormat]::Png)
-    $g.Dispose(); $bmp.Dispose()
-    , $ms.ToArray()
-}
+    $src.Dispose()
 
-$entries = foreach ($size in $sizes) { , (New-CrabPng $size) }
-$ms = [IO.MemoryStream]::new()
-$w = [IO.BinaryWriter]::new($ms)
-$w.Write([uint16]0); $w.Write([uint16]1); $w.Write([uint16]$sizes.Count)
-$offset = 6 + 16 * $sizes.Count
-for ($i = 0; $i -lt $sizes.Count; $i++) {
-    $dim = if ($sizes[$i] -ge 256) { 0 } else { $sizes[$i] }
-    $w.Write([byte]$dim); $w.Write([byte]$dim); $w.Write([byte]0); $w.Write([byte]0)
-    $w.Write([uint16]1); $w.Write([uint16]32)
-    $w.Write([uint32]$entries[$i].Length); $w.Write([uint32]$offset)
-    $offset += $entries[$i].Length
+    # ICONDIR + ICONDIRENTRY table + PNG payloads.
+    $out = [IO.MemoryStream]::new()
+    $w = [IO.BinaryWriter]::new($out)
+    $w.Write([uint16]0); $w.Write([uint16]1); $w.Write([uint16]$entries.Count)
+    $offset = 6 + 16 * $entries.Count
+    foreach ($e in $entries) {
+        $s = $e[0]; $data = $e[1]
+        $dim = if ($s -ge 256) { 0 } else { $s }
+        $w.Write([byte]$dim); $w.Write([byte]$dim); $w.Write([byte]0); $w.Write([byte]0)
+        $w.Write([uint16]1); $w.Write([uint16]32)
+        $w.Write([uint32]$data.Length); $w.Write([uint32]$offset)
+        $offset += $data.Length
+    }
+    foreach ($e in $entries) { $w.Write([byte[]]$e[1]) }
+    $w.Flush()
+    [IO.File]::WriteAllBytes($Output, $out.ToArray())
+    Write-Host "wrote $Output ($($sizes -join ', ') px)"
 }
-foreach ($bytes in $entries) { $w.Write($bytes) }
-$w.Flush()
-New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Output) | Out-Null
-[IO.File]::WriteAllBytes($Output, $ms.ToArray())
-Write-Host "Wrote $Output ($($ms.Length) bytes)"
+finally {
+    Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+}

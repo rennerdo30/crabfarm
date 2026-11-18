@@ -12,14 +12,14 @@
 # package name and the installer text change, the binaries still report the
 # Cargo.toml version, and Cargo.toml itself is never touched.
 #
-# NSIS 3.13 (zlib licence, a build tool, not shipped): scripts/fetch-nsis.ps1
-# downloads the pinned portable ZIP; on the owner PC it is already at
-# E:/Development/_cache/tools/nsis-3.13/makensis.exe. Without -BinDir the
-# release build runs first.
+# NSIS 3.13 (zlib licence, a build tool, not shipped): pass -MakeNsis or set
+# CRABFARM_MAKENSIS to a makensis.exe; without either, scripts/fetch-nsis.ps1
+# downloads the pinned portable ZIP into the repository-ignored artifacts/
+# cache. Without -BinDir the release build runs first.
 [CmdletBinding()]
 param(
     [string]$Version,
-    [string]$MakeNsis = $(if ($env:CRABFARM_MAKENSIS) { $env:CRABFARM_MAKENSIS } else { 'E:/Development/_cache/tools/nsis-3.13/makensis.exe' }),
+    [string]$MakeNsis = $env:CRABFARM_MAKENSIS,
     [string]$BinDir,
     [int]$Jobs = 6
 )
@@ -30,8 +30,19 @@ if ($toml -notmatch '(?m)^\[package\][\s\S]*?^version\s*=\s*"([^"]+)"') { throw 
 if (!$Version) { $Version = $Matches[1] }
 if ($Version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?$') { throw "Unexpected version: $Version" }
 $numeric = "$($Matches[1]).$($Matches[2]).$($Matches[3]).0"
+if (!$MakeNsis) {
+    # No machine-specific default: fetch the pinned, checksum-verified NSIS into
+    # the ignored artifacts/ cache (once; later runs reuse it).
+    $cache = Join-Path $root 'artifacts/tools'
+    $cached = Join-Path $cache 'nsis-3.13/makensis.exe'
+    if (!(Test-Path -LiteralPath $cached -PathType Leaf)) {
+        Write-Host "No -MakeNsis or CRABFARM_MAKENSIS: fetching the pinned NSIS into $cache"
+        & (Join-Path $PSScriptRoot 'fetch-nsis.ps1') -Destination $cache | Out-Null
+    }
+    $MakeNsis = $cached
+}
 if (!(Test-Path -LiteralPath $MakeNsis -PathType Leaf)) {
-    throw "NSIS compiler not found at '$MakeNsis'. Run scripts/fetch-nsis.ps1 -Destination <folder> and pass -MakeNsis."
+    throw "NSIS compiler not found at '$MakeNsis'. Pass -MakeNsis, set CRABFARM_MAKENSIS, or run scripts/fetch-nsis.ps1 -Destination <folder>."
 }
 Write-Host "crabfarm $Version from commit $(& git -C $root rev-parse --short HEAD)"
 
@@ -66,7 +77,7 @@ if (!$BinDir) {
     $meta = Invoke-Bounded $cargo @('metadata', '--format-version', '1', '--no-deps') 120 | ConvertFrom-Json
     $BinDir = Join-Path $meta.target_directory 'release'
 }
-foreach ($exe in 'crabfarm.exe', 'crabfarmd.exe') {
+foreach ($exe in 'crabfarm.exe', 'crabfarmd.exe', 'cargo-crabfarm.exe') {
     if (!(Test-Path -LiteralPath (Join-Path $BinDir $exe) -PathType Leaf)) { throw "Missing $exe in $BinDir" }
 }
 
@@ -77,6 +88,7 @@ New-Item -ItemType Directory -Path $stage | Out-Null
 try {
     Copy-Item -LiteralPath (Join-Path $BinDir 'crabfarm.exe') -Destination $stage
     Copy-Item -LiteralPath (Join-Path $BinDir 'crabfarmd.exe') -Destination $stage
+    Copy-Item -LiteralPath (Join-Path $BinDir 'cargo-crabfarm.exe') -Destination $stage
     Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $stage 'LICENSE.txt')
     Copy-Item -LiteralPath (Join-Path $root 'docs/GETTING-STARTED.md') -Destination $stage
     Copy-Item -LiteralPath (Join-Path $root 'assets/crabfarm.ico') -Destination $stage

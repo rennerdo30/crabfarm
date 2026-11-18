@@ -298,6 +298,10 @@ Section "Uninstall"
     DetailPrint "crabfarm path remove: $0"
   ${EndIf}
   StrCpy $Remaining ""
+  ; Leftovers of updates that were in use at the time.
+  Delete "$INSTDIR\crabfarm.exe.old*"
+  Delete "$INSTDIR\crabfarmd.exe.old*"
+  Delete "$INSTDIR\cargo-crabfarm.exe.old*"
   Delete "$INSTDIR\crabfarm.ico"
   Delete "$INSTDIR\LICENSE.txt"
   Delete "$INSTDIR\GETTING-STARTED.md"

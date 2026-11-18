@@ -88,6 +88,8 @@ impl Node {
             exec::run(&ctx, &spec2, &toolchain, etx, cancel2).await
         });
 
+        // rustc may be silent for long; the job timeout bounds this phase.
+        link.set_idle(None);
         let mut peer_gone = false;
         let mut exit_code: Option<i32> = None;
         loop {

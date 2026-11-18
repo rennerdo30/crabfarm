@@ -185,7 +185,7 @@ pub enum LocalReason {
     LocalSlotFree,
 }
 
-#[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub enum Message {
     // ---- every connection ----
     Hello {
@@ -316,4 +316,178 @@ pub enum Message {
     RetryLocal {
         reason: LocalReason,
     },
+}
+
+/// Escape and truncate (200 characters) a string that came from a peer before
+/// it goes into a log line or an error text: control characters such as
+/// newlines or ANSI escapes must not forge log lines or garble a terminal.
+pub fn log_safe(s: &str) -> String {
+    const MAX: usize = 200;
+    let mut out: String = s.chars().take(MAX).flat_map(char::escape_debug).collect();
+    if s.chars().nth(MAX).is_some() {
+        out.push_str("...");
+    }
+    out
+}
+
+struct Redacted;
+
+impl std::fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// Byte buffers print as their length only.
+struct Len(usize);
+
+impl std::fmt::Debug for Len {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{} bytes>", self.0)
+    }
+}
+
+/// A job spec without its environment values and argument contents.
+struct SpecSummary<'a>(&'a JobSpec);
+
+impl std::fmt::Debug for SpecSummary<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = self.0;
+        f.debug_struct("JobSpec")
+            .field("job_id", &s.job_id)
+            .field("crate_name", &s.crate_name)
+            .field("toolchain", &s.toolchain)
+            .field("target", &s.target)
+            .field("args", &s.args.len())
+            .field("env", &s.env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>())
+            .field("inputs", &s.inputs.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Hand-written so that tokens, keys and environment values can never reach a
+/// log line through `{:?}`; every other variant stays readable. Peer-supplied
+/// text is escaped and truncated.
+impl std::fmt::Debug for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Message::Hello { proto, node_id, node_name, host_triple, crabfarm_version } => f
+                .debug_struct("Hello")
+                .field("proto", proto)
+                .field("node_id", node_id)
+                .field("node_name", &log_safe(node_name))
+                .field("host_triple", &log_safe(host_triple))
+                .field("crabfarm_version", &log_safe(crabfarm_version))
+                .finish(),
+            Message::Error { message } => f.debug_struct("Error").field("message", &log_safe(message)).finish(),
+            Message::JoinRequest { node_name, public_key, .. } => f
+                .debug_struct("JoinRequest")
+                .field("token", &Redacted)
+                .field("node_name", &log_safe(node_name))
+                .field("public_key", &Len(public_key.len()))
+                .finish(),
+            Message::JoinAccepted { node_id, node_cert_der, ca_cert_der, known_peers } => f
+                .debug_struct("JoinAccepted")
+                .field("node_id", node_id)
+                .field("node_cert_der", &Len(node_cert_der.len()))
+                .field("ca_cert_der", &Len(ca_cert_der.len()))
+                .field("known_peers", &known_peers.len())
+                .finish(),
+            Message::PeerList { peers } => f.debug_struct("PeerList").field("peers", &peers.len()).finish(),
+            Message::StatusUpdate(s) => f.debug_tuple("StatusUpdate").field(&s.node_id).finish(),
+            Message::Reserve { job_id } => f.debug_struct("Reserve").field("job_id", job_id).finish(),
+            Message::Reserved { job_id } => f.debug_struct("Reserved").field("job_id", job_id).finish(),
+            Message::Busy { job_id } => f.debug_struct("Busy").field("job_id", job_id).finish(),
+            Message::JobRequest { spec, .. } => {
+                f.debug_struct("JobRequest").field("spec", &SpecSummary(spec)).field("blob_key", &Redacted).finish()
+            }
+            Message::NeedBlobs { hashes } => f.debug_struct("NeedBlobs").field("hashes", &hashes.len()).finish(),
+            Message::BlobChunk { hash, offset, last, data } => f
+                .debug_struct("BlobChunk")
+                .field("hash", hash)
+                .field("offset", offset)
+                .field("last", last)
+                .field("data", &Len(data.len()))
+                .finish(),
+            Message::Started => f.write_str("Started"),
+            Message::Stderr { line } => f.debug_struct("Stderr").field("line", &log_safe(line)).finish(),
+            Message::Stdout { line } => f.debug_struct("Stdout").field("line", &log_safe(line)).finish(),
+            Message::Output { path, hash, size } => {
+                f.debug_struct("Output").field("path", path).field("hash", hash).field("size", size).finish()
+            }
+            Message::Exit { code } => f.debug_struct("Exit").field("code", code).finish(),
+            Message::Cancel => f.write_str("Cancel"),
+            Message::IpcAuth { .. } => f.debug_struct("IpcAuth").field("token", &Redacted).finish(),
+            Message::Submit { spec, rustc, produces, externs, input, search_dirs, link_libs } => f
+                .debug_struct("Submit")
+                .field("spec", &SpecSummary(spec))
+                .field("rustc", rustc)
+                .field("produces", &produces.len())
+                .field("externs", &externs.len())
+                .field("input", input)
+                .field("search_dirs", &search_dirs.len())
+                .field("link_libs", &link_libs.len())
+                .finish(),
+            Message::RunLocal { reason } => f.debug_struct("RunLocal").field("reason", reason).finish(),
+            Message::LocalDone { code, produces } => {
+                f.debug_struct("LocalDone").field("code", code).field("produces", &produces.len()).finish()
+            }
+            Message::QueryStatus => f.write_str("QueryStatus"),
+            Message::FarmStatus { local, peers, counters } => f
+                .debug_struct("FarmStatus")
+                .field("local", &local.node_id)
+                .field("peers", &peers.len())
+                .field("counters", &counters.len())
+                .finish(),
+            Message::RetryLocal { reason } => f.debug_struct("RetryLocal").field("reason", reason).finish(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_secrets_and_keeps_the_rest_readable() {
+        let join = format!("{:?}", Message::JoinRequest { token: [0xAB; 16], node_name: "beta".into(), public_key: vec![9; 32] });
+        assert!(!join.contains("171") && !join.contains("ab"), "{join}");
+        assert!(join.contains("beta") && join.contains("redacted"));
+        let ipc = format!("{:?}", Message::IpcAuth { token: [200; 32] });
+        assert!(!ipc.contains("200"), "{ipc}");
+        let mut key = [0u8; 32];
+        key[0] = 77;
+        key[31] = 88;
+        let spec = JobSpec {
+            job_id: JobId([1; 16]),
+            toolchain: ToolchainId { release: "1.100.0".into(), commit_hash: "h".into(), commit_date: "d".into(), host: "x".into() },
+            target: "t".into(),
+            args: vec![],
+            cwd: ClientPath { style: PathStyle::Posix, path: "/".into() },
+            env: vec![("SECRET_VAR".into(), EnvValue::Plain("hunter2".into()))],
+            inputs: vec![],
+            dirs: vec![],
+            out_dir: ClientPath { style: PathStyle::Posix, path: "/o".into() },
+            crate_name: "mycrate".into(),
+            no_retain: false,
+            needs_host: false,
+        };
+        let job = format!("{:?}", Message::JobRequest { spec, blob_key: key });
+        assert!(!job.contains("hunter2") && !job.contains("77") && !job.contains("88"), "{job}");
+        assert!(job.contains("mycrate") && job.contains("SECRET_VAR"));
+        // Other variants stay readable.
+        assert_eq!(format!("{:?}", Message::Exit { code: 3 }), "Exit { code: 3 }");
+        assert_eq!(format!("{:?}", Message::Started), "Started");
+    }
+
+    #[test]
+    fn peer_text_is_escaped_and_truncated() {
+        assert_eq!(log_safe("a\nb\x1b[31m"), "a\\nb\\u{1b}[31m");
+        let long = "x".repeat(500);
+        let out = log_safe(&long);
+        assert_eq!(out.len(), 203);
+        assert!(out.ends_with("..."));
+        let e = format!("{:?}", Message::Error { message: format!("{long}\nFORGED") });
+        assert!(e.len() < 260 && !e.contains("FORGED"), "{e}");
+    }
 }

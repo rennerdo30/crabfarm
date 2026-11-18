@@ -336,12 +336,19 @@ pub fn load(data_dir: &Path) -> anyhow::Result<Option<Identity>> {
 // ---------------------------------------------------------------- join code
 
 /// A parsed join code `cf1-<token>-<fp>@<host>:<port>`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct JoinCode {
     pub token: [u8; 16],
     /// First 16 bytes of SHA-256 of the inviter's node cert DER.
     pub cert_fp: [u8; 16],
     pub addr: String,
+}
+
+/// The token is a bearer secret: `{:?}` must not print it.
+impl std::fmt::Debug for JoinCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinCode").field("token", &"<redacted>").field("cert_fp", &b32(&self.cert_fp)).field("addr", &self.addr).finish()
+    }
 }
 
 fn b32(bytes: &[u8]) -> String {
@@ -392,9 +399,9 @@ struct InviteFile {
 /// Pending invites held by the inviting node in memory (and in
 /// `farm/invites.toml` so `crabfarm farm invite` can talk to a running node:
 /// the CLI writes the invite file, the node reads it on each join attempt).
-/// Read-modify-write is atomic per file replace; two processes redeeming the
-/// same token at the same instant could both succeed, which needs the
-/// 128-bit token and is accepted for P1 (the node serializes its own joins).
+/// Every load-modify-save runs under an exclusive lock on `invites.lock`, so
+/// the CLI (`issue`) and the node (`redeem`) never lose each other's update and
+/// a token cannot be redeemed twice by racing processes.
 #[derive(Default)]
 pub struct Invites {
     entries: Vec<InviteEntry>,
@@ -402,6 +409,43 @@ pub struct Invites {
 
 fn invite_path(data_dir: &Path) -> PathBuf {
     data_dir.join("farm").join("invites.toml")
+}
+
+/// Exclusive advisory lock on `farm/invites.lock`, released on drop (or when
+/// the process dies). Waits up to 10 s: the critical section is a tiny file
+/// read and replace.
+struct InviteLock(std::fs::File);
+
+impl InviteLock {
+    fn acquire(data_dir: &Path) -> anyhow::Result<InviteLock> {
+        let path = data_dir.join("farm").join("invites.lock");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(InviteLock(file)),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    ensure!(std::time::Instant::now() < deadline, "timed out waiting for the invite lock");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(e).context("lock invites"),
+            }
+        }
+    }
+}
+
+impl Drop for InviteLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 fn token_hash(token: &[u8; 16]) -> [u8; 32] {
@@ -439,6 +483,7 @@ impl Invites {
     }
 
     pub(crate) fn issue_at(&mut self, data_dir: &Path, now: u64) -> anyhow::Result<[u8; 16]> {
+        let _lock = InviteLock::acquire(data_dir)?;
         self.reload(data_dir, now)?;
         ensure!(self.entries.len() < MAX_PENDING_INVITES, "too many pending invites");
         let token: [u8; 16] = random_bytes();
@@ -453,6 +498,7 @@ impl Invites {
     }
 
     pub(crate) fn redeem_at(&mut self, data_dir: &Path, token: &[u8; 16], now: u64) -> anyhow::Result<bool> {
+        let _lock = InviteLock::acquire(data_dir)?;
         self.reload(data_dir, now)?;
         let want = hex(&token_hash(token));
         // Compare against every entry without early exit so timing does not
@@ -580,7 +626,7 @@ pub async fn join(data_dir: &Path, node_name: &str, code: &JoinCode) -> anyhow::
         Some(Message::JoinAccepted { node_id, node_cert_der, ca_cert_der, known_peers }) => {
             (node_id, node_cert_der, ca_cert_der, known_peers)
         }
-        Some(Message::Error { message }) => bail!("join refused: {message}"),
+        Some(Message::Error { message }) => bail!("join refused: {}", crate::proto::log_safe(&message)),
         Some(_) => bail!("unexpected reply to join request (this node speaks protocol {PROTO_VERSION})"),
         None => bail!("inviter closed the connection"),
     };
@@ -707,6 +753,50 @@ mod tests {
         assert!(node.redeem(dir.path(), &t).unwrap());
         assert!(!node.redeem(dir.path(), &t).unwrap(), "reused token");
         assert!(!Invites::load(dir.path()).unwrap().redeem(dir.path(), &t).unwrap(), "reuse across processes");
+    }
+
+    #[test]
+    fn concurrent_issue_and_redeem_lose_no_update() {
+        // CLI-style issuers and node-style redeemers on one data dir, each with
+        // its own `Invites` (as separate processes have). Without the lock a
+        // load-modify-save pair overwrites the other's change.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        const THREADS: usize = 4;
+        const EACH: usize = 6;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let mut inv = Invites::default();
+                    (0..EACH).map(|_| inv.issue(&path).unwrap()).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let tokens: Vec<[u8; 16]> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        assert_eq!(tokens.len(), THREADS * EACH);
+        assert_eq!(Invites::load(&path).unwrap().entries.len(), tokens.len(), "an issue was lost");
+        // Racing redeemers: every token redeems exactly once overall.
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let (path, tokens) = (path.clone(), tokens.clone());
+                std::thread::spawn(move || {
+                    let mut inv = Invites::default();
+                    tokens.iter().filter(|t| inv.redeem(&path, t).unwrap()).count()
+                })
+            })
+            .collect();
+        let won: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(won, tokens.len(), "each token must redeem exactly once");
+        assert!(Invites::load(&path).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn join_code_debug_hides_the_token() {
+        let c = JoinCode { token: [7; 16], cert_fp: [0xab; 16], addr: "h:1".into() };
+        let dbg = format!("{c:?}");
+        assert!(!dbg.contains(&b32(&c.token)) && !dbg.contains("[7"), "{dbg}");
+        assert!(dbg.contains("h:1") && dbg.contains("redacted"));
     }
 
     #[test]

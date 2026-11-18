@@ -507,7 +507,7 @@ impl Node {
                     wrapper.send(Message::Exit { code }).await.ok();
                     return Ok(RemoteEnd::Done);
                 }
-                Message::Error { message } => bail!("peer reported: {message}"),
+                Message::Error { message } => bail!("peer reported: {}", crate::proto::log_safe(&message)),
                 _ => bail!("unexpected message from the peer"),
             }
         }

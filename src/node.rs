@@ -27,13 +27,46 @@ use tokio_util::sync::CancellationToken;
 /// Status push interval while either side has work, and otherwise.
 const STATUS_BUSY: Duration = Duration::from_secs(1);
 const STATUS_IDLE: Duration = Duration::from_secs(10);
-/// A control connection that stayed silent this long is dead.
-const CONTROL_SILENCE: Duration = Duration::from_secs(40);
+/// A control connection with no frame (status included) for this long is dead.
+const CONTROL_SILENCE: Duration = Duration::from_secs(60);
+/// A job connection with no frame in either direction for this long is closed
+/// (the executor lifts it while rustc runs; the job timeout bounds that).
+const JOB_IDLE: Duration = Duration::from_secs(600);
+/// Inbound connections served at once, and of those the ones that have not yet
+/// proved to be a farm member (TLS and first frame pending, or a join).
+const MAX_INBOUND: usize = 256;
+const MAX_UNAUTHENTICATED: usize = 8;
 /// How long an inbound connection may take to say what it is.
 const FIRST_MESSAGE: Duration = Duration::from_secs(10);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Cap for the per-peer set of blobs known to be on the peer.
 pub const MAX_SENT_HASHES: usize = 200_000;
+
+/// Caps on inbound connections, so a flood of connects (or of slow handshakes)
+/// cannot exhaust tasks and memory. Excess connections are dropped at accept.
+pub struct InboundLimits {
+    all: Arc<Semaphore>,
+    unauthenticated: Arc<Semaphore>,
+}
+
+/// Held for the life of an inbound connection; `unauthenticated` is dropped as
+/// soon as the peer proved it is a farm member.
+pub struct InboundPermit {
+    _all: tokio::sync::OwnedSemaphorePermit,
+    pub unauthenticated: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl InboundLimits {
+    pub fn new(max_all: usize, max_unauthenticated: usize) -> InboundLimits {
+        InboundLimits { all: Arc::new(Semaphore::new(max_all)), unauthenticated: Arc::new(Semaphore::new(max_unauthenticated)) }
+    }
+
+    pub fn admit(&self) -> Option<InboundPermit> {
+        let all = self.all.clone().try_acquire_owned().ok()?;
+        let unauth = self.unauthenticated.clone().try_acquire_owned().ok()?;
+        Some(InboundPermit { _all: all, unauthenticated: Some(unauth) })
+    }
+}
 
 pub fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -95,6 +128,7 @@ pub struct Node {
     status_tx: watch::Sender<u64>,
     pub shutdown: CancellationToken,
     pub listen_addr: SocketAddr,
+    inbound: InboundLimits,
 }
 
 pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -261,7 +295,7 @@ impl Node {
         e.info.node_name = name.to_string();
         e.info.last_seen = unix_now();
         e.host_triple = host.to_string();
-        tracing::info!(peer = name, "peer connected");
+        tracing::info!(peer = crate::proto::log_safe(name).as_str(), "peer connected");
     }
 
     fn peer_disconnected(&self, id: NodeId) {
@@ -270,7 +304,7 @@ impl Node {
             e.conns = e.conns.saturating_sub(1);
             if e.conns == 0 {
                 e.status = None;
-                tracing::info!(peer = e.info.node_name.as_str(), "peer disconnected");
+                tracing::info!(peer = crate::proto::log_safe(&e.info.node_name).as_str(), "peer disconnected");
             }
         }
     }
@@ -475,9 +509,13 @@ impl Node {
                 _ = self.shutdown.cancelled() => return,
                 acc = listener.accept() => {
                     let Ok((tcp, _)) = acc else { continue };
+                    let Some(permit) = self.inbound.admit() else {
+                        tracing::debug!("inbound connection refused: too many connections");
+                        continue;
+                    };
                     let node = self.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = node.handle_inbound(tcp).await {
+                        if let Err(e) = node.handle_inbound(tcp, permit).await {
                             tracing::debug!("inbound connection: {e:#}");
                         }
                     });
@@ -486,8 +524,9 @@ impl Node {
         }
     }
 
-    async fn handle_inbound(self: Arc<Self>, tcp: tokio::net::TcpStream) -> anyhow::Result<()> {
+    async fn handle_inbound(self: Arc<Self>, tcp: tokio::net::TcpStream, mut permit: InboundPermit) -> anyhow::Result<()> {
         match transport::accept(&self.tls, &self.id, tcp).await? {
+            // The join keeps its unauthenticated slot until the reply is sent.
             Accepted::Join { request, mut conn } => {
                 let reply = {
                     let mut invites = lock(&self.invites);
@@ -500,7 +539,8 @@ impl Node {
                 Ok(())
             }
             Accepted::Peer { node_id, hello, conn } => {
-                let mut link = Link::new(conn);
+                permit.unauthenticated = None;
+                let mut link = Link::new_with_idle(conn, Some(JOB_IDLE));
                 let first = tokio::time::timeout(FIRST_MESSAGE, link.recv()).await.context("peer sent nothing after Hello")?;
                 match first {
                     Some(Message::Reserve { job_id }) => {
@@ -508,6 +548,7 @@ impl Node {
                         Ok(())
                     }
                     Some(m @ (Message::PeerList { .. } | Message::StatusUpdate(_))) => {
+                        link.set_idle(Some(CONTROL_SILENCE));
                         self.run_control(node_id, hello, link, Some(m)).await;
                         Ok(())
                     }
@@ -701,6 +742,7 @@ pub async fn run(data_dir: PathBuf, shutdown: CancellationToken) -> anyhow::Resu
         status_tx,
         shutdown: shutdown.clone(),
         listen_addr,
+        inbound: InboundLimits::new(MAX_INBOUND, MAX_UNAUTHENTICATED),
         host_triple,
         tls,
         id,
@@ -771,4 +813,36 @@ pub async fn run(data_dir: PathBuf, shutdown: CancellationToken) -> anyhow::Resu
     let n = node.clone();
     let _ = tokio::task::spawn_blocking(move || n.persist()).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inbound_limits_cap_total_and_unauthenticated() {
+        let l = InboundLimits::new(5, 2);
+        let a = l.admit().unwrap();
+        let b = l.admit().unwrap();
+        assert!(l.admit().is_none(), "third unauthenticated connection refused");
+        // Authenticating frees the unauthenticated slot but keeps the connection slot.
+        let mut a = a;
+        a.unauthenticated = None;
+        let c = l.admit().unwrap();
+        assert!(l.admit().is_none());
+        drop((b, c));
+        assert!(l.admit().is_some(), "dropped connections free their slots");
+
+        // The total cap: authenticated connections still count.
+        let l = InboundLimits::new(3, 8);
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            let mut p = l.admit().unwrap();
+            p.unauthenticated = None;
+            held.push(p);
+        }
+        assert!(l.admit().is_none(), "total cap reached");
+        held.pop();
+        assert!(l.admit().is_some());
+    }
 }

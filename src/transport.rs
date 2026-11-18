@@ -282,7 +282,7 @@ pub async fn connect(tls: &TlsContext, id: &Identity, addr: &str) -> anyhow::Res
         .context("peer closed or refused the connection")?;
     let hello = match first {
         Some(h @ Message::Hello { .. }) => h,
-        Some(Message::Error { message }) => bail!("peer refused: {message}"),
+        Some(Message::Error { message }) => bail!("peer refused: {}", crate::proto::log_safe(&message)),
         Some(_) => bail!("peer did not start with Hello"),
         None => bail!("peer closed the connection before Hello"),
     };

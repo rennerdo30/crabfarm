@@ -20,7 +20,7 @@ From a clean checkout of `main` that matches `origin/main`:
 Set the public commit identity in the environment first (`GIT_AUTHOR_*` and `GIT_COMMITTER_*`; the script never writes Git config and refuses anything but a GitHub noreply address).
 
 The script:
-1. refuses a dirty tree, a branch other than `main`, a `main` that differs from `origin/main`, an existing tag, a version that does not go up, and an empty `## Unreleased` section in `CHANGELOG.md`;
+1. refuses a dirty tree, a branch other than `main`, a `main` that differs from `origin/main`, an existing tag, a version that does not go up, an empty `## Unreleased` section in `CHANGELOG.md`, an `origin` that is not `https://github.com/rennerdo30/crabfarm`, and an author or committer identity (`git var GIT_AUTHOR_IDENT`, `GIT_COMMITTER_IDENT`) that is not a GitHub noreply address;
 2. sets the version in `Cargo.toml` and `Cargo.lock`;
 3. moves the Unreleased notes into a `## X.Y.Z` section;
 4. runs `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings` and `cargo test --locked` (`-SkipTests` skips the last; CI runs it again), and restores the edited files if a check fails;

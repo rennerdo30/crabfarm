@@ -6,8 +6,10 @@
 .DESCRIPTION
     Run from a clean checkout of main that matches origin/main. The script
       1. refuses a dirty tree, a branch other than main, a main that differs
-         from origin/main, an existing tag, a version that does not go up, and
-         an empty "Unreleased" changelog section;
+         from origin/main, an existing tag, a version that does not go up, an
+         empty "Unreleased" changelog section, an origin that is not
+         https://github.com/rennerdo30/crabfarm, and an author or committer
+         identity that is not a GitHub noreply address;
       2. sets the version in Cargo.toml and Cargo.lock;
       3. moves the "Unreleased" notes of CHANGELOG.md into a "## X.Y.Z" section;
       4. runs cargo fmt --check, clippy and the tests (unless -SkipTests);
@@ -57,6 +59,11 @@ function Invoke-Git {
 }
 
 # --- Preconditions -----------------------------------------------------------
+# Check the remote before the first network call and before anything is pushed.
+$originUrl = (Invoke-Git remote get-url origin).Trim()
+if ($originUrl -notmatch '^https://github\.com/rennerdo30/crabfarm(\.git)?$') {
+    Fail "origin is '$originUrl', not https://github.com/rennerdo30/crabfarm (a release is pushed only to the public repository)."
+}
 Invoke-Git fetch origin --quiet | Out-Null
 
 if (Invoke-Git status --porcelain) { Fail 'The working tree is not clean (commit or remove changes first).' }
@@ -71,9 +78,13 @@ if ($head -ne $remote) { Fail "HEAD ($($head.Substring(0,7))) is not origin/main
 if (Invoke-Git tag --list $tag) { Fail "Tag $tag already exists locally." }
 if (Invoke-Git ls-remote --tags origin "refs/tags/$tag") { Fail "Tag $tag already exists on origin." }
 
+# The commit (author) and the annotated tag (committer) both carry an identity.
 $ident = (Invoke-Git var GIT_AUTHOR_IDENT).Trim()
-if ($ident -notmatch '<[^>]*@users\.noreply\.github\.com>') {
-    Fail 'The commit identity is not a public GitHub noreply address (set GIT_AUTHOR_* and GIT_COMMITTER_* in the environment; this script never writes Git config).'
+$committer = (Invoke-Git var GIT_COMMITTER_IDENT).Trim()
+foreach ($who in @(@('author', $ident), @('committer', $committer))) {
+    if ($who[1] -notmatch '<[^>]*@users\.noreply\.github\.com>') {
+        Fail "The $($who[0]) identity is not a public GitHub noreply address (set GIT_AUTHOR_* and GIT_COMMITTER_* in the environment; this script never writes Git config)."
+    }
 }
 
 # --- Versions and changelog (in memory first) --------------------------------

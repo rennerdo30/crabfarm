@@ -66,7 +66,49 @@ pub fn classify(args: &[String], opts: &ClassifyOptions) -> Classified {
 
 /// Render structured args to strings, using `map` for each client path
 /// (identity rendering for a local run, sandbox mapping on a peer).
+///
+/// `classify` always emits `--remap-path-prefix` as its own `Plain` argument
+/// followed by one `RemapFrom` holding the value, which renders to
+/// `<mapped FROM>=<TO>`.
 pub fn render_args(args: &[Arg], map: &dyn Fn(&ClientPath) -> String) -> Vec<String> {
-    let _ = (args, map);
-    todo!("package A")
+    args.iter()
+        .map(|a| match a {
+            Arg::Plain(s) => s.clone(),
+            Arg::Path(p) => map(p),
+            Arg::PrefixedPath { prefix, path } => format!("{prefix}{}", map(path)),
+            Arg::RemapFrom { from, to } => format!("{}={to}", map(from)),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    #[test]
+    fn render_maps_every_path_variant() {
+        let p = |s: &str| ClientPath::parse(PathStyle::Windows, s).expect("path");
+        let args = vec![
+            Arg::Plain("--crate-name".into()),
+            Arg::Plain("foo".into()),
+            Arg::Path(p(r"C:\a\lib.rs")),
+            Arg::PrefixedPath { prefix: "--out-dir=".into(), path: p(r"C:\a\out") },
+            Arg::PrefixedPath { prefix: "foo=".into(), path: p(r"C:\a\libfoo.rlib") },
+            Arg::Plain("--remap-path-prefix".into()),
+            Arg::RemapFrom { from: p(r"C:\a"), to: "/x".into() },
+        ];
+        let out = render_args(&args, &|c| format!("<{}>", c.path));
+        assert_eq!(
+            out,
+            vec![
+                "--crate-name",
+                "foo",
+                r"<C:\a\lib.rs>",
+                r"--out-dir=<C:\a\out>",
+                r"foo=<C:\a\libfoo.rlib>",
+                "--remap-path-prefix",
+                r"<C:\a>=/x",
+            ]
+        );
+    }
 }

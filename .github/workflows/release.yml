@@ -1,0 +1,141 @@
+name: release
+
+# A version tag builds every package and attaches them to a DRAFT GitHub
+# release. Publishing the draft is the owner's yes (docs/RELEASING.md);
+# nothing here publishes. A tag with "-" (0.2.0-beta.1) becomes a prerelease.
+# The crates.io upload is a separate manual workflow (publish-crate.yml).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing version tag to build (vX.Y.Z or vX.Y.Z-pre.N)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every target builds natively on a GitHub-hosted runner; nothing is
+        # cross-compiled. macos-15-intel is the last Intel Mac label GitHub
+        # offers for free; when it goes (announced for 2027), build
+        # x86_64-apple-darwin on macos-latest with `rustup target add`.
+        include:
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, ext: zip }
+          - { target: aarch64-pc-windows-msvc, os: windows-11-arm, ext: zip }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04, ext: tar.gz }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, ext: tar.gz }
+          - { target: x86_64-apple-darwin, os: macos-15-intel, ext: tar.gz }
+          - { target: aarch64-apple-darwin, os: macos-latest, ext: tar.gz }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - name: Tag matches the crate version
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          if [ "$RELEASE_TAG" != "v$version" ]; then
+            echo "Tag $RELEASE_TAG does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+      # rust-toolchain.toml pins the toolchain; this installs it. No sccache
+      # here: tag builds are rare and must not depend on a cache service.
+      - run: rustup show active-toolchain
+      - name: Release build and test
+        run: |
+          cargo build --release --locked
+          cargo test --release --locked
+      - name: Stage package
+        run: |
+          set -euo pipefail
+          v="${RELEASE_TAG#v}"
+          dir="crabfarm-$v-${{ matrix.target }}"
+          target=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+          exe=crabfarm
+          case "${{ matrix.target }}" in *windows*) exe=crabfarm.exe ;; esac
+          mkdir -p "dist/$dir"
+          cp "$target/release/$exe" "dist/$dir/"
+          cp LICENSE README.md "dist/$dir/"
+          echo "PKG_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Archive (tar.gz)
+        if: matrix.ext == 'tar.gz'
+        run: tar -C dist -czf "dist/$PKG_DIR.tar.gz" "$PKG_DIR"
+      - name: Archive (zip)
+        if: matrix.ext == 'zip'
+        shell: pwsh
+        run: Compress-Archive -Path "dist/$env:PKG_DIR" -DestinationPath "dist/$env:PKG_DIR.zip"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.${{ matrix.ext }}
+          if-no-files-found: error
+
+  draft:
+    name: draft release (owner publishes)
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+          sparse-checkout: CHANGELOG.md
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create or refresh the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          # One checksum file over every package.
+          (cd dist && sha256sum crabfarm-* > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          awk -v v="$version" '$0 ~ "^## "v"[[:space:]]*$" {on=1; next} /^## / {on=0} on' CHANGELOG.md > notes.md || true
+          {
+            echo
+            echo "**Install:** unpack the archive for your platform and put \`crabfarm\` on your PATH, or run \`cargo install crabfarm\`."
+            echo "Check every download against SHA256SUMS.txt."
+          } >> notes.md
+          flags=(--draft --verify-tag --title "crabfarm $RELEASE_TAG" --notes-file notes.md)
+          case "$RELEASE_TAG" in *-*) flags+=(--prerelease) ;; esac
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            # Never touch a published release; refresh only a draft.
+            if [ "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" != "true" ]; then
+              echo "Release $RELEASE_TAG is already published; nothing changed." >&2
+              exit 1
+            fi
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* "${flags[@]}"
+          fi
+          echo "Draft ready: the owner publishes it on GitHub."

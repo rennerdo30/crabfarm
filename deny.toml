@@ -1,0 +1,21 @@
+# cargo-deny configuration. crabfarm ships only permissively licensed
+# dependencies; CI enforces this list (job "cargo-deny (licenses)").
+# For "A OR B" expressions one allowed side is enough.
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+]
+# option-ext (pulled in by directories -> dirs-sys) is MPL-2.0: file-level
+# copyleft, used unmodified, so it is allowed for that one crate only.
+exceptions = [
+    { allow = ["MPL-2.0"], crate = "option-ext" },
+]

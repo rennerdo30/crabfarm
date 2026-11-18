@@ -192,14 +192,45 @@ fn validate_paths(spec: &JobSpec, map: &SandboxMap) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether the file system under `jobs_dir` ignores case, so that two sandbox
+/// names that differ only in case (or Unicode normalization) are one file
+/// (CF-19). Windows and macOS are assumed insensitive (their defaults). Elsewhere
+/// the directory is probed once per process (`Aa` created, `aa` looked up); a
+/// probe that fails counts as insensitive, which only makes the check stricter.
+fn sandbox_case_insensitive(jobs_dir: &Path) -> bool {
+    if cfg!(any(windows, target_os = "macos")) {
+        return true;
+    }
+    static PROBED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROBED.get_or_init(|| {
+        let mut tag = [0u8; 4];
+        rand::fill(&mut tag[..]);
+        let hex: String = tag.iter().map(|b| format!("{b:02x}")).collect();
+        let upper = jobs_dir.join(format!(".case-probe-{hex}-Aa"));
+        let lower = jobs_dir.join(format!(".case-probe-{hex}-aa"));
+        if std::fs::create_dir_all(jobs_dir).is_err() || std::fs::write(&upper, b"").is_err() {
+            return true;
+        }
+        let insensitive = lower.exists();
+        let _ = std::fs::remove_file(&upper);
+        insensitive
+    })
+}
+
 /// Refuse a job whose argument list, environment or size is outside what the
 /// submitter's wrapper can produce (CF-8). The submitter then runs it locally.
-pub fn validate_spec(spec: &JobSpec, accept_env: &[String], peer_host: &str) -> anyhow::Result<()> {
+pub fn validate_spec(
+    spec: &JobSpec,
+    accept_env: &[String],
+    peer_host: &str,
+    jobs_dir: &Path,
+) -> anyhow::Result<()> {
     let node_has = |n: &str| std::env::var_os(n).is_some();
     let policy = guard::Policy {
         peer_host,
         accept_env,
         node_has: &node_has,
+        case_insensitive: sandbox_case_insensitive(jobs_dir),
     };
     guard::validate_spec(spec, &policy).map_err(|why| anyhow::anyhow!("job refused: {why}"))
 }
@@ -615,7 +646,7 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let job_dir = ctx.jobs_dir.join(job_hex(ctx.owner, &spec.job_id));
     let map = SandboxMap::new(job_dir.join("root"));
-    validate_spec(spec, ctx.accept_env, &toolchain.id.host)?;
+    validate_spec(spec, ctx.accept_env, &toolchain.id.host, &ctx.jobs_dir)?;
     validate_paths(spec, &map)?;
     // Claimed before anything is deleted: a duplicate (owner, id) must not wipe
     // the sandbox of the job that is running.
@@ -1721,6 +1752,28 @@ fn main() {
                 "case {n}: rustc wrote outside the sandbox"
             );
         }
+    }
+
+    /// CF-19: two inputs whose names are one file on this sandbox file system
+    /// must not both be written; the job is refused before anything is.
+    #[tokio::test]
+    async fn colliding_inputs_are_refused_on_a_case_insensitive_sandbox() {
+        let f = fixture();
+        if !sandbox_case_insensitive(&f.jobs) {
+            return; // a case-sensitive file system keeps them apart
+        }
+        let c = ctx(&f, Duration::from_secs(120));
+        let mut spec = lib_spec(&f, SRC, false);
+        let mut twin = spec.inputs[0].clone();
+        twin.path = ClientPath::parse(twin.path.style, &twin.path.path.to_uppercase())
+            .expect("upper-case twin");
+        twin.hash = BlobHash::of(b"different content");
+        assert_ne!(twin.path, spec.inputs[0].path);
+        spec.inputs.push(twin);
+        let (res, evs) = collect(&c, &spec, &f.tc, CancellationToken::new()).await;
+        let err = res.expect_err("a collision must be refused");
+        assert!(format!("{err:#}").contains("job refused"), "{err:#}");
+        assert!(evs.is_empty(), "{evs:?}");
     }
 
     #[test]

@@ -10,7 +10,7 @@
 //! locally (DESIGN section 10).
 
 use crate::paths::valid_component;
-use crate::proto::{Arg, EnvValue, JobSpec, PathStyle};
+use crate::proto::{Arg, ClientPath, EnvValue, JobSpec, PathStyle};
 use crate::rustc_args::{ALLOWED_EMIT, SEARCH_KINDS, looks_absolute, parse_flag};
 
 /// Per-job caps, checked before anything is written (CF-8).
@@ -22,6 +22,82 @@ pub const MAX_MATERIALIZED_BYTES: u64 = 512 * 1024 * 1024;
 /// checked as text. Plain arguments containing it are refused first, so it
 /// cannot be forged.
 const MARK: char = '\u{1}';
+
+/// Unicode combining marks (the blocks canonical decompositions use). Not a
+/// complete table on purpose: see [`fold_component`].
+fn is_combining(c: char) -> bool {
+    matches!(c as u32,
+        0x0300..=0x036F | 0x0483..=0x0489 | 0x0591..=0x05BD | 0x0610..=0x061A
+        | 0x064B..=0x065F | 0x0900..=0x0903 | 0x093A..=0x094F | 0x1AB0..=0x1AFF
+        | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0x3099..=0x309A | 0xFE20..=0xFE2F)
+}
+
+/// What a path component is called on a file system that ignores case and
+/// Unicode normalization (Windows, default macOS): two names that can be the
+/// same file there have the same result.
+///
+/// Case is folded with `to_lowercase`. Normalization (NFC/NFD) cannot be
+/// computed without the Unicode tables, and no crate that has them is in the
+/// tree, so the rule is conservative instead (fail closed): a name with any
+/// non-ASCII character or combining mark is reduced to its ASCII skeleton,
+/// that is the name without those characters and without an ASCII letter that a
+/// combining mark follows. A composed `\u{e9}` and a decomposed `e\u{301}` both
+/// reduce to the same thing, as does every other pair of canonically equivalent
+/// names; names that merely look alike after that (`\u{e9}.rs` and `\u{e8}.rs`)
+/// are reported as colliding too. The price is a refused job (it runs on the
+/// submitter) in a rare case, never a silent overwrite. Known gap: the two
+/// ASCII punctuation characters that have canonical equivalents outside
+/// ASCII (`;` is equivalent to U+037E, `` ` `` to U+1FEF).
+fn fold_component(c: &str) -> String {
+    let lower = c.to_lowercase();
+    if lower.is_ascii() {
+        return lower;
+    }
+    let mut skeleton = String::new();
+    for ch in lower.chars() {
+        if is_combining(ch) {
+            if skeleton.ends_with(|b: char| b.is_ascii_alphabetic()) {
+                skeleton.pop();
+            }
+        } else if ch.is_ascii() {
+            skeleton.push(ch);
+        }
+    }
+    // The marker keeps a skeleton apart from an ASCII name with the same text.
+    format!("\u{1}{skeleton}")
+}
+
+fn collision_key(p: &ClientPath, case_insensitive: bool) -> String {
+    let parts = p.path.split(['/', '\\']).filter(|c| !c.is_empty());
+    let mut key = format!("{:?}", p.style);
+    for c in parts {
+        key.push('\0');
+        if case_insensitive {
+            key.push_str(&fold_component(c));
+        } else {
+            key.push_str(c);
+        }
+    }
+    key
+}
+
+/// Refuse a job in which two inputs with different content would land on the
+/// same file in the sandbox (CF-19): the second write would silently replace
+/// the first. On a case-insensitive sandbox file system, names that differ only
+/// in case or in Unicode normalization count as the same file; two inputs with
+/// the same content under such names are harmless and accepted.
+pub fn check_collisions(spec: &JobSpec, case_insensitive: bool) -> Result<(), String> {
+    let mut seen: std::collections::HashMap<String, &crate::proto::BlobHash> =
+        std::collections::HashMap::with_capacity(spec.inputs.len());
+    for i in &spec.inputs {
+        if let Some(h) = seen.insert(collision_key(&i.path, case_insensitive), &i.hash)
+            && *h != i.hash
+        {
+            return Err("two inputs with different content map to the same file".into());
+        }
+    }
+    Ok(())
+}
 
 /// Caps on the declared inputs and directories.
 pub fn check_caps(spec: &JobSpec) -> Result<(), String> {
@@ -445,6 +521,8 @@ pub struct Policy<'a> {
     pub accept_env: &'a [String],
     /// Whether this node's own environment defines a name.
     pub node_has: &'a dyn Fn(&str) -> bool,
+    /// The sandbox file system ignores case and Unicode normalization.
+    pub case_insensitive: bool,
 }
 
 /// Check the job environment (CF-8, CF-18, CF-19).
@@ -487,6 +565,7 @@ pub fn validate_env(spec: &JobSpec, policy: &Policy) -> Result<(), String> {
 /// Everything that can be decided without touching the file system.
 pub fn validate_spec(spec: &JobSpec, policy: &Policy) -> Result<(), String> {
     check_caps(spec)?;
+    check_collisions(spec, policy.case_insensitive)?;
     validate_args(&spec.args, spec.toolchain.host == policy.peer_host)?;
     validate_env(spec, policy)
 }
@@ -511,6 +590,7 @@ mod tests {
                 peer_host: "h",
                 accept_env: &accept,
                 node_has: &none,
+                case_insensitive: false,
             },
         )
     }
@@ -729,6 +809,7 @@ mod tests {
                     peer_host: "h",
                     accept_env: &none_accepted,
                     node_has: &has,
+                    case_insensitive: false,
                 }
             )
             .is_err()
@@ -855,6 +936,69 @@ mod tests {
         let a = with("proc-macro", "link-arg=-fuse-ld=lld");
         assert!(validate_args(&a, false).is_err());
         assert_eq!(validate_args(&with("rlib", "link-arg=-x"), false), Ok(()));
+    }
+
+    fn input(path: &str, content: &[u8]) -> InputFile {
+        InputFile {
+            path: cp(path),
+            hash: crate::proto::BlobHash::of(content),
+            size: content.len() as u64,
+            executable: false,
+        }
+    }
+
+    /// CF-19: names that are the same file on a case-insensitive file system
+    /// must not carry different content.
+    #[test]
+    fn inputs_that_collide_on_a_case_insensitive_sandbox_are_refused() {
+        let with = |inputs: Vec<InputFile>| {
+            let mut s = spec(vec![], &[]);
+            s.inputs = inputs;
+            s
+        };
+        let case = with(vec![
+            input(r"C:\w\Src\a.rs", b"one"),
+            input(r"C:\w\src\A.rs", b"two"),
+        ]);
+        assert!(check_collisions(&case, true).is_err(), "case");
+        // A case-sensitive file system keeps them apart.
+        assert_eq!(check_collisions(&case, false), Ok(()));
+        // The same content under both spellings is one file: fine.
+        let same = with(vec![
+            input(r"C:\w\Src\a.rs", b"one"),
+            input(r"C:\w\src\A.rs", b"one"),
+        ]);
+        assert_eq!(check_collisions(&same, true), Ok(()));
+        // Non-ASCII case folding and Unicode normalization (composed and decomposed).
+        let upper = with(vec![
+            input("C:\\w\\\u{c4}.rs", b"one"),
+            input("C:\\w\\\u{e4}.rs", b"two"),
+        ]);
+        assert!(check_collisions(&upper, true).is_err(), "non-ASCII case");
+        let nfc = with(vec![
+            input("C:\\w\\caf\u{e9}.rs", b"one"),
+            input("C:\\w\\cafe\u{301}.rs", b"two"),
+        ]);
+        assert!(check_collisions(&nfc, true).is_err(), "NFC against NFD");
+        assert_eq!(check_collisions(&nfc, false), Ok(()));
+        // Fail closed: names that only look alike after the reduction are refused too.
+        let alike = with(vec![
+            input("C:\\w\\\u{e9}.rs", b"one"),
+            input("C:\\w\\\u{e8}.rs", b"two"),
+        ]);
+        assert!(check_collisions(&alike, true).is_err());
+        // Unrelated names, a plain non-ASCII path and one name twice with one content pass.
+        let ok = with(vec![
+            input("C:\\Users\\Ren\u{e9}e\\p\\a.rs", b"one"),
+            input("C:\\Users\\Ren\u{e9}e\\p\\b.rs", b"two"),
+            input("C:\\Users\\Renee\\p\\a.rs", b"three"),
+            input(r"C:\w\x.rs", b"4"),
+            input(r"C:\w\x.rs", b"4"),
+        ]);
+        assert_eq!(check_collisions(&ok, true), Ok(()));
+        // The very same path with two contents is refused everywhere.
+        let dup = with(vec![input(r"C:\w\x.rs", b"1"), input(r"C:\w\x.rs", b"2")]);
+        assert!(check_collisions(&dup, false).is_err());
     }
 
     #[test]

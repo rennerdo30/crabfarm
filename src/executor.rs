@@ -57,7 +57,12 @@ impl Node {
         }
         // Caps, arguments and environment are checked before any blob is
         // received or written (CF-8); a refusal makes the submitter run locally.
-        exec::validate_spec(&spec, &self.cfg.accept_env, &self.host_triple)?;
+        exec::validate_spec(
+            &spec,
+            &self.cfg.accept_env,
+            &self.host_triple,
+            &self.data_dir.join("jobs"),
+        )?;
         // From here on no other job's cleanup or an eviction may delete a blob
         // this job needs, including the ones still to be uploaded.
         let _pin = self

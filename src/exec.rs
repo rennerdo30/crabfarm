@@ -1169,7 +1169,7 @@ mod tests {
     }
 
     /// A stand-in "rustc" that starts a sleeping grandchild (like rustc starting
-    /// a linker) and records its pid in the file named by CARGO_CRABFARM_PIDFILE.
+    /// a linker) and records its pid in the file named by CRABFARM_TEST_PIDFILE.
     fn fake_with_grandchild(f: &Fixture) -> Installed {
         let dir = f._tmp.path().join("fakegc");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1185,7 +1185,7 @@ fn main() {
     }
     let exe = std::env::current_exe().unwrap();
     let child = Command::new(exe).arg("--grandchild").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-    std::fs::write(std::env::var("CARGO_CRABFARM_PIDFILE").unwrap(), child.id().to_string()).unwrap();
+    std::fs::write(std::env::var("CRABFARM_TEST_PIDFILE").unwrap(), child.id().to_string()).unwrap();
     std::thread::sleep(std::time::Duration::from_secs(120));
 }
 "#,
@@ -1384,8 +1384,9 @@ fn main() {
         let fake = fake_with_grandchild(&f);
         let pidfile = f._tmp.path().join("grandchild.pid");
         let mut spec = lib_spec(&f, SRC, false);
+        spec.extra_env.push("CRABFARM_TEST_PIDFILE".into());
         spec.env.push((
-            "CARGO_CRABFARM_PIDFILE".into(),
+            "CRABFARM_TEST_PIDFILE".into(),
             EnvValue::Plain(pidfile.to_string_lossy().into_owned()),
         ));
         let c = ctx(&f, Duration::from_millis(3000));
@@ -1784,10 +1785,10 @@ fn main() {
         // SAFETY-free approach: use a variable name unique to this test and check via option_env!.
         let f = fixture();
         unsafe { std::env::set_var("CARGO_CRABFARM_LEAK_PROBE", "leaked") };
-        let src = "pub const P: Option<&str> = option_env!(\"CARGO_CRABFARM_LEAK_PROBE\");\npub const Q: Option<&str> = option_env!(\"CARGO_CRABFARM_FROM_SPEC\");\n";
+        let src = "pub const P: Option<&str> = option_env!(\"CARGO_CRABFARM_LEAK_PROBE\");\npub const Q: Option<&str> = option_env!(\"CARGO_PKG_DESCRIPTION\");\n";
         let mut spec = lib_spec(&f, src, false);
         spec.env.push((
-            "CARGO_CRABFARM_FROM_SPEC".into(),
+            "CARGO_PKG_DESCRIPTION".into(),
             EnvValue::Plain("yes".into()),
         ));
         let c = ctx(&f, Duration::from_secs(120));
@@ -1812,7 +1813,7 @@ fn main() {
             !dep.contains("CARGO_CRABFARM_LEAK_PROBE=leaked"),
             "node variable leaked: {dep}"
         );
-        assert!(dep.contains("CARGO_CRABFARM_FROM_SPEC=yes"), "{dep}");
+        assert!(dep.contains("CARGO_PKG_DESCRIPTION=yes"), "{dep}");
         unsafe { std::env::remove_var("CARGO_CRABFARM_LEAK_PROBE") };
     }
 }

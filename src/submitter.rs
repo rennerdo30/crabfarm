@@ -408,6 +408,7 @@ impl Node {
                     input,
                     search_dirs,
                     link_libs,
+                    force_local,
                 } => {
                     let info = SubmitInfo {
                         produces,
@@ -416,7 +417,7 @@ impl Node {
                         search_dirs,
                         link_libs,
                     };
-                    self.handle_submit(&mut link, spec, info).await;
+                    self.handle_submit(&mut link, spec, info, force_local).await;
                     break;
                 }
                 _ => break,
@@ -427,8 +428,21 @@ impl Node {
 
     // --------------------------------------------------------------- submit
 
-    async fn handle_submit(self: &Arc<Self>, wrapper: &mut Link, spec: JobSpec, info: SubmitInfo) {
+    async fn handle_submit(
+        self: &Arc<Self>,
+        wrapper: &mut Link,
+        spec: JobSpec,
+        info: SubmitInfo,
+        force_local: bool,
+    ) {
         lock(&self.depgraph).begin(&info.produces, &info.externs);
+        if force_local {
+            // The wrapper knows a variable this crate reads is not forwarded
+            // (CF-18): no peer is tried, no inputs are collected.
+            self.local_phase(wrapper, LocalReason::EnvDependency, &info)
+                .await;
+            return;
+        }
         let plan = match self.plan(spec, &info).await {
             Ok(p) => p,
             Err(reason) => {

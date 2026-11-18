@@ -25,6 +25,7 @@ pub mod toolchain;
 // `crabfarm cargo`, `crabfarm status`, dependency graph.
 pub mod cargo_cmd;
 pub mod depgraph;
+pub mod envlearn;
 pub mod executor;
 pub mod ipc;
 pub mod link;

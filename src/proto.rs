@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bump on any incompatible change to these types.
-pub const PROTO_VERSION: u16 = 2;
+pub const PROTO_VERSION: u16 = 3;
 /// Maximum encoded frame size in bytes.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// Blob transfer chunk size (plaintext bytes before compression).
@@ -300,6 +300,12 @@ pub enum Message {
         input: ClientPath,
         search_dirs: Vec<(String, ClientPath)>,
         link_libs: Vec<(String, String)>,
+        /// Added in protocol 3 (CF-18): the wrapper already knows this crate
+        /// depends on a variable that is not forwarded (recorded from its own
+        /// local build), so the node must not try a peer: it answers
+        /// `RunLocal` once a local slot is free, and still records the job in
+        /// the dependency graph so dependents stay eligible.
+        force_local: bool,
     },
     /// Node -> wrapper: run rustc yourself; keep the IPC connection open
     /// until rustc exits (it holds a local slot), then send `LocalDone`.
@@ -488,8 +494,10 @@ impl std::fmt::Debug for Message {
                 input,
                 search_dirs,
                 link_libs,
+                force_local,
             } => f
                 .debug_struct("Submit")
+                .field("force_local", force_local)
                 .field("spec", &SpecSummary(spec))
                 .field("rustc", rustc)
                 .field("produces", &produces.len())

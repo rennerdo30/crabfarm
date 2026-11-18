@@ -288,29 +288,70 @@ pub fn validate_args(args: &[Arg]) -> Result<(), String> {
     Ok(())
 }
 
-/// Variables of the job environment the peer accepts from the submitter:
-/// DESIGN section 9 (`wrapper::is_forwarded` without the config list), plus the
-/// names the job declares in `extra_env` (the submitter's `forward_env` and
-/// the names it learned per crate).
-fn design_env(name: &str) -> bool {
+/// Names `CARGO_PKG_<X>` that cargo sets for every crate it compiles.
+const PKG_SUFFIXES: [&str; 14] = [
+    "VERSION",
+    "VERSION_MAJOR",
+    "VERSION_MINOR",
+    "VERSION_PATCH",
+    "VERSION_PRE",
+    "AUTHORS",
+    "NAME",
+    "DESCRIPTION",
+    "HOMEPAGE",
+    "REPOSITORY",
+    "LICENSE",
+    "LICENSE_FILE",
+    "RUST_VERSION",
+    "README",
+];
+
+/// The variables a job gets from the submitter without anybody listing them
+/// (CF-18, DESIGN section 9). Allow-list, matched case-insensitively (Windows
+/// environment names are):
+///
+/// - what cargo sets for the crates it compiles ("Environment variables Cargo
+///   sets for crates", doc.rust-lang.org/cargo/reference/environment-variables.html):
+///   `CARGO`, `CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_PATH`, `CARGO_MANIFEST_LINKS`,
+///   `CARGO_PKG_*` (the fixed set above, not a prefix), `CARGO_CRATE_NAME`,
+///   `CARGO_BIN_NAME`, `CARGO_PRIMARY_PACKAGE`, `CARGO_TARGET_TMPDIR`,
+///   `CARGO_RUSTC_CURRENT_DIR`, `CARGO_BIN_EXE_<name>`, `OUT_DIR`;
+/// - `CARGO_CFG_*`: the cfg values cargo derives from the target; cargo sets
+///   them for build scripts only, but they carry no user data and are accepted
+///   for a crate whose build script re-exports them with `rustc-env`;
+/// - `RUSTC_BOOTSTRAP`: not set by cargo, but the user's own value changes what
+///   rustc accepts, so a build that has it set must get it on the peer too.
+///
+/// Everything else is not forwarded unless the user lists it in `forward_env`
+/// (and the peer in `accept_env`): `DEP_*`, `TARGET`, `HOST`, `PROFILE`,
+/// `NUM_JOBS`, `OPT_LEVEL` and `DEBUG` are build-script variables that cargo
+/// does not pass to rustc, and nothing else with a `CARGO_` prefix goes along:
+/// `CARGO_REGISTRY_TOKEN` and `CARGO_REGISTRIES_<name>_TOKEN` are credentials.
+/// `CARGO_MAKEFLAGS` is machine-local (jobserver handles) and never sent.
+pub fn design_env(name: &str) -> bool {
     let up = name.to_ascii_uppercase();
-    if up == "CARGO_MAKEFLAGS" {
-        return false;
+    if matches!(
+        up.as_str(),
+        "CARGO"
+            | "CARGO_MANIFEST_DIR"
+            | "CARGO_MANIFEST_PATH"
+            | "CARGO_MANIFEST_LINKS"
+            | "CARGO_CRATE_NAME"
+            | "CARGO_BIN_NAME"
+            | "CARGO_PRIMARY_PACKAGE"
+            | "CARGO_TARGET_TMPDIR"
+            | "CARGO_RUSTC_CURRENT_DIR"
+            | "OUT_DIR"
+            | "RUSTC_BOOTSTRAP"
+    ) {
+        return true;
     }
-    up == "CARGO"
-        || up.starts_with("CARGO_")
-        || up.starts_with("DEP_")
-        || matches!(
-            up.as_str(),
-            "OUT_DIR"
-                | "RUSTC_BOOTSTRAP"
-                | "TARGET"
-                | "HOST"
-                | "PROFILE"
-                | "NUM_JOBS"
-                | "OPT_LEVEL"
-                | "DEBUG"
-        )
+    if let Some(rest) = up.strip_prefix("CARGO_PKG_") {
+        return PKG_SUFFIXES.contains(&rest);
+    }
+    up.strip_prefix("CARGO_CFG_")
+        .or_else(|| up.strip_prefix("CARGO_BIN_EXE_"))
+        .is_some_and(|rest| !rest.is_empty())
 }
 
 /// True when `name` is a variable the farm must never accept, even when the
@@ -562,13 +603,32 @@ mod tests {
             vec![
                 ("CARGO_PKG_NAME", plain("x")),
                 ("OUT_DIR", EnvValue::Path(cp(r"C:\o"))),
-                ("DEP_A_B", plain("1")),
+                ("CARGO_CRATE_NAME", plain("x")),
                 ("RUSTC_BOOTSTRAP", plain("1")),
                 ("MY_VAR", plain("v")),
             ],
             &["MY_VAR"],
         );
         assert_eq!(validate_env(&ok, &none), Ok(()));
+        // CF-18: credentials and settings of cargo are refused when
+        // undeclared, whatever their prefix; so are build-script variables.
+        for bad in [
+            "CARGO_REGISTRY_TOKEN",
+            "CARGO_REGISTRIES_PRIVATE_TOKEN",
+            "CARGO_HOME",
+            "CARGO_PKG_SECRET",
+            "GITHUB_TOKEN",
+            "DEP_A_B",
+            "TARGET",
+            "HOST",
+            "PROFILE",
+            "NUM_JOBS",
+            "OPT_LEVEL",
+            "DEBUG",
+        ] {
+            let s = spec(vec![(bad, plain("x"))], &[]);
+            assert!(validate_env(&s, &none).is_err(), "{bad} must be refused");
+        }
         for bad in [
             "PATH",
             "Path",

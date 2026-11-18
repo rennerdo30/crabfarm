@@ -12,7 +12,7 @@ use crate::proto::{ClientPath, EnvValue, JobId, JobSpec, LocalReason, Message, T
 use crate::rewrite;
 use crate::rustc_args::{self, Classified, ClassifyOptions, RemoteCandidate};
 use crate::toolchain;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -198,28 +198,11 @@ const PATH_ENV: [&str; 5] = [
     "CARGO_RUSTC_CURRENT_DIR",
 ];
 
-/// DESIGN section 9: the variables a job gets from the submitter.
+/// DESIGN section 9: the variables a job gets from the submitter: the
+/// allow-list of what cargo sets for rustc (`guard::design_env`) and the names
+/// the user listed in `forward_env`. Nothing is added automatically (CF-18).
 pub fn is_forwarded(name: &str, extra: &[String]) -> bool {
-    let up = name.to_ascii_uppercase();
-    if up == "CARGO_MAKEFLAGS" {
-        // Jobserver file descriptors of this machine mean nothing elsewhere.
-        return false;
-    }
-    up == "CARGO"
-        || up.starts_with("CARGO_")
-        || up.starts_with("DEP_")
-        || matches!(
-            up.as_str(),
-            "OUT_DIR"
-                | "RUSTC_BOOTSTRAP"
-                | "TARGET"
-                | "HOST"
-                | "PROFILE"
-                | "NUM_JOBS"
-                | "OPT_LEVEL"
-                | "DEBUG"
-        )
-        || extra.iter().any(|e| e.eq_ignore_ascii_case(name))
+    crate::guard::design_env(name) || extra.iter().any(|e| e.eq_ignore_ascii_case(name))
 }
 
 fn is_path_env(name: &str) -> bool {
@@ -250,35 +233,6 @@ pub fn forwarded_env(
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
-}
-
-fn learned_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("env_forward.toml")
-}
-
-/// Variables a crate's `.d` file listed as dependencies that were not
-/// forwarded the first time; remembered so later runs forward them.
-fn learned_env(data_dir: &Path, crate_name: &str) -> Vec<String> {
-    let text = std::fs::read_to_string(learned_path(data_dir)).unwrap_or_default();
-    let map: BTreeMap<String, Vec<String>> = toml::from_str(&text).unwrap_or_default();
-    map.get(crate_name).cloned().unwrap_or_default()
-}
-
-fn remember_env(data_dir: &Path, crate_name: &str, names: &[String]) {
-    let text = std::fs::read_to_string(learned_path(data_dir)).unwrap_or_default();
-    let mut map: BTreeMap<String, Vec<String>> = toml::from_str(&text).unwrap_or_default();
-    let e = map.entry(crate_name.to_string()).or_default();
-    for n in names {
-        if !e.contains(n) {
-            e.push(n.clone());
-        }
-    }
-    if let Ok(s) = toml::to_string(&map) {
-        let tmp = learned_path(data_dir).with_extension("tmp");
-        if std::fs::write(&tmp, s).is_ok() {
-            let _ = std::fs::rename(&tmp, learned_path(data_dir));
-        }
-    }
 }
 
 // ------------------------------------------------------------- crate kinds
@@ -323,6 +277,33 @@ fn dep_info_file(cand: &RemoteCandidate, args: &[String]) -> PathBuf {
     cand.out_dir
         .to_local()
         .join(format!("{}{}.d", cand.crate_name, extra_filename(args)))
+}
+
+/// Names recorded for `crate_name` that are set now and are not part of the
+/// forwarded environment: the crate cannot be built on a peer.
+fn blocked_env(
+    data_dir: &Path,
+    crate_name: &str,
+    forwarded: &HashSet<String>,
+    is_set: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    crate::envlearn::recorded(data_dir, crate_name)
+        .into_iter()
+        .filter(|n| is_set(n) && !forwarded.contains(&n.to_ascii_uppercase()))
+        .collect()
+}
+
+/// Record the env dependencies of the `.d` file the LOCAL rustc just wrote
+/// (never one that came from a peer) so the crate stays local while they are
+/// set (CF-18). Recording does not forward anything.
+fn learn_env_deps(data_dir: &Path, crate_name: &str, dep_file: &Path, forwarded: &HashSet<String>) {
+    let Ok(text) = std::fs::read_to_string(dep_file) else {
+        return;
+    };
+    let missing = missing_env_deps(&text, forwarded, |n| std::env::var_os(n).is_some());
+    if !missing.is_empty() {
+        let _ = crate::envlearn::remember(data_dir, crate_name, &missing);
+    }
 }
 
 /// Names a freshly written `.d` file lists as env dependencies that are set
@@ -375,16 +356,28 @@ fn submit(
         return passthrough(rustc, args);
     };
 
-    let mut extra = cfg.forward_env.clone();
-    extra.extend(learned_env(data_dir, &cand.crate_name));
-    let env = forwarded_env(std::env::vars(), &extra);
+    // Only what cargo sets for rustc and what the user listed travels (CF-18).
+    // Names recorded from an earlier local build of this crate are NOT added.
+    let env = forwarded_env(std::env::vars(), &cfg.forward_env);
+    let forwarded: HashSet<String> = env.iter().map(|(k, _)| k.to_ascii_uppercase()).collect();
+    // A variable this crate was seen to read (from a `.d` file the local rustc
+    // wrote) that is set now but would not reach the peer: build locally.
+    let force_local = !blocked_env(data_dir, &cand.crate_name, &forwarded, |n| {
+        std::env::var_os(n).is_some()
+    })
+    .is_empty();
     // Names beyond DESIGN section 9; the executor accepts only these.
     let extra_env: Vec<String> = env
         .iter()
         .map(|(k, _)| k.clone())
-        .filter(|k| !is_forwarded(k, &[]))
+        .filter(|k| !crate::guard::design_env(k))
         .collect();
-    let forwarded: HashSet<String> = env.iter().map(|(k, _)| k.to_ascii_uppercase()).collect();
+    // A job that stays local carries no environment at all.
+    let (env, extra_env) = if force_local {
+        (Vec::new(), Vec::new())
+    } else {
+        (env, extra_env)
+    };
     let spec = JobSpec {
         job_id: JobId({
             let mut b = [0u8; 16];
@@ -412,6 +405,7 @@ fn submit(
         input: cand.input.clone(),
         search_dirs: cand.search_dirs.clone(),
         link_libs: cand.link_libs.clone(),
+        force_local,
     };
     if rt.block_on(conn.send(&submit)).is_err() {
         return passthrough(rustc, args);
@@ -463,8 +457,9 @@ fn submit(
                                 missing_env_deps(&d, &forwarded, |n| std::env::var_os(n).is_some())
                             })
                             .unwrap_or_default();
+                        // A peer-written `.d`: a reason to distrust this result,
+                        // never a source of names to forward or remember.
                         if !missing.is_empty() {
-                            remember_env(data_dir, &cand.crate_name, &missing);
                             stale_early = true;
                         }
                     }
@@ -515,7 +510,7 @@ fn submit(
                         })
                         .unwrap_or_default();
                     if !missing.is_empty() {
-                        remember_env(data_dir, &cand.crate_name, &missing);
+                        // Same: only the local rerun's own `.d` is learned from.
                         buffered.clear();
                         if rt
                             .block_on(conn.send(&Message::RetryLocal {
@@ -553,7 +548,14 @@ fn submit(
             if printed {
                 eprintln!("crabfarm: remote job failed, rerunning locally");
             }
+            // The dep-info at this path may be the peer's (the submitter moves
+            // it into place early): remove it, so that what is read after the
+            // run was certainly written by the local rustc.
+            let _ = std::fs::remove_file(&dep_file);
             let code = passthrough_skipping(rustc, args, &relayed_notices);
+            if code == 0 {
+                learn_env_deps(data_dir, &cand.crate_name, &dep_file, &forwarded);
+            }
             if reason.is_some() {
                 // Releases the local slot the node reserved for this run.
                 let _ = rt.block_on(conn.send(&Message::LocalDone {
@@ -664,16 +666,20 @@ mod tests {
         let extra = vec![v("MY_TOKEN_FREE")];
         for n in [
             "CARGO_PKG_NAME",
+            "CARGO_PKG_VERSION_MAJOR",
             "CARGO",
-            "DEP_FOO_ROOT",
+            "CARGO_MANIFEST_DIR",
+            "CARGO_MANIFEST_PATH",
+            "CARGO_MANIFEST_LINKS",
+            "CARGO_CRATE_NAME",
+            "CARGO_BIN_NAME",
+            "CARGO_PRIMARY_PACKAGE",
+            "CARGO_TARGET_TMPDIR",
+            "CARGO_RUSTC_CURRENT_DIR",
+            "CARGO_BIN_EXE_tool",
+            "CARGO_CFG_TARGET_OS",
             "OUT_DIR",
             "RUSTC_BOOTSTRAP",
-            "TARGET",
-            "HOST",
-            "PROFILE",
-            "NUM_JOBS",
-            "OPT_LEVEL",
-            "DEBUG",
             "MY_TOKEN_FREE",
         ] {
             assert!(is_forwarded(n, &extra), "{n} must be forwarded");
@@ -685,9 +691,57 @@ mod tests {
             "RUSTFLAGS",
             "CARGO_MAKEFLAGS",
             "USERPROFILE",
+            // Credentials and settings of cargo itself (CF-18).
+            "CARGO_REGISTRY_TOKEN",
+            "CARGO_REGISTRIES_PRIVATE_TOKEN",
+            "CARGO_HOME",
+            "CARGO_NET_GIT_FETCH_WITH_CLI",
+            "CARGO_PKG_SECRET",
+            "CARGO_CFG_",
+            "GITHUB_TOKEN",
+            // Build-script variables that cargo does not pass to rustc.
+            "DEP_FOO_ROOT",
+            "TARGET",
+            "HOST",
+            "PROFILE",
+            "NUM_JOBS",
+            "OPT_LEVEL",
+            "DEBUG",
         ] {
             assert!(!is_forwarded(n, &extra), "{n} must not be forwarded");
         }
+    }
+
+    /// CF-18, the first leak: every `CARGO_*` variable used to be forwarded.
+    #[test]
+    fn registry_credentials_never_enter_the_forwarded_environment() {
+        let vars = vec![
+            (v("CARGO_REGISTRY_TOKEN"), v("secret-1")),
+            (v("CARGO_REGISTRIES_MY_TOKEN"), v("secret-2")),
+            (v("GITHUB_TOKEN"), v("secret-3")),
+            (v("CARGO_PKG_NAME"), v("x")),
+        ];
+        let env = forwarded_env(vars.into_iter(), &[]);
+        let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, vec!["CARGO_PKG_NAME"]);
+    }
+
+    #[test]
+    fn a_recorded_name_blocks_the_crate_only_while_it_is_set_and_not_forwarded() {
+        let d = tempfile::tempdir().unwrap();
+        crate::envlearn::remember(d.path(), "krate", &[v("MY_VAR")]).unwrap();
+        let none: HashSet<String> = HashSet::new();
+        let set = |n: &str| n == "MY_VAR";
+        assert_eq!(
+            blocked_env(d.path(), "krate", &none, set),
+            vec![v("MY_VAR")]
+        );
+        // Not set here: nothing to go wrong on the peer.
+        assert!(blocked_env(d.path(), "krate", &none, |_| false).is_empty());
+        // The user forwards it: the peer gets it, so the crate may go remote.
+        let fwd: HashSet<String> = [v("MY_VAR")].into_iter().collect();
+        assert!(blocked_env(d.path(), "krate", &fwd, set).is_empty());
+        assert!(blocked_env(d.path(), "other", &none, set).is_empty());
     }
 
     #[test]

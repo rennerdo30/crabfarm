@@ -84,6 +84,9 @@ enum RemoteEnd {
     Done,
     /// Nothing usable came back; run locally. The text is for debug logs.
     Fallback(String),
+    /// An output embeds the peer's sandbox path (CF-10): nothing was written;
+    /// run locally and count it as `SandboxPathInOutput`.
+    Tainted,
 }
 
 /// A job's output may only land in its `--out-dir` (or be one of the files the
@@ -105,20 +108,76 @@ pub fn under_prefix(prefixes: &[String], path: &ClientPath) -> bool {
     prefixes.iter().filter_map(|p| ClientPath::parse(path.style, p)).any(|p| path.starts_with(&p))
 }
 
-/// Write `data` to `dest` through a temporary file in the same directory.
-fn write_atomic(dest: &std::path::Path, data: &[u8]) -> anyhow::Result<()> {
+/// Write `data` next to `dest` into a temporary file and return its path.
+fn write_temp(dest: &std::path::Path, data: &[u8]) -> anyhow::Result<PathBuf> {
     use anyhow::Context;
     let parent = dest.parent().context("output path has no parent")?;
     std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     let mut tag = [0u8; 6];
     rand::fill(&mut tag[..]);
     let tmp = parent.join(format!(".crabfarm-{}.tmp", data_encoding::HEXLOWER.encode(&tag)));
-    std::fs::write(&tmp, data).with_context(|| format!("write {}", tmp.display()))?;
-    if let Err(e) = std::fs::rename(&tmp, dest) {
+    if let Err(e) = std::fs::write(&tmp, data) {
         let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("write {}", tmp.display()));
+    }
+    Ok(tmp)
+}
+
+/// Move a temporary file onto its destination.
+fn commit_temp(tmp: &std::path::Path, dest: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    if let Err(e) = std::fs::rename(tmp, dest) {
+        let _ = std::fs::remove_file(tmp);
         return Err(e).with_context(|| format!("replace {}", dest.display()));
     }
     Ok(())
+}
+
+/// Write `data` to `dest` through a temporary file in the same directory.
+#[cfg(test)]
+fn write_atomic(dest: &std::path::Path, data: &[u8]) -> anyhow::Result<()> {
+    commit_temp(&write_temp(dest, data)?, dest)
+}
+
+/// Outputs of a remote job that arrived but are not applied yet (CF-10): the
+/// job may turn out to be tainted (the peer found its sandbox path in an
+/// output), and then none of them may reach the client's target directory.
+/// Whatever is still staged when this is dropped is deleted.
+#[derive(Default)]
+struct Staged {
+    files: Vec<(PathBuf, PathBuf)>,
+}
+
+impl Staged {
+    fn add(&mut self, tmp: PathBuf, dest: PathBuf) {
+        self.files.push((tmp, dest));
+    }
+
+    /// Move every staged file to its destination.
+    fn commit(&mut self) -> anyhow::Result<()> {
+        while !self.files.is_empty() {
+            let (tmp, dest) = self.files.remove(0);
+            commit_temp(&tmp, &dest)?;
+        }
+        Ok(())
+    }
+
+    fn discard(&mut self) {
+        for (tmp, _) in self.files.drain(..) {
+            let _ = std::fs::remove_file(tmp);
+        }
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        self.discard();
+    }
+}
+
+/// True for the stderr line that announces a finished artifact to cargo.
+fn is_artifact_notice(m: &Message) -> bool {
+    matches!(m, Message::Stderr { line } if crate::rewrite::artifact(line).is_some())
 }
 
 fn env_path(spec: &JobSpec, name: &str) -> Option<ClientPath> {
@@ -243,6 +302,10 @@ impl Node {
                 tracing::debug!(crate_name = plan.spec.crate_name.as_str(), "remote job failed: {why}");
                 self.count("remote_failed", 1);
                 self.local_phase(wrapper, LocalReason::RemoteFailed, &info).await;
+            }
+            RemoteEnd::Tainted => {
+                tracing::info!(crate_name = plan.spec.crate_name.as_str(), "remote output embeds the sandbox path, rerunning locally");
+                self.local_phase(wrapper, LocalReason::SandboxPathInOutput, &info).await;
             }
         }
     }
@@ -435,6 +498,13 @@ impl Node {
         link.send(Message::JobRequest { spec: spec.clone(), blob_key: self.id.blob_key }).await?;
         let idle = Duration::from_secs(self.cfg.job_timeout_min.max(1) * 60 + 120);
         let mut pending: Option<(Assembler, ClientPath, BlobHash, u64)> = None;
+        // Outputs are applied at `Exit`, not on arrival, so a tainted job leaves
+        // nothing behind. Cargo must not see an artifact notice before its file
+        // exists, so from the first notice on the lines wait for the commit too
+        // (this costs pipelining for registry crates).
+        let mut staged = Staged::default();
+        let mut held: Vec<Message> = Vec::new();
+        let mut holding = false;
         loop {
             let m = tokio::time::timeout(idle, link.recv()).await.map_err(|_| anyhow::anyhow!("peer silent"))?;
             let Some(m) = m else { bail!("connection to the peer lost") };
@@ -445,7 +515,11 @@ impl Node {
                     if pending.is_some() {
                         bail!("stderr inside an output transfer");
                     }
-                    if wrapper.send(Message::Stderr { line }).await.is_err() {
+                    let m = Message::Stderr { line };
+                    holding |= is_artifact_notice(&m);
+                    if holding {
+                        held.push(m);
+                    } else if wrapper.send(m).await.is_err() {
                         let _ = link.send(Message::Cancel).await;
                         return Ok(RemoteEnd::Done);
                     }
@@ -454,7 +528,9 @@ impl Node {
                     if pending.is_some() {
                         bail!("stdout inside an output transfer");
                     }
-                    if wrapper.send(Message::Stdout { line }).await.is_err() {
+                    if holding {
+                        held.push(Message::Stdout { line });
+                    } else if wrapper.send(Message::Stdout { line }).await.is_err() {
                         let _ = link.send(Message::Cancel).await;
                         return Ok(RemoteEnd::Done);
                     }
@@ -482,19 +558,39 @@ impl Node {
                         }
                         let dest = path.to_local();
                         let n = plain.len() as u64;
-                        // Written before any later frame is relayed, so cargo
-                        // never sees an artifact notice for a missing file.
-                        tokio::task::spawn_blocking(move || write_atomic(&dest, &plain)).await??;
+                        let to = dest.clone();
+                        let tmp = tokio::task::spawn_blocking(move || write_temp(&to, &plain)).await??;
+                        staged.add(tmp, dest);
                         self.count("bytes_down", n);
                         pending = None;
                     }
+                }
+                Message::Tainted { .. } => {
+                    // The peer's sandbox path is inside an output: use none of them.
+                    staged.discard();
+                    held.clear();
+                    let _ = link.send(Message::Cancel).await;
+                    return Ok(RemoteEnd::Tainted);
                 }
                 Message::Exit { code } => {
                     if pending.is_some() {
                         bail!("exit inside an output transfer");
                     }
+                    // Files first, then the lines that announce them, then `Exit`.
+                    if code == 0 {
+                        let mut files = std::mem::take(&mut staged);
+                        tokio::task::spawn_blocking(move || files.commit()).await??;
+                    } else {
+                        staged.discard();
+                    }
                     lock(&self.depgraph).finish(&info.produces, code == 0);
                     self.count(if code == 0 { "remote_ok" } else { "remote_exit_nonzero" }, 1);
+                    for m in held.drain(..) {
+                        if wrapper.send(m).await.is_err() {
+                            let _ = link.send(Message::Cancel).await;
+                            return Ok(RemoteEnd::Done);
+                        }
+                    }
                     if !spec.no_retain {
                         let mut peers = lock(&self.peers);
                         if let Some(p) = peers.get_mut(&target) {
@@ -602,6 +698,45 @@ mod tests {
         assert!(under_prefix(&prefixes, &win(r"C:\secret\proj\src\lib.rs")));
         assert!(!under_prefix(&prefixes, &win(r"C:\secrets\proj")));
         assert!(!under_prefix(&prefixes, &win(r"C:\other")));
+    }
+
+    #[test]
+    fn staged_outputs_appear_only_on_commit_and_vanish_when_discarded() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b) = (d.path().join("deps").join("liba.rlib"), d.path().join("deps").join("liba.rmeta"));
+        let names = |dir: &std::path::Path| -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            v.sort();
+            v
+        };
+        let mut st = Staged::default();
+        st.add(write_temp(&a, b"rlib").unwrap(), a.clone());
+        st.add(write_temp(&b, b"rmeta").unwrap(), b.clone());
+        assert!(!a.exists() && !b.exists(), "staged files must not be at their destination");
+        // A tainted job: everything staged is deleted, nothing is written.
+        st.discard();
+        assert!(names(&d.path().join("deps")).is_empty(), "{:?}", names(&d.path().join("deps")));
+        // Dropping staged files (error path) cleans up as well.
+        {
+            let mut lost = Staged::default();
+            lost.add(write_temp(&a, b"x").unwrap(), a.clone());
+        }
+        assert!(names(&d.path().join("deps")).is_empty());
+        // A good job: both files are moved into place.
+        let mut ok = Staged::default();
+        ok.add(write_temp(&a, b"rlib").unwrap(), a.clone());
+        ok.add(write_temp(&b, b"rmeta").unwrap(), b.clone());
+        ok.commit().unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), b"rlib");
+        assert_eq!(names(&d.path().join("deps")), vec!["liba.rlib", "liba.rmeta"]);
+    }
+
+    #[test]
+    fn artifact_notices_are_recognized() {
+        let n = Message::Stderr { line: r#"{"artifact":"C:\\t\\libx.rmeta","emit":"metadata"}"#.into() };
+        assert!(is_artifact_notice(&n));
+        assert!(!is_artifact_notice(&Message::Stderr { line: "warning: unused".into() }));
+        assert!(!is_artifact_notice(&Message::Stdout { line: r#"{"artifact":"x","emit":"link"}"#.into() }));
     }
 
     #[test]

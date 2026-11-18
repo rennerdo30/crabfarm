@@ -188,6 +188,9 @@ pub enum LocalReason {
     RemoteCompileErrorRetry,
     EnvDependency,
     LocalSlotFree,
+    /// The peer found its sandbox path inside an output (`env!("CARGO_MANIFEST_DIR")`
+    /// and the like), which a local build would not contain. Appended in CF-10.
+    SandboxPathInOutput,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
@@ -318,5 +321,11 @@ pub enum Message {
     /// `RunLocal { reason }` once a local slot is free.
     RetryLocal {
         reason: LocalReason,
+    },
+    /// Executor -> submitter (appended in CF-10): the output `path` contains the
+    /// executor's sandbox path. The submitter discards every output of the job
+    /// without writing it and reruns the job locally; the executor stops rustc.
+    Tainted {
+        path: ClientPath,
     },
 }

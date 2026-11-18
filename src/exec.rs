@@ -42,6 +42,9 @@ pub enum ExecEvent {
     /// `.d` files are already rewritten. For an artifact notification line
     /// the `Output` is emitted BEFORE the corresponding `Stderr` line.
     Output { path: ClientPath, hash: BlobHash, data: Vec<u8> },
+    /// The output `path` contains this peer's sandbox path (CF-10). Sent once,
+    /// instead of that output; the job is stopped right after and no `Exit` follows.
+    Tainted(ClientPath),
     Exit(i32),
 }
 
@@ -54,6 +57,9 @@ pub enum ExecAborted {
     Timeout,
     #[error("job cancelled")]
     Cancelled,
+    /// An output embeds the sandbox path; `ExecEvent::Tainted` was sent.
+    #[error("output embeds the sandbox path")]
+    Tainted,
 }
 
 pub struct ExecContext<'a> {
@@ -363,6 +369,44 @@ fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(
     })
 }
 
+/// The strings under which this job's sandbox root can appear inside an output:
+/// the host spelling, the other separator spelling and the `\\?\` prefixed forms
+/// (CF-10). UTF-16 is not searched: rustc writes UTF-8.
+fn sandbox_needles(map: &SandboxMap) -> Vec<Vec<u8>> {
+    let host = map.root.to_string_lossy().into_owned();
+    let host = if cfg!(windows) { host.replace('/', "\\") } else { host };
+    let other = if host.contains('\\') { host.replace('\\', "/") } else { host.replace('/', "\\") };
+    let mut v = vec![host.clone(), other.clone()];
+    if cfg!(windows) {
+        v.push(format!(r"\\?\{host}"));
+        v.push(format!("//?/{other}"));
+    }
+    v.sort();
+    v.dedup();
+    v.into_iter().map(String::into_bytes).collect()
+}
+
+/// Debug-symbol files list the object and output paths of the link by design
+/// (a proc-macro `.pdb` always names the sandbox). Nothing loads them at build
+/// or run time, so they are the one kind of output the scan skips.
+fn scan_exempt(path: &ClientPath) -> bool {
+    path.path.rsplit_once('.').is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("pdb"))
+}
+
+fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
+    let Some(last_start) = hay.len().checked_sub(needle.len()) else { return false };
+    let Some(&first) = needle.first() else { return false };
+    let mut i = 0;
+    while i <= last_start {
+        match hay[i..=last_start].iter().position(|b| *b == first) {
+            Some(off) if hay[i + off..i + off + needle.len()] == *needle => return true,
+            Some(off) => i += off + 1,
+            None => return false,
+        }
+    }
+    false
+}
+
 /// Sends events and remembers what was already emitted as an output.
 struct Emitter<'a> {
     ctx: &'a ExecContext<'a>,
@@ -372,6 +416,9 @@ struct Emitter<'a> {
     events: &'a mpsc::Sender<ExecEvent>,
     /// Outputs already sent (hash of what was sent).
     emitted: HashMap<ClientPath, BlobHash>,
+    needles: Vec<Vec<u8>>,
+    /// Output blobs stored for the owner so far (dropped again when tainted).
+    stored: Vec<BlobHash>,
 }
 
 impl Emitter<'_> {
@@ -385,12 +432,26 @@ impl Emitter<'_> {
         if path.path.ends_with(".d") {
             data = self.rewriter.dep_info(&String::from_utf8_lossy(&data)).into_bytes();
         }
+        // Rewriting removed the sandbox path from `.d` files; anything left in a
+        // file is a path rustc did not remap and a local build would not contain.
+        if !scan_exempt(&path) && self.needles.iter().any(|n| contains_bytes(&data, n)) {
+            let file = path.path.rsplit(['\\', '/']).next().unwrap_or("");
+            tracing::info!(crate_name = self.spec.crate_name.as_str(), file, "output embeds the sandbox path");
+            for h in self.stored.drain(..) {
+                if !self.spec.inputs.iter().any(|i| i.hash == h) {
+                    let _ = self.ctx.store.remove(self.ctx.owner, &h);
+                }
+            }
+            self.send(ExecEvent::Tainted(path)).await?;
+            return Err(anyhow::Error::from(ExecAborted::Tainted));
+        }
         let hash = BlobHash::of(&data);
-        if !self.spec.no_retain
-            && let Err(e) = self.ctx.store.put(self.ctx.owner, &self.ctx.key, &hash, &data)
-        {
-            // The result is still delivered; only the later cache hit is lost.
-            tracing::warn!("could not store output {hash:?}: {e:#}");
+        if !self.spec.no_retain {
+            match self.ctx.store.put(self.ctx.owner, &self.ctx.key, &hash, &data) {
+                Ok(()) => self.stored.push(hash),
+                // The result is still delivered; only the later cache hit is lost.
+                Err(e) => tracing::warn!("could not store output {hash:?}: {e:#}"),
+            }
         }
         self.emitted.insert(path.clone(), hash);
         self.send(ExecEvent::Output { path, hash, data }).await
@@ -435,6 +496,10 @@ pub async fn run(
     // Claimed before anything is deleted: a duplicate (owner, id) must not wipe
     // the sandbox of the job that is running.
     let _running = RunningGuard::claim(ctx, spec)?;
+    // The inputs stay in the store while this job runs, whatever other jobs
+    // delete or evict. Dropped after the `no_retain` cleanup below, which then
+    // takes effect right away.
+    let _pin = ctx.store.pin(ctx.owner, spec.inputs.iter().map(|i| i.hash));
     let _guard = DirGuard(job_dir.clone());
     // A directory left by a crashed run would leak old files into this job.
     let _ = std::fs::remove_dir_all(&job_dir);
@@ -540,7 +605,7 @@ async fn run_in_sandbox(
     let readers = [spawn_reader(stdout, tx.clone(), false), spawn_reader(stderr, tx, true)];
 
     let deadline = tokio::time::Instant::now() + ctx.timeout;
-    let mut em = Emitter { ctx, spec, map, rewriter: &rewriter, events, emitted: HashMap::new() };
+    let mut em = Emitter { ctx, spec, map, rewriter: &rewriter, events, emitted: HashMap::new(), needles: sandbox_needles(map), stored: Vec::new() };
 
     let outcome = async {
         em.send(ExecEvent::Started).await?;
@@ -926,6 +991,97 @@ fn main() {
 
     /// CF-9: on timeout the whole process tree ends, not only rustc, and the
     /// sandbox is removed.
+    /// CF-10: a crate that embeds its manifest dir (`env!`) carries the sandbox
+    /// path; the job reports it instead of sending any output.
+    #[tokio::test]
+    async fn output_with_the_sandbox_path_is_reported_not_sent() {
+        let f = fixture();
+        let src = "pub const DIR: &str = env!(\"CARGO_MANIFEST_DIR\");\n";
+        let spec = lib_spec(&f, src, false);
+        let c = ctx(&f, Duration::from_secs(120));
+        let (res, evs) = collect(&c, &spec, &f.tc, CancellationToken::new()).await;
+        let err = res.unwrap_err();
+        assert_eq!(err.downcast_ref::<ExecAborted>(), Some(&ExecAborted::Tainted), "{err:#}");
+        assert!(evs.iter().any(|e| matches!(e, ExecEvent::Tainted(_))), "{evs:?}");
+        assert!(!evs.iter().any(|e| matches!(e, ExecEvent::Exit(_))), "{evs:?}");
+        // Nothing after the report, and nothing of this job stays in the store.
+        let n = evs.iter().position(|e| matches!(e, ExecEvent::Tainted(_))).unwrap();
+        assert!(!evs[n + 1..].iter().any(|e| matches!(e, ExecEvent::Output { .. })), "{evs:?}");
+        for e in &evs {
+            if let ExecEvent::Output { hash, .. } = e {
+                assert!(!f.store.has(OWNER, hash), "tainted job left an output blob");
+            }
+        }
+        assert!(!f.jobs.join(job_hex(OWNER, &spec.job_id)).exists());
+    }
+
+    #[test]
+    fn only_debug_symbol_files_skip_the_scan() {
+        let p = |s: &str| ClientPath { style: PathStyle::Windows, path: s.into() };
+        assert!(scan_exempt(&p(r"C:\t\derive_mac-1.PDB")));
+        for s in [r"C:\t\libx-1.rlib", r"C:\t\libx-1.rmeta", r"C:\t\x-1.d", r"C:\t\x.dll", r"C:\t\pdb", r"C:\t\x.pdb.rlib"] {
+            assert!(!scan_exempt(&p(s)), "{s}");
+        }
+    }
+
+    #[test]
+    fn needles_cover_both_separators_and_the_prefixed_form() {
+        let map = SandboxMap::new(PathBuf::from("E:/data/jobs/aa-bb/root"));
+        let n: Vec<String> = sandbox_needles(&map).into_iter().map(|b| String::from_utf8(b).unwrap()).collect();
+        if cfg!(windows) {
+            assert!(n.contains(&r"E:\data\jobs\aa-bb\root".to_string()), "{n:?}");
+            assert!(n.contains(&"E:/data/jobs/aa-bb/root".to_string()), "{n:?}");
+            assert!(n.contains(&r"\\?\E:\data\jobs\aa-bb\root".to_string()), "{n:?}");
+        } else {
+            assert!(n.contains(&"E:/data/jobs/aa-bb/root".to_string()), "{n:?}");
+        }
+        assert!(contains_bytes(b"xx\0E:/data/jobs/aa-bb/root/C/a\0", b"E:/data/jobs/aa-bb/root"));
+        assert!(!contains_bytes(b"E:/data/jobs/aa-bb/roo", b"E:/data/jobs/aa-bb/root"));
+        assert!(!contains_bytes(b"", b"x"));
+        assert!(contains_bytes(b"EEE:/x", b"E:/x"), "a false start must not hide the match");
+    }
+
+    /// CF-10 (from CF-14): the inputs of a running job survive the `no_retain`
+    /// cleanup of another job that shares the blob.
+    #[tokio::test]
+    async fn running_job_keeps_its_inputs_when_another_job_cleans_up() {
+        let f = fixture();
+        let fake = fake_sleeper(&f);
+        let spec = lib_spec(&f, SRC, false);
+        let hash = spec.inputs[0].hash;
+        let cancel = CancellationToken::new();
+        let c = ctx(&f, Duration::from_secs(120));
+        let running = {
+            let (spec, fake, cancel) = (spec.clone(), fake.clone(), cancel.clone());
+            let c = ctx(&f, Duration::from_secs(120));
+            async move {
+                // The receiver must live as long as the job: a closed channel cancels it.
+                let (tx, _rx) = mpsc::channel(1024);
+                run(&c, &spec, &fake, tx, cancel).await
+            }
+        };
+        let other = async {
+            let dir = f.jobs.join(job_hex(OWNER, &spec.job_id));
+            for _ in 0..100 {
+                if dir.join("root").exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            // A second job (another id, `no_retain`) shares the blob and finishes.
+            let mut second = lib_spec(&f, SRC, true);
+            second.job_id = JobId([2; 16]);
+            let (res, _) = collect(&c, &second, &f.tc, CancellationToken::new()).await;
+            res.unwrap();
+            assert!(f.store.has(OWNER, &hash), "the running job's input was deleted");
+            cancel.cancel();
+        };
+        let (res, ()) = tokio::join!(running, other);
+        assert!(res.is_err());
+        // The cleanup the second job asked for happens once nobody needs the blob.
+        assert!(!f.store.has(OWNER, &hash), "deferred removal never happened");
+    }
+
     #[tokio::test]
     async fn timeout_kills_grandchildren_and_removes_the_sandbox() {
         let f = fixture();
@@ -973,8 +1129,11 @@ fn main() {
         let first = {
             let c = ctx(&f, Duration::from_secs(120));
             let (spec, fake, cancel) = (spec.clone(), fake.clone(), cancel.clone());
-            let (tx, _rx) = mpsc::channel(1024);
-            async move { run(&c, &spec, &fake, tx, cancel).await }
+            async move {
+                // The receiver must live as long as the job: a closed channel cancels it.
+                let (tx, _rx) = mpsc::channel(1024);
+                run(&c, &spec, &fake, tx, cancel).await
+            }
         };
         let canceller = async {
             // Wait until the first job has its sandbox, then try the duplicate.

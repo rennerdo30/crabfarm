@@ -6,3 +6,4 @@ publish = false
 
 [dependencies]
 core_lib = { path = "../core_lib" }
+embed = { path = "../embed" }

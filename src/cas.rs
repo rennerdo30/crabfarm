@@ -13,7 +13,9 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use std::fs::{self, File};
 use std::io::Write;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 const MAGIC: &[u8; 4] = b"CFB1";
@@ -27,12 +29,65 @@ const STALE_TMP: Duration = Duration::from_secs(24 * 3600);
 pub struct BlobStore {
     pub dir: PathBuf,
     pub max_bytes: u64,
+    pins: Mutex<HashMap<PathBuf, Pin>>,
+}
+
+/// A blob some running job still needs.
+#[derive(Default)]
+struct Pin {
+    count: usize,
+    /// `remove` was called while pinned: delete when the last pin goes.
+    remove_when_free: bool,
+}
+
+/// Keeps the blobs of a running job in the store: `remove` (the `no_retain`
+/// cleanup of another job) and `evict` leave them alone until the guard is
+/// dropped (CF-10, from CF-14).
+pub struct PinGuard<'a> {
+    store: &'a BlobStore,
+    paths: Vec<PathBuf>,
+}
+
+impl Drop for PinGuard<'_> {
+    fn drop(&mut self) {
+        let mut pins = self.store.pins.lock().unwrap_or_else(|e| e.into_inner());
+        for p in &self.paths {
+            let Some(pin) = pins.get_mut(p) else { continue };
+            pin.count = pin.count.saturating_sub(1);
+            if pin.count == 0 {
+                let remove = pin.remove_when_free;
+                pins.remove(p);
+                if remove {
+                    let _ = fs::remove_file(p);
+                }
+            }
+        }
+    }
 }
 
 impl BlobStore {
     pub fn open(dir: &Path, max_bytes: u64) -> anyhow::Result<BlobStore> {
         fs::create_dir_all(dir).with_context(|| format!("create blob store {}", dir.display()))?;
-        Ok(BlobStore { dir: dir.to_path_buf(), max_bytes })
+        Ok(BlobStore { dir: dir.to_path_buf(), max_bytes, pins: Mutex::default() })
+    }
+
+    /// Pin the blobs of `owner` with these hashes (present or not yet received)
+    /// until the guard is dropped. Pins nest: a blob stays while any guard holds it.
+    pub fn pin(&self, owner: NodeId, hashes: impl IntoIterator<Item = BlobHash>) -> PinGuard<'_> {
+        let mut paths: Vec<PathBuf> = hashes.into_iter().map(|h| self.path_of(owner, &h)).collect();
+        paths.sort();
+        paths.dedup();
+        let mut pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
+        for p in &paths {
+            pins.entry(p.clone()).or_default().count += 1;
+        }
+        drop(pins);
+        PinGuard { store: self, paths }
+    }
+
+    /// True when a running job holds this blob.
+    fn pinned(&self, path: &Path) -> bool {
+        self.pins.lock().unwrap_or_else(|e| e.into_inner()).contains_key(path)
     }
 
     fn path_of(&self, owner: NodeId, hash: &BlobHash) -> PathBuf {
@@ -111,8 +166,17 @@ impl BlobStore {
         Ok(plain)
     }
 
+    /// Delete a blob. A pinned blob is deleted when its last pin is released.
     pub fn remove(&self, owner: NodeId, hash: &BlobHash) -> anyhow::Result<()> {
-        match fs::remove_file(self.path_of(owner, hash)) {
+        let path = self.path_of(owner, hash);
+        {
+            let mut pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(pin) = pins.get_mut(&path) {
+                pin.remove_when_free = true;
+                return Ok(());
+            }
+        }
+        match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e).with_context(|| format!("remove blob {hash:?}")),
@@ -138,6 +202,10 @@ impl BlobStore {
                 continue;
             }
             total += md.len();
+            // A running job still reads this one.
+            if self.pinned(entry.path()) {
+                continue;
+            }
             files.push((mtime, md.len(), entry.into_path()));
         }
         files.sort_by_key(|(mtime, _, _)| *mtime);
@@ -250,6 +318,34 @@ mod tests {
         h
     }
 
+    /// CF-10: a blob a running job needs survives `remove` and `evict`.
+    #[test]
+    fn pinned_blobs_survive_remove_and_evict_until_released() {
+        let (_d, s) = store(0);
+        let key = [7u8; 32];
+        let h = put(&s, owner(1), &key, b"input of a running job");
+        let other = put(&s, owner(1), &key, b"unpinned");
+        let pin = s.pin(owner(1), [h]);
+        let nested = s.pin(owner(1), [h]);
+        s.remove(owner(1), &h).unwrap();
+        s.evict().unwrap();
+        assert!(s.has(owner(1), &h), "pinned blob was deleted");
+        assert!(!s.has(owner(1), &other), "evict must still free unpinned blobs");
+        drop(pin);
+        assert!(s.has(owner(1), &h), "still held by the second pin");
+        drop(nested);
+        assert!(!s.has(owner(1), &h), "the requested removal happens when the last pin goes");
+        // Pinning also covers a blob that has not arrived yet; without a removal request it stays.
+        let later = BlobHash::of(b"arrives later");
+        let g = s.pin(owner(1), [later]);
+        s.put(owner(1), &key, &later, b"arrives later").unwrap();
+        s.evict().unwrap();
+        assert!(s.has(owner(1), &later));
+        drop(g);
+        s.evict().unwrap();
+        assert!(!s.has(owner(1), &later), "unpinned again, evicted");
+    }
+
     #[test]
     fn round_trip_and_layout() {
         let (_d, s) = store(u64::MAX);
@@ -335,7 +431,7 @@ mod tests {
         }
         s.get(owner(1), &key, &hashes[0]).unwrap();
         let one = fs::metadata(s.path_of(owner(1), &hashes[0])).unwrap().len();
-        let small = BlobStore { dir: s.dir.clone(), max_bytes: one * 2 };
+        let small = BlobStore { dir: s.dir.clone(), max_bytes: one * 2, pins: Mutex::default() };
         let freed = small.evict().unwrap();
         assert_eq!(freed, one * 2);
         assert!(!s.has(owner(1), &hashes[1]));

@@ -201,11 +201,22 @@ fn two_nodes_build_the_fixture_remotely() {
     assert!(b1.ok, "build failed\n{}", dump());
     let run_app = run(Command::new(app_binary(&target)), 30);
     assert!(run_app.ok, "app failed to run");
-    assert_eq!(run_app.stdout.trim(), "answer=42 generated=from-build-script", "proc macro or OUT_DIR include broke");
+    let mut lines = run_app.stdout.lines();
+    assert_eq!(lines.next(), Some("answer=42 generated=from-build-script"), "proc macro or OUT_DIR include broke");
+    // CF-10: the `embed` crate bakes `env!("CARGO_MANIFEST_DIR")` into its rlib. Built on the
+    // peer that is the peer's sandbox; crabfarm must notice and rebuild it locally.
+    let client_embed = work.join("embed").to_string_lossy().into_owned();
+    assert_eq!(
+        lines.next(),
+        Some(format!("embedded-manifest-dir={client_embed}").as_str()),
+        "the app embeds a path that is not the client's manifest dir\n{}",
+        dump()
+    );
 
     let mut c = crabfarm(&home1);
     c.arg("status");
     let st = run(c, 20);
+    assert!(st.stdout.contains("SandboxPathInOutput 1"), "exactly one job (embed) should be rerun for its sandbox path:\n{}\n{}", st.stdout, dump());
     let remote_ok = counter(&st.stdout, "remote ok");
     assert!(remote_ok >= 3, "expected derive_mac, util and core_lib to run remotely, got {remote_ok}\n{}\n{}", st.stdout, dump());
 

@@ -45,6 +45,9 @@ impl Node {
         // Caps, arguments and environment are checked before any blob is
         // received or written (CF-8); a refusal makes the submitter run locally.
         exec::validate_spec(&spec)?;
+        // From here on no other job's cleanup or an eviction may delete a blob
+        // this job needs, including the ones still to be uploaded.
+        let _pin = self.store.pin(submitter, spec.inputs.iter().map(|i| i.hash));
 
         let timeout = Duration::from_secs(self.cfg.job_timeout_min.max(1) * 60);
         let ctx = ExecContext {
@@ -96,6 +99,7 @@ impl Node {
                         ExecEvent::Stderr(line) => link.send(Message::Stderr { line }).await,
                         ExecEvent::Stdout(line) => link.send(Message::Stdout { line }).await,
                         ExecEvent::Output { path, hash, data } => send_output(link, path, hash, &data).await,
+                        ExecEvent::Tainted(path) => link.send(Message::Tainted { path }).await,
                         ExecEvent::Exit(code) => {
                             exit_code = Some(code);
                             link.send(Message::Exit { code }).await
@@ -129,7 +133,8 @@ impl Node {
                 Ok(())
             }
             Err(e) => match e.downcast_ref::<ExecAborted>() {
-                Some(ExecAborted::Cancelled) => Ok(()),
+                // The submitter was told (`Tainted`) and reruns the job itself.
+                Some(ExecAborted::Cancelled | ExecAborted::Tainted) => Ok(()),
                 Some(ExecAborted::Timeout) => bail!("job timed out"),
                 None => Err(e),
             },

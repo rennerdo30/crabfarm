@@ -3,4 +3,4 @@
 # apart from the crabfarm crate.
 [workspace]
 resolver = "2"
-members = ["app", "core_lib", "derive_mac", "util"]
+members = ["app", "core_lib", "derive_mac", "embed", "util"]

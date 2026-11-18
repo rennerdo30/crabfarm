@@ -90,6 +90,46 @@ pub fn classify(args: &[String], opts: &ClassifyOptions) -> Classified {
 }
 
 pub(crate) const ALLOWED_EMIT: [&str; 3] = ["dep-info", "metadata", "link"];
+
+/// `-C` keys a job may carry to a peer (CF-19): the ones cargo passes for its
+/// profiles (`opt-level`, `debuginfo`, `debug-assertions`, `overflow-checks`,
+/// `codegen-units`, `panic`, `strip`, `lto`, `embed-bitcode`, `split-debuginfo`,
+/// `metadata`, `extra-filename`, `prefer-dynamic` for proc macros) and the
+/// code-generation switches users put into `RUSTFLAGS` or target config. Every
+/// other key (`instrument-coverage`, `profile-generate`, `save-temps`, `ar`,
+/// `dlltool`, `llvm-args`, `remark`, `passes`, ...) keeps the job local. The
+/// path-like ones (`linker`, `link-arg(s)`, `incremental`, `target-cpu=native`)
+/// have their own rules in the classifier and in `guard`.
+pub(crate) const CODEGEN_REMOTE_OK: [&str; 23] = [
+    "opt-level",
+    "debuginfo",
+    "debug-assertions",
+    "overflow-checks",
+    "codegen-units",
+    "panic",
+    "strip",
+    "metadata",
+    "extra-filename",
+    "lto",
+    "embed-bitcode",
+    "target-feature",
+    "target-cpu",
+    "relocation-model",
+    "code-model",
+    "force-frame-pointers",
+    "force-unwind-tables",
+    "split-debuginfo",
+    "symbol-mangling-version",
+    "prefer-dynamic",
+    "link-dead-code",
+    "linker",
+    "linker-flavor",
+];
+
+/// True when `-C key=...` may run on a peer (see [`CODEGEN_REMOTE_OK`]).
+pub(crate) fn codegen_key_remote_ok(key: &str) -> bool {
+    CODEGEN_REMOTE_OK.contains(&key)
+}
 const LINK_CRATE_TYPES: [&str; 4] = ["bin", "dylib", "cdylib", "staticlib"];
 pub(crate) const SEARCH_KINDS: [&str; 5] = ["dependency", "crate", "native", "framework", "all"];
 
@@ -293,6 +333,7 @@ fn classify_inner(args: &[String], opts: &ClassifyOptions) -> Result<RemoteCandi
     let mut emit_paths: Vec<(String, ClientPath)> = Vec::new();
     let mut o_path: Option<ClientPath> = None;
     let mut extra = String::new();
+    let mut link_arg_values: Vec<String> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -477,8 +518,15 @@ fn classify_inner(args: &[String], opts: &ClassifyOptions) -> Result<RemoteCandi
                             extra = val.to_string();
                             push_original(&mut out, &tok);
                         }
-                        // Kept verbatim: only matters when linking a proc-macro on a same-host peer.
-                        "link-arg" | "link-args" => push_original(&mut out, &tok),
+                        // Kept verbatim; only a proc macro links, and `guard` decides
+                        // there (same host, no paths). Checked below once the crate type is known.
+                        "link-arg" | "link-args" => {
+                            link_arg_values.push(val.to_string());
+                            push_original(&mut out, &tok);
+                        }
+                        _ if !codegen_key_remote_ok(key) => {
+                            return Err(format!("-C {key} is not allowed on a peer"));
+                        }
                         _ if looks_absolute(cx.style, val) => {
                             return Err(format!("-C {key} takes a path"));
                         }
@@ -547,6 +595,10 @@ fn classify_inner(args: &[String], opts: &ClassifyOptions) -> Result<RemoteCandi
     let is_proc_macro = crate_types.iter().any(|t| t == "proc-macro");
     if is_proc_macro && crate_types.len() > 1 {
         return Err("proc-macro mixed with other crate types".into());
+    }
+    // The executor refuses these anyway; saying so here saves the round trip.
+    if is_proc_macro && link_arg_values.iter().any(|v| v.contains(['/', '\\'])) {
+        return Err("-C link-arg with a path for a proc macro".into());
     }
     if emits.is_empty() {
         emits.push("link".into());

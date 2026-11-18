@@ -69,8 +69,13 @@ fn crate_name_ok(n: &str) -> bool {
     !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
-/// `-C key[=value]` as the classifier treats it.
-fn codegen_ok(value: &str) -> Result<(), String> {
+/// `-C key[=value]` as the classifier treats it (CF-19). The keys are an
+/// allow-list (`rustc_args::CODEGEN_REMOTE_OK`); a key that is not on it makes
+/// the job local, so a new or dangerous rustc option never runs on a peer by
+/// accident (`instrument-coverage`, `profile-*`, `save-temps`, `ar`, `dlltool`,
+/// `llvm-args`, `remark`, ... are all outside). `link-arg`/`link-args` are
+/// collected into `link_args` and judged once the crate type is known.
+fn codegen_ok(value: &str, link_args: &mut Vec<String>) -> Result<(), String> {
     if value.contains(MARK) && value != format!("linker={MARK}") {
         return Err("-C takes a mapped path".into());
     }
@@ -80,10 +85,8 @@ fn codegen_ok(value: &str) -> Result<(), String> {
     match key {
         "incremental" => Err("-C incremental".into()),
         "target-cpu" if val == "native" => Err("-C target-cpu=native".into()),
-        "profile-generate" | "profile-use" => Err(format!("-C {key}")),
-        // Programs rustc would start: only `linker` is supported, as a bare
-        // name or as a structured path the executor resolves itself.
-        "ar" | "dlltool" | "linker-plugin-lto" | "save-temps" => Err(format!("-C {key}")),
+        // Only `linker` is supported among the programs rustc would start: as a
+        // bare name or as a structured path the executor resolves itself.
         "linker" => {
             if val == MARK.to_string() || (!val.is_empty() && !val.contains(['/', '\\', MARK])) {
                 Ok(())
@@ -98,13 +101,16 @@ fn codegen_ok(value: &str) -> Result<(), String> {
                 Ok(())
             }
         }
-        // Verbatim by contract (only matters when linking a proc macro).
         "link-arg" | "link-args" => {
             if val.contains(MARK) || val.starts_with('@') {
                 Err(format!("-C {key}"))
             } else {
+                link_args.push(val.to_string());
                 Ok(())
             }
+        }
+        _ if !crate::rustc_args::codegen_key_remote_ok(key) => {
+            Err(format!("-C {key} is not allowed on a peer"))
         }
         _ if val.contains(MARK) || abs(val) || val.starts_with('@') => {
             Err(format!("-C {key} takes a path"))
@@ -113,9 +119,31 @@ fn codegen_ok(value: &str) -> Result<(), String> {
     }
 }
 
+/// `-C link-arg` values of a job, judged by what the crate links. A library
+/// (`lib`, `rlib`) is not linked, so rustc never hands the arguments to a
+/// linker. A proc macro is a dynamic library that IS linked, here: allowed only
+/// from the same host as the submitter (the arguments are meant for that
+/// linker) and with no path separator anywhere in them, so nothing can name a
+/// file of the submitter's machine or of this one.
+fn link_args_ok(link_args: &[String], proc_macro: bool, same_host: bool) -> Result<(), String> {
+    if !proc_macro || link_args.is_empty() {
+        return Ok(());
+    }
+    if !same_host {
+        return Err("-C link-arg for a proc macro on a different host".into());
+    }
+    if link_args.iter().any(|a| a.contains(['/', '\\'])) {
+        return Err("-C link-arg with a path for a proc macro".into());
+    }
+    Ok(())
+}
+
 /// Check the whole argument list. `Ok` means every path-carrying flag holds a
 /// structured path (mapped on this peer) or a safe relative path.
-pub fn validate_args(args: &[Arg]) -> Result<(), String> {
+///
+/// `same_host` is true when this peer's toolchain has the host triple of the
+/// submitter's (see `link_args_ok`).
+pub fn validate_args(args: &[Arg], same_host: bool) -> Result<(), String> {
     let mut v: Vec<String> = Vec::with_capacity(args.len());
     let mut structured = Vec::with_capacity(args.len());
     for a in args {
@@ -139,7 +167,8 @@ pub fn validate_args(args: &[Arg]) -> Result<(), String> {
     }
 
     let mut input = false;
-    let mut crate_types = 0usize;
+    let mut crate_types: Vec<String> = Vec::new();
+    let mut link_args: Vec<String> = Vec::new();
     let mut i = 0;
     while i < v.len() {
         let a = v[i].as_str();
@@ -172,7 +201,7 @@ pub fn validate_args(args: &[Arg]) -> Result<(), String> {
                         if !matches!(t, "lib" | "rlib" | "proc-macro") {
                             return Err(format!("crate type {t}"));
                         }
-                        crate_types += 1;
+                        crate_types.push(t.to_string());
                     }
                 }
                 "--crate-name" => {
@@ -234,7 +263,7 @@ pub fn validate_args(args: &[Arg]) -> Result<(), String> {
                         return Err("--remap-path-prefix".into());
                     }
                 }
-                "-C" => codegen_ok(val)?,
+                "-C" => codegen_ok(val, &mut link_args)?,
                 _ => {
                     if val.contains(MARK) {
                         return Err(format!("{} takes no path", tok.name));
@@ -282,9 +311,14 @@ pub fn validate_args(args: &[Arg]) -> Result<(), String> {
     if !input {
         return Err("no input file".into());
     }
-    if crate_types == 0 {
+    if crate_types.is_empty() {
         return Err("no --crate-type".into());
     }
+    link_args_ok(
+        &link_args,
+        crate_types.iter().any(|t| t == "proc-macro"),
+        same_host,
+    )?;
     Ok(())
 }
 
@@ -393,24 +427,44 @@ fn never_forward(name: &str) -> bool {
         )
 }
 
-/// Names the submitter may declare beyond DESIGN section 9. Also used on the
-/// submitter side, so a `forward_env` entry such as `PATH` is never sent.
+/// Names a submitter may put into `forward_env` at all. Also used on the
+/// submitter side, so `forward_env = ["PATH"]` is never sent. This is a floor
+/// under the executor's own allow-list (`Policy::accept_env`), not a way to
+/// accept anything it does not exclude.
 pub fn extra_env_name_ok(name: &str) -> bool {
     !never_forward(name)
 }
 
-/// Check the job environment. `node_has` tells whether the peer's own
-/// environment defines a name: a declared extra name may not override it.
+/// What the executing node decides on its own, never what the job says.
+pub struct Policy<'a> {
+    /// Host triple of the toolchain that would run the job.
+    pub peer_host: &'a str,
+    /// Names the operator of this node accepts as `extra_env` (config
+    /// `accept_env`). Empty by default: a job that declares any other
+    /// variable is refused and runs on the submitter.
+    pub accept_env: &'a [String],
+    /// Whether this node's own environment defines a name.
+    pub node_has: &'a dyn Fn(&str) -> bool,
+}
+
+/// Check the job environment (CF-8, CF-18, CF-19).
+///
+/// Every variable must be on the allow-list (`design_env`) or be declared in
+/// `extra_env` AND listed in the operator's `accept_env`; the hard floor
+/// (`never_forward`: `PATH`, loader, wrapper and machine variables) holds even
+/// then, and a declared name may not override a variable of the peer's own
+/// environment.
 ///
 /// `RUSTC_BOOTSTRAP` is accepted because DESIGN section 9 forwards it and it
 /// only reaches the job when the submitter set it itself (the job environment
 /// is the submitter's forwarded set); a local build with that variable behaves
 /// the same. The peer's own `RUSTC_BOOTSTRAP` never reaches a job
 /// (`exec::is_build_var`).
-pub fn validate_env(spec: &JobSpec, node_has: &dyn Fn(&str) -> bool) -> Result<(), String> {
+pub fn validate_env(spec: &JobSpec, policy: &Policy) -> Result<(), String> {
     for n in &spec.extra_env {
-        if !extra_env_name_ok(n) || design_env(n) || node_has(n) {
-            return Err("job declares a variable the farm does not forward".into());
+        let accepted = policy.accept_env.iter().any(|a| a.eq_ignore_ascii_case(n));
+        if !extra_env_name_ok(n) || design_env(n) || !accepted || (policy.node_has)(n) {
+            return Err("job declares a variable this node does not accept".into());
         }
     }
     for (k, v) in &spec.env {
@@ -431,16 +485,35 @@ pub fn validate_env(spec: &JobSpec, node_has: &dyn Fn(&str) -> bool) -> Result<(
 }
 
 /// Everything that can be decided without touching the file system.
-pub fn validate_spec(spec: &JobSpec, node_has: &dyn Fn(&str) -> bool) -> Result<(), String> {
+pub fn validate_spec(spec: &JobSpec, policy: &Policy) -> Result<(), String> {
     check_caps(spec)?;
-    validate_args(&spec.args)?;
-    validate_env(spec, node_has)
+    validate_args(&spec.args, spec.toolchain.host == policy.peer_host)?;
+    validate_env(spec, policy)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::proto::{ClientPath, InputFile, JobId, ToolchainId};
+
+    /// `validate_args` for a job from the submitter's own host.
+    fn va(a: &[Arg]) -> Result<(), String> {
+        validate_args(a, true)
+    }
+
+    /// `validate_env` for a node that accepts `accept` and has no own variables.
+    fn ve(spec: &JobSpec, accept: &[&str]) -> Result<(), String> {
+        let none = |_: &str| false;
+        let accept: Vec<String> = accept.iter().map(|s| s.to_string()).collect();
+        validate_env(
+            spec,
+            &Policy {
+                peer_host: "h",
+                accept_env: &accept,
+                node_has: &none,
+            },
+        )
+    }
 
     fn cp(s: &str) -> ClientPath {
         ClientPath::parse(PathStyle::Windows, s).expect("test path")
@@ -492,7 +565,7 @@ mod tests {
 
     #[test]
     fn classifier_shaped_arguments_pass() {
-        assert_eq!(validate_args(&good()), Ok(()));
+        assert_eq!(va(&good()), Ok(()));
         // Attached forms and a mapped linker.
         let mut a = good();
         a.push(Arg::PrefixedPath {
@@ -501,7 +574,7 @@ mod tests {
         });
         a.push(p("--emit=metadata=target/x.rmeta"));
         a.push(p("-Ldependency=deps"));
-        assert_eq!(validate_args(&a), Ok(()));
+        assert_eq!(va(&a), Ok(()));
     }
 
     #[test]
@@ -545,7 +618,7 @@ mod tests {
         for extra in cases {
             let mut a = good();
             a.extend(extra.clone());
-            assert!(validate_args(&a).is_err(), "must refuse {extra:?}");
+            assert!(va(&a).is_err(), "must refuse {extra:?}");
         }
     }
 
@@ -553,20 +626,17 @@ mod tests {
     fn structure_is_required() {
         let mut a = good();
         a.push(Arg::Path(cp(r"C:\w\src\other.rs")));
-        assert!(validate_args(&a).is_err(), "two inputs");
-        assert!(
-            validate_args(&[p("--crate-type"), p("lib")]).is_err(),
-            "no input"
-        );
+        assert!(va(&a).is_err(), "two inputs");
+        assert!(va(&[p("--crate-type"), p("lib")]).is_err(), "no input");
         let mut b = good();
         b.retain(|x| !matches!(x, Arg::Plain(s) if s == "lib"));
         b.retain(|x| !matches!(x, Arg::Plain(s) if s == "--crate-type"));
-        assert!(validate_args(&b).is_err(), "no crate type");
+        assert!(va(&b).is_err(), "no crate type");
         // The marker cannot be forged.
         let mut c = good();
         c.push(p("--cfg"));
         c.push(p("x\u{1}"));
-        assert!(validate_args(&c).is_err());
+        assert!(va(&c).is_err());
     }
 
     fn spec(env: Vec<(&str, EnvValue)>, extra: &[&str]) -> JobSpec {
@@ -598,7 +668,6 @@ mod tests {
 
     #[test]
     fn env_follows_design_section_9() {
-        let none = |_: &str| false;
         let ok = spec(
             vec![
                 ("CARGO_PKG_NAME", plain("x")),
@@ -609,7 +678,7 @@ mod tests {
             ],
             &["MY_VAR"],
         );
-        assert_eq!(validate_env(&ok, &none), Ok(()));
+        assert_eq!(ve(&ok, &["MY_VAR"]), Ok(()));
         // CF-18: credentials and settings of cargo are refused when
         // undeclared, whatever their prefix; so are build-script variables.
         for bad in [
@@ -627,7 +696,7 @@ mod tests {
             "DEBUG",
         ] {
             let s = spec(vec![(bad, plain("x"))], &[]);
-            assert!(validate_env(&s, &none).is_err(), "{bad} must be refused");
+            assert!(ve(&s, &[bad]).is_err(), "{bad} must be refused");
         }
         for bad in [
             "PATH",
@@ -643,18 +712,149 @@ mod tests {
             "HOME",
         ] {
             let s = spec(vec![(bad, plain("x"))], &[]);
-            assert!(validate_env(&s, &none).is_err(), "{bad} undeclared");
-            // Declaring it does not help.
+            assert!(ve(&s, &[]).is_err(), "{bad} undeclared");
+            // Declaring it does not help, and neither does accepting it.
             let s = spec(vec![(bad, plain("x"))], &[bad]);
-            assert!(validate_env(&s, &none).is_err(), "{bad} declared");
+            assert!(ve(&s, &[]).is_err(), "{bad} declared");
+            assert!(ve(&s, &[bad]).is_err(), "{bad} declared and accepted");
         }
         // An undeclared variable is refused; a declared one that the node itself defines too is refused.
-        assert!(validate_env(&spec(vec![("MY_VAR", plain("v"))], &[]), &none).is_err());
+        assert!(ve(&spec(vec![("MY_VAR", plain("v"))], &[]), &["MY_VAR"]).is_err());
+        let none_accepted: Vec<String> = vec!["MY_VAR".into()];
+        let has = |n: &str| n == "MY_VAR";
         assert!(
-            validate_env(&spec(vec![("MY_VAR", plain("v"))], &["MY_VAR"]), &|n| n
-                == "MY_VAR")
+            validate_env(
+                &spec(vec![("MY_VAR", plain("v"))], &["MY_VAR"]),
+                &Policy {
+                    peer_host: "h",
+                    accept_env: &none_accepted,
+                    node_has: &has,
+                }
+            )
             .is_err()
         );
+    }
+
+    /// CF-19: a declared name is accepted only when the node's operator listed
+    /// it (`accept_env`); the default is to refuse every declaration.
+    #[test]
+    fn declared_names_need_the_operators_allow_list() {
+        let job = spec(vec![("MY_VAR", plain("v"))], &["MY_VAR"]);
+        assert!(ve(&job, &[]).is_err(), "nothing accepted by default");
+        assert!(ve(&job, &["OTHER"]).is_err());
+        assert_eq!(
+            ve(&job, &["my_var"]),
+            Ok(()),
+            "names compare case-insensitively"
+        );
+        // A name that is only declared (not set in env) is refused too.
+        let declared_only = spec(vec![], &["MY_VAR"]);
+        assert!(ve(&declared_only, &[]).is_err());
+    }
+
+    /// `-C` keys cargo really passes (taken from `cargo build -v` of the test
+    /// fixture and the usual RUSTFLAGS) stay accepted.
+    #[test]
+    fn real_cargo_codegen_flags_pass() {
+        for c in [
+            "embed-bitcode=no",
+            "debug-assertions=off",
+            "debuginfo=2",
+            "opt-level=3",
+            "opt-level=s",
+            "overflow-checks=on",
+            "codegen-units=16",
+            "panic=abort",
+            "strip=debuginfo",
+            "lto=thin",
+            "split-debuginfo=packed",
+            "metadata=a293107b07e6888e",
+            "extra-filename=-4467f462d3a319e5",
+            "prefer-dynamic",
+            "target-feature=+crt-static",
+            "target-cpu=x86-64-v3",
+            "relocation-model=pic",
+            "code-model=small",
+            "force-frame-pointers=yes",
+            "symbol-mangling-version=v0",
+            "linker=link.exe",
+            "linker-flavor=gcc",
+            "link-arg=-fuse-ld=lld",
+        ] {
+            let mut a = good();
+            a.push(p("-C"));
+            a.push(p(c));
+            assert_eq!(va(&a), Ok(()), "-C {c}");
+        }
+    }
+
+    /// CF-19: any `-C` key outside the allow-list is refused, including the
+    /// ones that write files or start programs.
+    #[test]
+    fn unknown_codegen_keys_are_refused() {
+        for c in [
+            "instrument-coverage",
+            "instrument-coverage=all",
+            "llvm-args=-time-passes",
+            "remark=all",
+            "passes=x",
+            "no-prepopulate-passes",
+            "save-temps",
+            "ar=x",
+            "dlltool=x",
+            "profile-generate",
+            "profile-use=x",
+            "link-self-contained=yes",
+            "linker-plugin-lto",
+            "pgo-gen=x",
+            "some-future-option=1",
+            "opt-level=/etc/x",
+            "opt-level=@file",
+        ] {
+            let mut a = good();
+            a.push(p("-C"));
+            a.push(p(c));
+            assert!(va(&a).is_err(), "-C {c} must be refused");
+            let mut b = good();
+            b.push(p(&format!("-C{c}")));
+            assert!(va(&b).is_err(), "-C{c} must be refused");
+        }
+    }
+
+    /// CF-19: link arguments reach a linker only for a proc macro; there they
+    /// need the submitter's host and no path.
+    #[test]
+    fn link_args_are_judged_by_what_gets_linked() {
+        let with = |crate_type: &str, arg: &str| {
+            let mut a = good();
+            a.push(p("--crate-type"));
+            a.push(p(crate_type));
+            a.push(p("-C"));
+            a.push(p(arg));
+            a
+        };
+        // A library is not linked: nothing to check.
+        assert_eq!(va(&with("rlib", "link-arg=-Wl,-rpath,/opt/lib")), Ok(()));
+        // A proc macro from the same host, without a path.
+        assert_eq!(va(&with("proc-macro", "link-arg=-fuse-ld=lld")), Ok(()));
+        assert_eq!(
+            va(&with("proc-macro", "link-args=-Wl,--as-needed -pthread")),
+            Ok(())
+        );
+        // With a path (either separator), whatever it names.
+        for bad in [
+            "link-arg=-Wl,-rpath,/opt/lib",
+            "link-arg=-LC:\\libs",
+            "link-arg=-L/usr/lib",
+            "link-args=-fuse-ld=/usr/bin/evil",
+            "link-arg=@rsp",
+        ] {
+            assert!(va(&with("proc-macro", bad)).is_err(), "{bad}");
+        }
+        // From a different host the arguments are not meant for this linker.
+        let a = with("proc-macro", "link-arg=-fuse-ld=lld");
+        assert!(validate_args(&a, false).is_err());
+        assert_eq!(validate_args(&with("rlib", "link-arg=-x"), false), Ok(()));
     }
 
     #[test]

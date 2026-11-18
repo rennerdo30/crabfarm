@@ -57,7 +57,7 @@ impl Node {
         }
         // Caps, arguments and environment are checked before any blob is
         // received or written (CF-8); a refusal makes the submitter run locally.
-        exec::validate_spec(&spec)?;
+        exec::validate_spec(&spec, &self.cfg.accept_env, &self.host_triple)?;
         // From here on no other job's cleanup or an eviction may delete a blob
         // this job needs, including the ones still to be uploaded.
         let _pin = self
@@ -72,6 +72,7 @@ impl Node {
             owner: submitter,
             key: blob_key,
             timeout,
+            accept_env: &self.cfg.accept_env,
         };
         let missing = exec::missing_inputs(&ctx, &spec);
         if !missing.is_empty() {
@@ -103,6 +104,7 @@ impl Node {
                 owner: submitter,
                 key: blob_key,
                 timeout,
+                accept_env: &node.cfg.accept_env,
             };
             exec::run(&ctx, &spec2, &toolchain, etx, cancel2).await
         });

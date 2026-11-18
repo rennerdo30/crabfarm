@@ -75,6 +75,8 @@ pub struct ExecContext<'a> {
     pub owner: NodeId,
     pub key: [u8; 32],
     pub timeout: std::time::Duration,
+    /// Config `accept_env` of this node (CF-19).
+    pub accept_env: &'a [String],
 }
 
 /// Inputs from `spec.inputs` that are not in the store for `owner`.
@@ -192,9 +194,14 @@ fn validate_paths(spec: &JobSpec, map: &SandboxMap) -> anyhow::Result<()> {
 
 /// Refuse a job whose argument list, environment or size is outside what the
 /// submitter's wrapper can produce (CF-8). The submitter then runs it locally.
-pub fn validate_spec(spec: &JobSpec) -> anyhow::Result<()> {
-    guard::validate_spec(spec, &|n| std::env::var_os(n).is_some())
-        .map_err(|why| anyhow::anyhow!("job refused: {why}"))
+pub fn validate_spec(spec: &JobSpec, accept_env: &[String], peer_host: &str) -> anyhow::Result<()> {
+    let node_has = |n: &str| std::env::var_os(n).is_some();
+    let policy = guard::Policy {
+        peer_host,
+        accept_env,
+        node_has: &node_has,
+    };
+    guard::validate_spec(spec, &policy).map_err(|why| anyhow::anyhow!("job refused: {why}"))
 }
 
 /// `SandboxMap::to_sandbox` with an error for a path that cannot be mapped.
@@ -608,7 +615,7 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let job_dir = ctx.jobs_dir.join(job_hex(ctx.owner, &spec.job_id));
     let map = SandboxMap::new(job_dir.join("root"));
-    validate_spec(spec)?;
+    validate_spec(spec, ctx.accept_env, &toolchain.id.host)?;
     validate_paths(spec, &map)?;
     // Claimed before anything is deleted: a duplicate (owner, id) must not wipe
     // the sandbox of the job that is running.
@@ -930,6 +937,7 @@ mod tests {
             owner: OWNER,
             key: KEY,
             timeout,
+            accept_env: &[],
         }
     }
 
@@ -1389,7 +1397,9 @@ fn main() {
             "CRABFARM_TEST_PIDFILE".into(),
             EnvValue::Plain(pidfile.to_string_lossy().into_owned()),
         ));
-        let c = ctx(&f, Duration::from_millis(3000));
+        let accept = vec!["CRABFARM_TEST_PIDFILE".to_string()];
+        let mut c = ctx(&f, Duration::from_millis(3000));
+        c.accept_env = &accept;
         let (res, _evs) = collect(&c, &spec, &fake, CancellationToken::new()).await;
         let err = res.unwrap_err();
         assert_eq!(

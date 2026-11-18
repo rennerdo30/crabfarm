@@ -21,6 +21,9 @@ pub struct Config {
     pub cache_max_gb: u64,
     pub job_timeout_min: u64,
     pub forward_env: Vec<String>,
+    /// Variable names this node accepts from submitters beyond cargo's own
+    /// (their `forward_env`); empty by default (DESIGN sections 9 and 12, CF-19).
+    pub accept_env: Vec<String>,
     /// Concurrent local rustc runs on this machine (default logical CPUs).
     pub local_slots: u32,
     /// Announce and browse via mDNS (tests set false).
@@ -55,6 +58,7 @@ impl Default for Config {
             cache_max_gb: 20,
             job_timeout_min: 30,
             forward_env: Vec::new(),
+            accept_env: Vec::new(),
             local_slots: std::thread::available_parallelism()
                 .map(|n| n.get() as u32)
                 .unwrap_or(4),

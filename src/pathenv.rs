@@ -70,7 +70,10 @@ pub fn add(backend: &mut dyn EnvBackend, dir: &str) -> anyhow::Result<Change> {
     let new = if value.trim().is_empty() {
         dir.to_string()
     } else if value.ends_with(';') {
-        format!("{value}{dir}")
+        // Keep the closing separator too: `remove` then restores the stored
+        // text exactly, which a value that ended with `;` (the Windows default
+        // for many user PATHs) needs (CF-29).
+        format!("{value}{dir};")
     } else {
         format!("{value};{dir}")
     };
@@ -237,7 +240,14 @@ pub mod tests {
         add(&mut e, DIR).unwrap();
         let v = e.value.unwrap();
         assert!(v.expand, "REG_EXPAND_SZ must stay REG_EXPAND_SZ");
-        assert_eq!(v.value, format!(r"%SystemRoot%;C:\x;{DIR}"));
+        assert_eq!(v.value, format!(r"%SystemRoot%;C:\x;{DIR};"));
+        // And remove gives back exactly what was stored (CF-29).
+        for stored in [r"%SystemRoot%;C:\x;", r"%SystemRoot%;C:\x"] {
+            let mut e = FakeEnv::with(stored, true);
+            add(&mut e, DIR).unwrap();
+            remove(&mut e, DIR).unwrap();
+            assert_eq!(e.value.unwrap().value, stored);
+        }
 
         let mut e = FakeEnv::with(r"C:\x", false);
         add(&mut e, DIR).unwrap();

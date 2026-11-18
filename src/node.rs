@@ -796,8 +796,53 @@ pub fn init_logging(data_dir: &Path) {
         .try_init();
 }
 
-/// Run the node until `shutdown` is cancelled.
-pub async fn run(data_dir: PathBuf, shutdown: CancellationToken) -> anyhow::Result<()> {
+/// Exclusive claim on a data directory (CF-19): one node per directory.
+/// Held for the life of the node; the operating system releases it when the
+/// process ends, however it ends.
+pub struct NodeLock {
+    file: std::fs::File,
+}
+
+impl NodeLock {
+    /// Take `<data>/node.lock`, or fail at once with a message that names the
+    /// problem. Nothing else in the directory is touched: callers take this
+    /// before logging, the job sweep, or binding any port.
+    pub fn acquire(data_dir: &Path) -> anyhow::Result<NodeLock> {
+        std::fs::create_dir_all(data_dir)
+            .with_context(|| format!("create {}", data_dir.display()))?;
+        let path = data_dir.join("node.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(NodeLock { file }),
+            Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+                "another crabfarm node is already running with this data directory ({});                  stop it first, or set CRABFARM_HOME to run a second node",
+                data_dir.display()
+            ),
+            Err(std::fs::TryLockError::Error(e)) => {
+                Err(e).with_context(|| format!("lock {}", path.display()))
+            }
+        }
+    }
+}
+
+impl Drop for NodeLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+/// Run the node until `shutdown` is cancelled. `_lock` is the data directory
+/// claim from [`NodeLock::acquire`], kept until the node has shut down.
+pub async fn run(
+    data_dir: PathBuf,
+    shutdown: CancellationToken,
+    _lock: NodeLock,
+) -> anyhow::Result<()> {
     let cfg = Config::load(&data_dir).context("read config.toml")?;
     let id = farm::load(&data_dir)?
         .context("this machine is not part of a farm: run `crabfarm farm create` or `crabfarm farm join <code>` first")?;

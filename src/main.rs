@@ -97,6 +97,9 @@ fn real_main() -> anyhow::Result<i32> {
         Cmd::Status => Ok(status::run()),
         Cmd::Node => {
             let data_dir = config::data_dir()?;
+            // First, before logging, the job sweep or any port: a second node on
+            // the same directory must not touch anything of the first (CF-19).
+            let lock = node::NodeLock::acquire(&data_dir)?;
             node::init_logging(&data_dir);
             let rt = runtime()?;
             rt.block_on(async {
@@ -106,7 +109,7 @@ fn real_main() -> anyhow::Result<i32> {
                     let _ = tokio::signal::ctrl_c().await;
                     t2.cancel();
                 });
-                node::run(data_dir, token).await
+                node::run(data_dir, token, lock).await
             })?;
             Ok(0)
         }

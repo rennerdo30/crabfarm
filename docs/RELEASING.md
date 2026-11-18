@@ -59,7 +59,11 @@ The owner reviews the draft and publishes it.
 One-time setup by the owner (the agents never create secrets):
 1. Create a crates.io API token scoped to publishing the `crabfarm` crate (crates.io, Account Settings, API Tokens).
 2. In the repository: Settings, Environments, New environment `crates-io`; add **Required reviewers** (the owner) so each upload needs an approval.
-3. Add the token as the environment secret `CARGO_REGISTRY_TOKEN`.
+3. Add the token as an **environment secret** named `CARGO_REGISTRY_TOKEN` in `crates-io` (not a repository secret; a repository secret would be readable by every workflow).
+
+The workflow checks out `refs/tags/<tag>`, runs `cargo package --locked` (which builds the packaged crate to verify it) in a step **without** the token, and only then runs `cargo publish --locked --no-verify` with the token in that one step's environment. No compiled code (build scripts, proc macros) ever runs next to the token.
+
+**Switching to Trusted Publishing after the first release.** crates.io can issue a short-lived token over OIDC so no long-lived secret is stored, but the crate must already exist: the first release is published with the token above, then (crates.io, the crate's Settings, Trusted Publishing) add the GitHub repository `rennerdo30/crabfarm`, workflow `publish-crate.yml`, environment `crates-io`. Then change the workflow: give the job `permissions: id-token: write`, add a step `rust-lang/crates-io-auth-action` (pinned to a commit SHA) with `id: auth`, pass `${{ steps.auth.outputs.token }}` as `CARGO_REGISTRY_TOKEN` to the publish step, and delete the stored secret and the API token. The package-and-verify step stays token-free. Source: the Rust blog post "crates.io: development update" of 2025-07-11 and https://crates.io/docs/trusted-publishing.
 
 A crates.io version can never be overwritten, only yanked. `cargo package --list` shows what ships (`include` in `Cargo.toml`: `src`, `Cargo.toml`, `Cargo.lock`, `LICENSE`, `README.md`, `CHANGELOG.md`, `docs/DESIGN.md`).
 

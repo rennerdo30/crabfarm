@@ -431,6 +431,7 @@ impl std::fmt::Debug for Message {
             }
             Message::Exit { code } => f.debug_struct("Exit").field("code", code).finish(),
             Message::Cancel => f.write_str("Cancel"),
+            Message::Tainted { path } => f.debug_struct("Tainted").field("path", path).finish(),
             Message::IpcAuth { .. } => f.debug_struct("IpcAuth").field("token", &Redacted).finish(),
             Message::Submit { spec, rustc, produces, externs, input, search_dirs, link_libs } => f
                 .debug_struct("Submit")
@@ -485,6 +486,7 @@ mod tests {
             crate_name: "mycrate".into(),
             no_retain: false,
             needs_host: false,
+            extra_env: vec![],
         };
         let job = format!("{:?}", Message::JobRequest { spec, blob_key: key });
         assert!(!job.contains("hunter2") && !job.contains("77") && !job.contains("88"), "{job}");

@@ -148,6 +148,51 @@ pub fn target_is_file(target: &str) -> bool {
     target.ends_with(".json") || target.contains('/') || target.contains('\\')
 }
 
+/// The identity of the crate a job compiles, for the hermetic proofs
+/// ([`crate::hermetic`]): package name and version (`CARGO_PKG_NAME`,
+/// `CARGO_PKG_VERSION`), the client manifest dir, the target and the crate
+/// types. `None` when the job does not carry them all; such a crate can never
+/// be proven and its local results are never stored.
+pub fn crate_identity(spec: &JobSpec) -> Option<String> {
+    let var = |name: &str| spec.env.iter().find(|(k, _)| k == name).map(|(_, v)| v);
+    let (Some(EnvValue::Plain(name)), Some(EnvValue::Plain(version)), Some(EnvValue::Path(dir))) = (
+        var("CARGO_PKG_NAME"),
+        var("CARGO_PKG_VERSION"),
+        var("CARGO_MANIFEST_DIR"),
+    ) else {
+        return None;
+    };
+    let mut types: Vec<&str> = Vec::new();
+    let mut args = spec.args.iter();
+    while let Some(a) = args.next() {
+        let Arg::Plain(a) = a else { continue };
+        if a == "--crate-type" {
+            if let Some(Arg::Plain(v)) = args.next() {
+                types.extend(v.split(','));
+            }
+        } else if let Some(v) = a.strip_prefix("--crate-type=") {
+            types.extend(v.split(','));
+        }
+    }
+    types.sort_unstable();
+    types.dedup();
+    if types.is_empty() {
+        return None;
+    }
+    let mut e = Enc(blake3::Hasher::new_derive_key(
+        "crabfarm hermetic crate identity",
+    ));
+    e.str(1, name);
+    e.str(2, version);
+    e.path(3, dir);
+    e.str(4, &spec.target);
+    e.num(5, types.len() as u64);
+    for t in types {
+        e.str(6, t);
+    }
+    Some(data_encoding::HEXLOWER.encode(e.0.finalize().as_bytes()))
+}
+
 // ----------------------------------------------------------- dep-info check
 
 /// The files a dep-info (`.d`) lists as read: its `path:` lines without
@@ -582,6 +627,70 @@ mod tests {
             no_retain: false,
             needs_host: false,
         }
+    }
+
+    /// The identity is the package, its version, where it lives, the target and
+    /// the crate types, and nothing a source edit changes.
+    #[test]
+    fn the_crate_identity_is_name_version_dir_target_and_types() {
+        let mut base = spec();
+        base.env
+            .push(("CARGO_PKG_VERSION".into(), EnvValue::Plain("1.2.3".into())));
+        base.args.push(Arg::Plain("--crate-type".into()));
+        base.args.push(Arg::Plain("lib".into()));
+        let id = crate_identity(&base).expect("identity");
+        assert_eq!(id.len(), 64);
+        let with = |f: &dyn Fn(&mut JobSpec)| {
+            let mut s = base.clone();
+            f(&mut s);
+            crate_identity(&s)
+        };
+        assert_eq!(
+            with(&|s| s.inputs[0].hash = BlobHash::of(b"edited")).as_deref(),
+            Some(id.as_str()),
+            "a source edit is the same crate"
+        );
+        assert_eq!(
+            with(&|s| {
+                s.args.pop();
+                s.args.pop();
+                s.args.push(Arg::Plain("--crate-type=lib".into()));
+            })
+            .as_deref(),
+            Some(id.as_str()),
+            "both spellings of the crate type"
+        );
+        for (what, other) in [
+            (
+                "name",
+                with(&|s| s.env[0].1 = EnvValue::Plain("bar".into())),
+            ),
+            (
+                "version",
+                with(&|s| s.env[2].1 = EnvValue::Plain("1.2.4".into())),
+            ),
+            ("dir", with(&|s| s.env[1].1 = EnvValue::Path(cp(r"C:\q")))),
+            (
+                "target",
+                with(&|s| s.target = "aarch64-apple-darwin".into()),
+            ),
+            (
+                "types",
+                with(&|s| {
+                    s.args.pop();
+                    s.args.push(Arg::Plain("rlib".into()));
+                }),
+            ),
+        ] {
+            assert_ne!(other.as_deref(), Some(id.as_str()), "{what} must matter");
+        }
+        assert_eq!(
+            with(&|s| {
+                s.env.remove(2);
+            }),
+            None,
+            "without a version there is no identity"
+        );
     }
 
     /// Every component of the key matters (CF-28): changing any one of them

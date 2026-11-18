@@ -263,7 +263,11 @@ fn cargo_build(home: &Path, work: &Path, target: &Path) -> Output {
     ])
     .arg(work.join("Cargo.toml"))
     .env("CARGO_TARGET_DIR", target)
-    .env("CARGO_NET_OFFLINE", "true");
+    .env("CARGO_NET_OFFLINE", "true")
+    // An empty wrapper switches a machine-local `rustc-wrapper` (sccache) off:
+    // it would answer local compiles of a crate whose proc macro read a file
+    // outside the package from ITS cache, which is not what is tested.
+    .env("RUSTC_WRAPPER", "");
     run(c, 150)
 }
 
@@ -482,10 +486,11 @@ fn a_clean_rebuild_is_served_from_the_cache() {
         "all eligible crates should be local hits: {c1b:?}\n{}",
         b2.stderr
     );
+    // Only `embed` (never proven hermetic, so never cached) misses again.
     assert_eq!(
         c1b.misses,
-        c1.misses,
-        "no new miss: {c1b:?}
+        c1.misses + 1,
+        "only embed may miss: {c1b:?}
 {}",
         node_log(&n1.home)
     );
@@ -725,6 +730,7 @@ fn a_variable_the_crate_reads_never_makes_a_stale_hit() {
         .arg(work.join("Cargo.toml"))
         .env("CARGO_TARGET_DIR", &target)
         .env("CARGO_NET_OFFLINE", "true")
+        .env("RUSTC_WRAPPER", "")
         .env_remove("CF_CACHE_PROBE");
         if let Some(v) = value {
             c.env("CF_CACHE_PROBE", v);
@@ -802,11 +808,9 @@ fn a_crate_that_reads_a_file_outside_its_package_is_never_served_stale() {
     let work = outside_workspace(tmp.path());
     let target = tmp.path().join("target");
     let n = single_node(tmp.path(), "");
-    let exe = target.join("release").join(if cfg!(windows) {
-        "app.exe"
-    } else {
-        "app"
-    });
+    let exe = target
+        .join("release")
+        .join(if cfg!(windows) { "app.exe" } else { "app" });
     let build = |text: &str| -> String {
         write(&work.join("outside.txt"), text);
         let _ = std::fs::remove_dir_all(&target);
@@ -834,7 +838,10 @@ fn a_crate_proven_on_a_peer_is_cached_when_it_builds_locally() {
     let f = fixture();
     let (mut n1, n2) = proving_farm(&f);
     build_ok(&n1, &f.work, &f.target);
-    assert!(remote_ok(&n1.home) >= ELIGIBLE, "the first build uses the peer");
+    assert!(
+        remote_ok(&n1.home) >= ELIGIBLE,
+        "the first build uses the peer"
+    );
 
     // Restart node one with free local slots and no preference for the peer;
     // what it learned must survive the restart.
@@ -869,4 +876,41 @@ fn a_crate_proven_on_a_peer_is_cached_when_it_builds_locally() {
     );
     assert_eq!(remote_ok(&n1.home), 0);
     drop(n2);
+}
+
+/// The same crate on a farm: it fails on the peer (the file is not in the
+/// sandbox), builds locally, shows the changed file every time and is never
+/// cached (the local rerun after a remote failure revokes any proof).
+#[test]
+fn a_crate_that_fails_on_a_peer_and_builds_locally_is_not_cached() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let work = outside_workspace(tmp.path());
+    let target = tmp.path().join("target");
+    let (n, _peer) = two_nodes(
+        tmp.path(),
+        "local_slots = 1\nprefer_remote = true",
+        "local_slots = 2",
+    );
+    let exe = target
+        .join("release")
+        .join(if cfg!(windows) { "app.exe" } else { "app" });
+    for text in ["one", "two", "three"] {
+        write(&work.join("outside.txt"), text);
+        let _ = std::fs::remove_dir_all(&target);
+        let b = cargo_build(&n.home, &work, &target);
+        assert!(b.ok, "build failed: {}\n{}", b.stderr, node_log(&n.home));
+        let o = run(Command::new(&exe), 30);
+        assert!(o.ok);
+        assert_eq!(
+            o.stdout.trim(),
+            format!("outside={text}"),
+            "a stale result was served\n{}",
+            node_log(&n.home)
+        );
+    }
+    assert!(
+        not_proven(&n.home) >= 3,
+        "user ran locally three times and was never cached"
+    );
 }

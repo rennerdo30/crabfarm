@@ -29,6 +29,7 @@ pub mod cargo_cmd;
 pub mod depgraph;
 pub mod envlearn;
 pub mod executor;
+pub mod hermetic;
 pub mod ipc;
 pub mod link;
 pub mod node;

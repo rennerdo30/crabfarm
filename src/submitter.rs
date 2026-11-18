@@ -267,6 +267,8 @@ struct DoneInfo {
     capture: Option<Captured>,
     /// Output bytes that were applied.
     bytes: u64,
+    /// The job ended with exit code 0 (what proves a remote run hermetic).
+    ok: bool,
 }
 
 /// Where the frames of a run come from.
@@ -289,6 +291,8 @@ enum Origin {
 struct CacheCtx {
     key: CacheKey,
     spec: JobSpec,
+    /// The crate's identity for the hermetic proofs; `None` = never provable.
+    identity: Option<String>,
 }
 
 enum RemoteEnd {
@@ -752,6 +756,7 @@ impl Node {
             {
                 ctx = Some(Arc::new(CacheCtx {
                     key: ccache::cache_key(&p.spec),
+                    identity: ccache::crate_identity(&p.spec),
                     spec: p.spec.clone(),
                 }));
             }
@@ -847,6 +852,15 @@ impl Node {
                 }
                 if hit.is_some() {
                     self.count("cache_bytes_saved", done.bytes);
+                }
+                // A job that ran on a peer and ended well is hermetic by
+                // construction: that crate's local results may be cached from
+                // now on. A farm hit proves nothing about this node's crate.
+                if hit.is_none()
+                    && done.ok
+                    && let Some(id) = ctx.and_then(|c| c.identity.clone())
+                {
+                    self.hermetic_update(id, true).await;
                 }
                 // A local hit is stored already; everything else is new here.
                 if hit != Some(Origin::Local)
@@ -990,6 +1004,24 @@ impl Node {
         }
     }
 
+    /// Record (`prove`) or withdraw a crate's hermetic proof, off the async
+    /// threads (the file is rewritten).
+    async fn hermetic_update(self: &Arc<Self>, id: String, prove: bool) {
+        let node = self.clone();
+        let done = tokio::task::spawn_blocking(move || {
+            let mut h = lock(&node.hermetic);
+            if prove {
+                h.prove(&id, ccache::Ccache::now())
+            } else {
+                h.revoke(&id)
+            }
+        })
+        .await;
+        if let Ok(Err(err)) = done {
+            tracing::warn!("hermetic proofs not saved: {err:#}");
+        }
+    }
+
     /// Keep a result that came from a peer (or from a farm hit) as a local entry.
     async fn store_capture(self: &Arc<Self>, ctx: &CacheCtx, cap: Captured) {
         let node = self.clone();
@@ -1119,11 +1151,28 @@ impl Node {
         };
         lock(&self.depgraph).finish(&info.produces, ok);
         drop(permit);
-        if ok
-            && stores_local_result(reason)
-            && let (Some(c), Some(cap)) = (ctx, capture)
-        {
-            self.store_local(c, info, cap).await;
+        if ok && !stores_local_result(reason) {
+            // The peer failed (or its result was rejected) and this run
+            // worked: the crate needs something outside the sandbox. Its
+            // proof, if it had one, is void.
+            if let Some(id) = ctx.and_then(|c| c.identity.clone()) {
+                self.hermetic_update(id, false).await;
+            }
+        }
+        if ok && let (Some(c), Some(cap)) = (ctx, capture) {
+            if !stores_local_result(reason) {
+                self.count("cache_unproven", 1);
+            } else if c
+                .identity
+                .as_deref()
+                .is_some_and(|id| lock(&self.hermetic).is_proven(id))
+            {
+                self.store_local(c, info, cap).await;
+            } else {
+                // A local run may have read files the key does not cover; only
+                // crates that built on a peer are known not to (section 16).
+                self.count("cache_unproven", 1);
+            }
         }
     }
 
@@ -1778,6 +1827,7 @@ impl Node {
                     return Ok(RemoteEnd::Done(DoneInfo {
                         capture: (record && code == 0).then_some(capture),
                         bytes: applied,
+                        ok: code == 0,
                     }));
                 }
                 Message::Error { message } => {

@@ -129,6 +129,9 @@ pub struct Node {
     /// The compile cache (DESIGN section 16); `None` when off or without the
     /// farm's cache key.
     pub ccache: Option<Ccache>,
+    /// Crates that built successfully on a peer: only their local results may
+    /// enter the compile cache (DESIGN section 16).
+    pub hermetic: Mutex<crate::hermetic::Hermetic>,
     /// Cache questions this node has in flight / cache entries it serves at once.
     pub cache_ask_sem: Arc<Semaphore>,
     pub cache_serve_sem: Arc<Semaphore>,
@@ -981,6 +984,7 @@ pub async fn run(
     };
     let node = Arc::new(Node {
         ccache,
+        hermetic: Mutex::new(crate::hermetic::Hermetic::load(&data_dir)),
         cache_ask_sem: Arc::new(Semaphore::new(crate::submitter::CACHE_ASK_CONCURRENCY)),
         cache_serve_sem: Arc::new(Semaphore::new(crate::executor::SERVE_CACHE_LIMIT)),
         store: BlobStore::open(

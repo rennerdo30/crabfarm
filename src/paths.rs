@@ -19,6 +19,13 @@ pub fn host_style() -> PathStyle {
 /// extension (`nul.txt` is still the NUL device).
 const RESERVED_DEVICES: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
 
+/// The characters that complete `COM`/`LPT` to a reserved device name: the
+/// digits 0 to 9 and the superscripts ¹, ² and ³ (Windows reserves `COM0`,
+/// `LPT0` and `COM¹` to `LPT³` as well, CF-19).
+fn is_device_digit(c: char) -> bool {
+    matches!(c, '0'..='9' | '¹' | '²' | '³')
+}
+
 /// One path component as it may appear in a client path and in the sandbox.
 ///
 /// The same string is a directory name on the submitter and, mapped, on every
@@ -43,7 +50,7 @@ pub fn valid_component(c: &str) -> bool {
     }
     let numbered = |prefix: &str| {
         up.strip_prefix(prefix)
-            .is_some_and(|d| matches!(d.as_bytes(), [b'1'..=b'9']))
+            .is_some_and(|d| d.chars().count() == 1 && d.chars().all(is_device_digit))
     };
     !(numbered("COM") || numbered("LPT"))
 }
@@ -351,6 +358,20 @@ mod tests {
     }
     fn cp(style: PathStyle, s: &str) -> ClientPath {
         ClientPath::parse(style, s).expect("valid test path")
+    }
+
+    /// CF-19: `COM0`, `LPT0` and the superscript spellings are device names too.
+    #[test]
+    fn all_numbered_device_names_are_refused() {
+        for c in [
+            "COM0", "LPT0", "COM1", "LPT9", "com¹", "COM²", "COM³", "LPT¹", "lpt²", "LPT³",
+            "COM0.txt", "COM¹.rs", "lpt0 ",
+        ] {
+            assert!(!valid_component(c), "{c:?}");
+        }
+        for c in ["COM", "COM10", "LPT00", "COM¹²", "COMx", "com0x", "xCOM1"] {
+            assert!(valid_component(c), "{c:?}");
+        }
     }
 
     #[test]

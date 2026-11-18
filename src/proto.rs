@@ -124,6 +124,11 @@ pub struct JobSpec {
     /// Forwarded environment (DESIGN section 9). Values that are client
     /// paths are sent as `EnvValue::Path`.
     pub env: Vec<(String, EnvValue)>,
+    /// Names in `env` beyond the fixed list of DESIGN section 9: the
+    /// submitter's `forward_env` and the names it learned per crate. The
+    /// executor accepts only the fixed list plus these (and never `PATH`,
+    /// loader or wrapper variables, even when listed). Added with CF-8.
+    pub extra_env: Vec<String>,
     pub inputs: Vec<InputFile>,
     /// Directories that must exist (out-dir, OUT_DIR, -L dirs).
     pub dirs: Vec<ClientPath>,

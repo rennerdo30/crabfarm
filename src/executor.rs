@@ -17,9 +17,6 @@ use tokio_util::sync::CancellationToken;
 const REQUEST_WAIT: Duration = Duration::from_secs(30);
 /// Silence while the submitter uploads blobs.
 const BLOB_WAIT: Duration = Duration::from_secs(60);
-/// Sanity bounds against a broken or hostile spec.
-const MAX_INPUT_FILES: usize = 200_000;
-const MAX_INPUT_BYTES: u64 = 1 << 30;
 
 impl Node {
     /// Handle one job connection whose first frame was `Reserve`.
@@ -45,9 +42,9 @@ impl Node {
         if spec.job_id != job_id {
             bail!("JobRequest for a different job");
         }
-        if spec.inputs.len() > MAX_INPUT_FILES || spec.inputs.iter().map(|i| i.size).sum::<u64>() > MAX_INPUT_BYTES {
-            bail!("job inputs exceed the limits");
-        }
+        // Caps, arguments and environment are checked before any blob is
+        // received or written (CF-8); a refusal makes the submitter run locally.
+        exec::validate_spec(&spec)?;
 
         let timeout = Duration::from_secs(self.cfg.job_timeout_min.max(1) * 60);
         let ctx = ExecContext {

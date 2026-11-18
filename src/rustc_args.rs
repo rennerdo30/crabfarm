@@ -89,9 +89,9 @@ pub fn classify(args: &[String], opts: &ClassifyOptions) -> Classified {
     }
 }
 
-const ALLOWED_EMIT: [&str; 3] = ["dep-info", "metadata", "link"];
+pub(crate) const ALLOWED_EMIT: [&str; 3] = ["dep-info", "metadata", "link"];
 const LINK_CRATE_TYPES: [&str; 4] = ["bin", "dylib", "cdylib", "staticlib"];
-const SEARCH_KINDS: [&str; 5] = ["dependency", "crate", "native", "framework", "all"];
+pub(crate) const SEARCH_KINDS: [&str; 5] = ["dependency", "crate", "native", "framework", "all"];
 
 /// Long flags that take a value, with the canonical name used for dispatch.
 const LONG_VALUE_FLAGS: [(&str, &str); 25] = [
@@ -126,20 +126,20 @@ const LONG_VALUE_FLAGS: [(&str, &str); 25] = [
 const SHORT_VALUE_FLAGS: [&str; 9] = ["-A", "-W", "-D", "-F", "-C", "-L", "-l", "-o", "-Z"];
 
 /// One value-taking flag as written on the command line.
-struct Tok {
+pub(crate) struct Tok {
     /// Canonical name for dispatch (`--codegen` is `-C`).
-    name: &'static str,
-    value: String,
+    pub(crate) name: &'static str,
+    pub(crate) value: String,
     /// Text that precedes the value inside the same argument (`--extern=`,
     /// `-L`); empty for the separate form.
     lead: String,
     /// The flag argument itself for the separate form.
     flag_text: Option<String>,
     /// The original argument texts (for verbatim pass-through).
-    original: Vec<String>,
+    pub(crate) original: Vec<String>,
 }
 
-fn parse_flag(args: &[String], i: usize) -> Result<Option<Tok>, String> {
+pub(crate) fn parse_flag(args: &[String], i: usize) -> Result<Option<Tok>, String> {
     let a = &args[i];
     let separate = |name: &'static str| -> Result<Option<Tok>, String> {
         let v = args.get(i + 1).ok_or_else(|| format!("{a} without a value"))?;
@@ -189,7 +189,7 @@ fn parse_flag(args: &[String], i: usize) -> Result<Option<Tok>, String> {
 /// Absolute in the sense of "would not mean the same on another machine".
 /// Rooted paths without a drive (`\foo`, `/foo` on a Windows client) count as
 /// absolute; they then fail to parse and make the job local.
-fn looks_absolute(style: PathStyle, s: &str) -> bool {
+pub(crate) fn looks_absolute(style: PathStyle, s: &str) -> bool {
     let b = s.as_bytes();
     match style {
         PathStyle::Posix => s.starts_with('/'),

@@ -5,7 +5,8 @@
 //! [`ExecEvent`]s in the order the submitter must apply them.
 
 use crate::cas::BlobStore;
-use crate::paths::SandboxMap;
+use crate::guard;
+use crate::paths::{SandboxMap, host_style};
 use crate::proto::{Arg, BlobHash, ClientPath, EnvValue, JobId, JobSpec, NodeId};
 use crate::rewrite::{self, Rewriter};
 use crate::rustc_args::render_args;
@@ -133,6 +134,12 @@ fn validate_paths(spec: &JobSpec, map: &SandboxMap) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Refuse a job whose argument list, environment or size is outside what the
+/// submitter's wrapper can produce (CF-8). The submitter then runs it locally.
+pub fn validate_spec(spec: &JobSpec) -> anyhow::Result<()> {
+    guard::validate_spec(spec, &|n| std::env::var_os(n).is_some()).map_err(|why| anyhow::anyhow!("job refused: {why}"))
+}
+
 /// `SandboxMap::to_sandbox` with an error for a path that cannot be mapped.
 fn sandbox_path(map: &SandboxMap, p: &ClientPath) -> anyhow::Result<PathBuf> {
     map.to_sandbox(p).context("path cannot be mapped into the sandbox")
@@ -163,6 +170,66 @@ async fn remove_job_dir(dir: &Path) {
             }
         }
     }
+}
+
+/// Linker programs a job may name by absolute path (the submitter's own
+/// toolchain layout); anything else is dropped.
+fn known_linker(path: &Path) -> bool {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+    matches!(stem.as_str(), "link" | "lld-link" | "rust-lld" | "ld" | "ld.lld" | "lld" | "cc" | "gcc" | "g++" | "c++" | "clang" | "clang++")
+        || ["-gcc", "-g++", "-clang", "-cc"].iter().any(|s| stem.ends_with(s))
+}
+
+fn under_dir(p: &Path, dir: &Path) -> bool {
+    let norm = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().to_ascii_lowercase().replace('\\', "/");
+    norm(p).starts_with(&norm(dir))
+}
+
+/// The submitter's `-C linker=<absolute path>` names a file of ITS machine.
+/// Keep it (as that native path, not a sandbox path) only when this peer has
+/// the same host triple and a known linker program at exactly that path,
+/// outside the job sandboxes; otherwise drop the flag and let rustc use its
+/// default linker (rustc_args docs, DESIGN section 5).
+fn linker_on_this_peer(spec: &JobSpec, toolchain: &Installed, jobs_dir: &Path, p: &ClientPath) -> Option<String> {
+    if spec.toolchain.host != toolchain.id.host || p.style != host_style() {
+        return None;
+    }
+    let native = Path::new(&p.path);
+    (native.is_file() && known_linker(native) && !under_dir(native, jobs_dir)).then(|| p.path.clone())
+}
+
+/// `render_args` with the sandbox mapping, except for `-C linker=<path>`.
+fn render_job_args(spec: &JobSpec, map: &SandboxMap, toolchain: &Installed, jobs_dir: &Path) -> Vec<String> {
+    let args = &spec.args;
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        match (&args[i], args.get(i + 1)) {
+            // `-C linker=<path>`: flag and value are separate arguments.
+            (Arg::Plain(flag), Some(Arg::PrefixedPath { prefix, path })) if (flag == "-C" || flag == "--codegen") && prefix == "linker=" => {
+                match linker_on_this_peer(spec, toolchain, jobs_dir, path) {
+                    Some(native) => {
+                        out.push(flag.clone());
+                        out.push(format!("linker={native}"));
+                    }
+                    None => tracing::debug!(crate_name = spec.crate_name.as_str(), "dropped -C linker"),
+                }
+                i += 2;
+            }
+            (Arg::PrefixedPath { prefix, path }, _) if prefix.ends_with("linker=") => {
+                match linker_on_this_peer(spec, toolchain, jobs_dir, path) {
+                    Some(native) => out.push(format!("{prefix}{native}")),
+                    None => tracing::debug!(crate_name = spec.crate_name.as_str(), "dropped -C linker"),
+                }
+                i += 1;
+            }
+            (a, _) => {
+                out.extend(render_args(std::slice::from_ref(a), &|p| map.render(p)));
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 enum Line {
@@ -265,6 +332,7 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let job_dir = ctx.jobs_dir.join(job_hex(&spec.job_id));
     let map = SandboxMap::new(job_dir.join("root"));
+    validate_spec(spec)?;
     validate_paths(spec, &map)?;
     let _guard = DirGuard(job_dir.clone());
     // A directory left by a crashed run would leak old files into this job.
@@ -293,6 +361,7 @@ async fn run_in_sandbox(
 
     // 1. Materialize inputs.
     let mut input_info: HashMap<ClientPath, (BlobHash, u64)> = HashMap::new();
+    let mut written: u64 = 0;
     for input in &spec.inputs {
         let dst = sandbox_path(map, &input.path)?;
         if let Some(parent) = dst.parent() {
@@ -302,6 +371,12 @@ async fn run_in_sandbox(
             .store
             .get(ctx.owner, &ctx.key, &input.hash)
             .with_context(|| format!("input {}", input.path.path))?;
+        // The declared sizes were checked up front; the real ones are checked
+        // again before every write.
+        written = written.saturating_add(data.len() as u64);
+        if written > guard::MAX_MATERIALIZED_BYTES {
+            bail!("job inputs exceed {} bytes", guard::MAX_MATERIALIZED_BYTES);
+        }
         std::fs::write(&dst, &data).with_context(|| format!("write input {}", input.path.path))?;
         #[cfg(unix)]
         if input.executable {
@@ -324,7 +399,7 @@ async fn run_in_sandbox(
         args.push("--remap-path-prefix".into());
         args.push(format!("{from}={to}"));
     }
-    args.extend(render_args(&spec.args, &|p| map.render(p)));
+    args.extend(render_job_args(spec, map, toolchain, &ctx.jobs_dir));
 
     let rewriter = Rewriter { pairs: remaps, client_windows: style == crate::proto::PathStyle::Windows };
 
@@ -504,6 +579,7 @@ mod tests {
             cwd: cp(&f.root),
             env: vec![("CARGO_MANIFEST_DIR".into(), EnvValue::Path(cp(&f.root)))],
             inputs: vec![InputFile { path: cp(&lib), hash, size: data.len() as u64, executable: false }],
+            extra_env: Vec::new(),
             dirs: vec![cp(&out)],
             out_dir: cp(&out),
             crate_name: "fixture".into(),
@@ -737,6 +813,88 @@ mod tests {
         }
         for n in ["PATH", "SystemRoot", "LIB", "INCLUDE", "RUSTUP_HOME", "TEMP", "HOME"] {
             assert!(!is_build_var(n), "{n}");
+        }
+    }
+
+    /// CF-8: a hostile spec is refused before rustc starts or anything is written.
+    #[tokio::test]
+    async fn hostile_specs_are_refused_before_anything_runs() {
+        let f = fixture();
+        let escape = f._tmp.path().join("escaped");
+        let escape_arg = escape.to_string_lossy().into_owned();
+        let c = ctx(&f, Duration::from_secs(120));
+        type Mutate = Box<dyn Fn(&mut JobSpec)>;
+        let hostile: Vec<Mutate> = vec![
+            Box::new({
+                let e = escape_arg.clone();
+                move |s| s.args.push(Arg::Plain(format!("--out-dir={e}")))
+            }),
+            Box::new({
+                let e = escape_arg.clone();
+                move |s| s.args.extend([Arg::Plain("-o".into()), Arg::Plain(e.clone())])
+            }),
+            Box::new({
+                let e = escape_arg.clone();
+                move |s| s.args.push(Arg::Plain(format!("--emit=link={e}")))
+            }),
+            Box::new(|s| s.args.extend([Arg::Plain("-C".into()), Arg::Plain("linker=evil-linker".into()), Arg::Plain("-C".into()), Arg::Plain("incremental=x".into())])),
+            Box::new(|s| s.args.push(Arg::Plain("@argfile.txt".into()))),
+            Box::new(|s| s.args.push(Arg::Plain("-Zunstable-options".into()))),
+            Box::new(|s| s.env.push(("PATH".into(), EnvValue::Plain("C:\\evil".into())))),
+            Box::new(|s| s.env.push(("RUSTC_WRAPPER".into(), EnvValue::Plain("evil".into())))),
+            Box::new(|s| s.env.push(("LD_PRELOAD".into(), EnvValue::Plain("evil.so".into())))),
+            Box::new(|s| s.env.push(("UNDECLARED_NAME".into(), EnvValue::Plain("x".into())))),
+        ];
+        for (n, mutate) in hostile.iter().enumerate() {
+            let mut spec = lib_spec(&f, SRC, false);
+            mutate(&mut spec);
+            let (res, evs) = collect(&c, &spec, &f.tc, CancellationToken::new()).await;
+            let err = res.expect_err(&format!("case {n} must be refused"));
+            assert!(format!("{err:#}").contains("job refused"), "case {n}: {err:#}");
+            assert!(evs.is_empty(), "case {n}: events {evs:?}");
+            assert!(!escape.exists(), "case {n}: rustc wrote outside the sandbox");
+        }
+    }
+
+    #[test]
+    fn linker_path_is_dropped_unless_this_peer_has_it() {
+        let f = fixture();
+        let map = SandboxMap::new(f.jobs.join("x").join("root"));
+        let exe_dir = f._tmp.path().join("tools");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let link = exe_dir.join(if cfg!(windows) { "link.exe" } else { "link" });
+        std::fs::write(&link, b"x").unwrap();
+        let other = exe_dir.join(if cfg!(windows) { "evil.exe" } else { "evil" });
+        std::fs::write(&other, b"x").unwrap();
+
+        let render = |path: &Path, host: &str| {
+            let mut spec = lib_spec(&f, SRC, false);
+            spec.toolchain.host = host.to_string();
+            spec.args.push(Arg::Plain("-C".into()));
+            spec.args.push(Arg::PrefixedPath { prefix: "linker=".into(), path: cp(path) });
+            spec.args.push(Arg::PrefixedPath { prefix: "-Clinker=".into(), path: cp(path) });
+            render_job_args(&spec, &map, &f.tc, &f.jobs)
+        };
+        let same = f.tc.id.host.clone();
+        let count = |args: &[String]| args.iter().filter(|a| a.contains("linker=")).count();
+        // Same host, known linker that exists: kept as the native path.
+        let kept = render(&link, &same);
+        assert_eq!(count(&kept), 2, "{kept:?}");
+        assert!(kept.iter().any(|a| a == &format!("-Clinker={}", cp(&link).path)));
+        // The argument after a dropped `-C` must not be left dangling.
+        // Different host, missing file, unknown program, file inside the job sandboxes: dropped.
+        assert_eq!(count(&render(&link, "other-host-triple")), 0);
+        assert_eq!(count(&render(&exe_dir.join("missing.exe"), &same)), 0);
+        assert_eq!(count(&render(&other, &same)), 0);
+        let inside = f.jobs.join("x").join("root").join("cc");
+        std::fs::create_dir_all(inside.parent().unwrap()).unwrap();
+        std::fs::write(&inside, b"x").unwrap();
+        assert_eq!(count(&render(&inside, &same)), 0);
+        let dropped = render(&other, &same);
+        for (i, a) in dropped.iter().enumerate() {
+            if a == "-C" {
+                assert!(dropped.get(i + 1).is_some_and(|n| !n.starts_with('-')), "dangling -C: {dropped:?}");
+            }
         }
     }
 

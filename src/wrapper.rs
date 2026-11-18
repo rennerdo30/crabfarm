@@ -20,6 +20,14 @@ use std::process::{Command, Stdio};
 /// Run one wrapper invocation; the return value is the process exit code.
 pub fn run(rustc: &str, args: &[String]) -> i32 {
     let debug = std::env::var_os("CRABFARM_LOG").is_some();
+    // `clippy-driver` and any other compiler driver behind RUSTC_WRAPPER run
+    // here: the peers only have `rustc`, so a remote run would lint nothing.
+    if !is_plain_rustc(rustc) {
+        if debug {
+            eprintln!("crabfarm: local (not rustc)");
+        }
+        return passthrough(rustc, args);
+    }
     let Ok(data_dir) = config::data_dir() else { return passthrough(rustc, args) };
 
     if args.iter().any(|a| a == "-vV" || a == "--version" || a == "-V") {
@@ -48,6 +56,11 @@ pub fn run(rustc: &str, args: &[String]) -> i32 {
         }
         Classified::Remote(cand) => submit(rustc, args, cand, tc, &cfg, &data_dir, &cwd, &expanded),
     }
+}
+
+/// True when the program's file stem is `rustc` (also `rustc.exe`).
+pub fn is_plain_rustc(program: &str) -> bool {
+    Path::new(program).file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.eq_ignore_ascii_case("rustc"))
 }
 
 /// Run rustc with inherited stdio.
@@ -174,7 +187,7 @@ fn is_path_env(name: &str) -> bool {
 /// Forwarded variables of `vars`; values of the path variables become client paths.
 pub fn forwarded_env(vars: impl Iterator<Item = (String, String)>, extra: &[String]) -> Vec<(String, EnvValue)> {
     let mut out: Vec<(String, EnvValue)> = vars
-        .filter(|(k, _)| is_forwarded(k, extra))
+        .filter(|(k, _)| is_forwarded(k, extra) && (crate::guard::extra_env_name_ok(k) || is_forwarded(k, &[])))
         .map(|(k, v)| {
             let value = if is_path_env(&k) {
                 match ClientPath::parse(host_style(), &v) {
@@ -299,6 +312,8 @@ fn submit(
     let mut extra = cfg.forward_env.clone();
     extra.extend(learned_env(data_dir, &cand.crate_name));
     let env = forwarded_env(std::env::vars(), &extra);
+    // Names beyond DESIGN section 9; the executor accepts only these.
+    let extra_env: Vec<String> = env.iter().map(|(k, _)| k.clone()).filter(|k| !is_forwarded(k, &[])).collect();
     let forwarded: HashSet<String> = env.iter().map(|(k, _)| k.to_ascii_uppercase()).collect();
     let spec = JobSpec {
         job_id: JobId({ let mut b = [0u8; 16]; rand::fill(&mut b[..]); b }),
@@ -306,6 +321,7 @@ fn submit(
         target: cand.target.clone(),
         args: cand.args.clone(),
         cwd: cwd_client,
+        extra_env,
         env,
         inputs: Vec::new(),
         dirs: Vec::new(),
@@ -440,6 +456,25 @@ mod tests {
         for n in ["PATH", "HOME", "SystemRoot", "RUSTFLAGS", "CARGO_MAKEFLAGS", "USERPROFILE"] {
             assert!(!is_forwarded(n, &extra), "{n} must not be forwarded");
         }
+    }
+
+    #[test]
+    fn only_rustc_runs_remotely() {
+        assert!(is_plain_rustc("rustc"));
+        assert!(is_plain_rustc(r"C:\Users\me\.rustup\toolchains\stable\bin\rustc.exe"));
+        assert!(is_plain_rustc("/usr/bin/rustc"));
+        for p in ["clippy-driver", r"C:\x\clippy-driver.exe", "/x/rustdoc", "rustc-wrapper", "cargo-clippy", "miri"] {
+            assert!(!is_plain_rustc(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn configured_names_that_would_change_the_peer_are_not_forwarded() {
+        let extra = vec![v("PATH"), v("LD_PRELOAD"), v("RUSTC_WRAPPER"), v("MY_FLAG")];
+        let vars = vec![(v("PATH"), v("p")), (v("LD_PRELOAD"), v("l")), (v("RUSTC_WRAPPER"), v("w")), (v("MY_FLAG"), v("1")), (v("RUSTC_BOOTSTRAP"), v("1"))];
+        let env = forwarded_env(vars.into_iter(), &extra);
+        let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, vec!["MY_FLAG", "RUSTC_BOOTSTRAP"]);
     }
 
     #[test]

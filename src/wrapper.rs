@@ -234,7 +234,7 @@ const PATH_ENV: [&str; 5] = [
 /// allow-list of what cargo sets for rustc (`guard::design_env`) and the names
 /// the user listed in `forward_env`. Nothing is added automatically (CF-18).
 pub fn is_forwarded(name: &str, extra: &[String]) -> bool {
-    crate::guard::design_env(name) || extra.iter().any(|e| e.eq_ignore_ascii_case(name))
+    crate::guard::design_env(name) || extra.iter().any(|e| crate::guard::env_name_eq(e, name))
 }
 
 fn is_path_env(name: &str) -> bool {
@@ -467,7 +467,7 @@ fn submit(
     // Names beyond DESIGN section 9; the executor accepts only these. A name the
     // build script declared is `build_env` (source-stamped), everything else
     // beyond the allow-list came from `forward_env`.
-    let is_build = |k: &str| build_names.iter().any(|b| b.eq_ignore_ascii_case(k));
+    let is_build = |k: &str| build_names.iter().any(|b| crate::guard::env_name_eq(b, k));
     let beyond: Vec<String> = env
         .iter()
         .map(|(k, _)| k.clone())
@@ -738,6 +738,16 @@ mod tests {
 
     fn v(s: &str) -> String {
         s.to_string()
+    }
+
+    /// CF-25: `forward_env` names match the environment the way the OS does:
+    /// case-insensitively on Windows, exactly elsewhere.
+    #[test]
+    fn forward_env_names_follow_the_case_rules_of_the_os() {
+        let extra = vec!["My_Var".to_string()];
+        assert!(is_forwarded("My_Var", &extra));
+        assert_eq!(is_forwarded("MY_VAR", &extra), cfg!(windows));
+        assert_eq!(is_forwarded("my_var", &extra), cfg!(windows));
     }
 
     #[test]

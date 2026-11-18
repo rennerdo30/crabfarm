@@ -847,7 +847,7 @@ impl NodeLock {
         match file.try_lock() {
             Ok(()) => Ok(NodeLock { file }),
             Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
-                "another crabfarm node is already running with this data directory ({});                  stop it first, or set CRABFARM_HOME to run a second node",
+                "another crabfarm node is already running with this data directory ({}); stop it first, or set CRABFARM_HOME to run a second node",
                 data_dir.display()
             ),
             Err(std::fs::TryLockError::Error(e)) => {

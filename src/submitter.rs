@@ -340,6 +340,10 @@ struct Relay {
     staged: Staged,
     held: Vec<Message>,
     holding: bool,
+    /// (file, emit) of every artifact notice seen: rustc says each once, and
+    /// cargo starts a crate's dependents on the metadata notice, so a peer that
+    /// repeats one must not make cargo see it twice (CF-25).
+    notices: HashSet<(String, String)>,
 }
 
 impl Relay {
@@ -351,13 +355,20 @@ impl Relay {
         m: Message,
         style: crate::proto::PathStyle,
     ) -> anyhow::Result<Option<(Message, bool)>> {
+        let notice = match &m {
+            Message::Stderr { line } => crate::rewrite::artifact(line),
+            _ => None,
+        };
+        if let Some(key) = &notice
+            && !self.notices.insert(key.clone())
+        {
+            return Ok(None);
+        }
         if self.holding {
             self.held.push(m);
             return Ok(None);
         }
-        if let Message::Stderr { line } = &m
-            && let Some((file, emit)) = crate::rewrite::artifact(line)
-        {
+        if let Some((file, emit)) = notice {
             let ready = match ClientPath::parse(style, &file) {
                 Some(client) if is_early_emit(&emit) => self.staged.commit_one(&client)?,
                 _ => false,
@@ -626,6 +637,8 @@ impl Node {
                 if let Ok(Some(Message::RetryLocal { reason })) =
                     tokio::time::timeout(RETRY_WAIT, wrapper.recv()).await
                 {
+                    // It waits for a slot now and needs to hear that we live.
+                    live.stopped.store(false, Ordering::Release);
                     self.local_phase(wrapper, reason, &info, live).await;
                 }
             }
@@ -1095,6 +1108,10 @@ impl Node {
                         }
                     }
                     wrapper.send(Message::Exit { code }).await.ok();
+                    // The wrapper has its answer; it speaks again only to ask
+                    // for a local retry, and `handle_submit` resumes the
+                    // keepalives then.
+                    live.stopped.store(true, Ordering::Release);
                     return Ok(RemoteEnd::Done);
                 }
                 Message::Error { message } => {
@@ -1376,6 +1393,55 @@ mod tests {
                 .is_none()
         );
         assert_eq!(r.held.len(), 1);
+    }
+
+    /// CF-25: a notice a peer repeats is dropped, early or held, so cargo never
+    /// releases the dependents of a crate twice.
+    #[test]
+    fn a_repeated_artifact_notice_is_dropped() {
+        let d = tempfile::tempdir().unwrap();
+        let style = style_of(d.path());
+        let mut r = Relay::default();
+        let (_meta, meta_c) = stage(&mut r, d.path(), "libz.rmeta", b"meta");
+        let (_rlib, rlib_c) = stage(&mut r, d.path(), "libz.rlib", b"rlib");
+        assert!(
+            r.offer(notice(&meta_c, "metadata"), style)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            r.offer(notice(&meta_c, "metadata"), style)
+                .unwrap()
+                .is_none(),
+            "the second metadata notice must not reach the wrapper"
+        );
+        assert!(r.held.is_empty(), "and it is not held for later either");
+        // A different kind for the same file is a different notice.
+        assert!(r.offer(notice(&rlib_c, "link"), style).unwrap().is_none());
+        assert_eq!(r.held.len(), 1);
+        assert!(r.offer(notice(&rlib_c, "link"), style).unwrap().is_none());
+        assert_eq!(r.held.len(), 1, "a repeated held notice is dropped too");
+    }
+
+    /// CF-25: a notice whose keys use a JSON unicode escape is still a notice:
+    /// its file is staged and checked like any other, and it is not passed
+    /// through as ordinary stderr.
+    #[test]
+    fn an_escaped_artifact_key_is_still_a_notice() {
+        let d = tempfile::tempdir().unwrap();
+        let style = style_of(d.path());
+        let mut r = Relay::default();
+        let (meta, meta_c) = stage(&mut r, d.path(), "libq.rmeta", b"meta");
+        let bs = char::from(92u8);
+        let line = serde_json::json!({ "emit": "metadata", "artifact": meta_c }).to_string();
+        let line = line.replace("\"artifact\"", &format!("\"{bs}u0061rtifact\""));
+        assert!(line.contains("u0061rtifact"));
+        let out = r
+            .offer(Message::Stderr { line }, style)
+            .unwrap()
+            .expect("an early notice for a staged file goes out");
+        assert!(out.1, "it was handled as an artifact notice");
+        assert_eq!(std::fs::read(&meta).unwrap(), b"meta");
     }
 
     /// CF-10 with CF-16: after a taint nothing staged is written and nothing

@@ -208,9 +208,14 @@ impl Rewriter {
 
 /// If `line` is a rustc artifact notification
 /// (`{"artifact":"<path>","emit":"<kind>"}`), return `(path, emit)`.
+///
+/// Decided on the parsed JSON object only (CF-25): a text test for `"artifact"`
+/// misses a key spelled with a JSON unicode escape for its first letter, which
+/// a JSON parser (and so cargo) reads as the same key. A line that is not an object with string `artifact` and `emit`
+/// members is not a notification.
 pub fn artifact(line: &str) -> Option<(String, String)> {
     let t = line.trim();
-    if !t.starts_with('{') || !t.contains("\"artifact\"") {
+    if !t.starts_with('{') {
         return None;
     }
     let v: Value = serde_json::from_str(t).ok()?;
@@ -404,6 +409,18 @@ mod tests {
         assert_eq!(
             artifact(r#"{"emit":"link","artifact":"/t/libfoo.rlib"}"#),
             Some(("/t/libfoo.rlib".into(), "link".into()))
+        );
+        // CF-25: a key spelled with a unicode escape is the same key.
+        let bs = char::from(92u8);
+        let escaped_key = format!(r#"{{"{bs}u0061rtifact":"/t/libfoo.rmeta","emit":"metadata"}}"#);
+        assert_eq!(
+            artifact(&escaped_key),
+            Some(("/t/libfoo.rmeta".into(), "metadata".into()))
+        );
+        let escaped_emit = format!(r#"{{"artifact":"/t/libfoo.rmeta","{bs}u0065mit":"metadata"}}"#);
+        assert_eq!(
+            artifact(&escaped_emit),
+            Some(("/t/libfoo.rmeta".into(), "metadata".into()))
         );
         assert_eq!(artifact(&json_diag()), None);
         assert_eq!(artifact("warning: x"), None);

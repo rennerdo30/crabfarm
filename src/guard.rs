@@ -503,6 +503,18 @@ pub fn design_env(name: &str) -> bool {
         .is_some_and(|rest| !rest.is_empty())
 }
 
+/// Whether two names are the same environment variable on the machine this
+/// code runs on (CF-25): names are case-insensitive on Windows only. On Unix
+/// `Path` and `PATH` are two variables, so listing one in `forward_env` or
+/// `accept_env` must not select the other.
+pub fn env_name_eq(a: &str, b: &str) -> bool {
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
 /// True when `name` is a variable the farm must never accept, even when the
 /// submitter lists it: it changes which program runs or how it is loaded, or
 /// belongs to the machine (search path, loader, wrappers, temp and home dirs).
@@ -636,7 +648,7 @@ pub struct Policy<'a> {
 /// (`exec::is_build_var`).
 pub fn validate_env(spec: &JobSpec, policy: &Policy) -> Result<(), String> {
     for n in &spec.extra_env {
-        let accepted = policy.accept_env.iter().any(|a| a.eq_ignore_ascii_case(n));
+        let accepted = policy.accept_env.iter().any(|a| env_name_eq(a, n));
         if !extra_env_name_ok(n) || design_env(n) || !accepted || (policy.node_has)(n) {
             return Err("job declares a variable this node does not accept".into());
         }
@@ -655,11 +667,11 @@ pub fn validate_env(spec: &JobSpec, policy: &Policy) -> Result<(), String> {
         }
     }
     for (k, v) in &spec.env {
-        if never_forward(k) && !k.eq_ignore_ascii_case("RUSTC_BOOTSTRAP") {
+        if never_forward(k) && !env_name_eq(k, "RUSTC_BOOTSTRAP") {
             return Err("job sets a variable the farm does not forward".into());
         }
-        let declared = spec.extra_env.iter().any(|e| e.eq_ignore_ascii_case(k))
-            || spec.build_env.iter().any(|e| e.eq_ignore_ascii_case(k));
+        let declared = spec.extra_env.iter().any(|e| env_name_eq(e, k))
+            || spec.build_env.iter().any(|e| env_name_eq(e, k));
         if !design_env(k) && !declared {
             return Err("job sets a variable that is not forwarded".into());
         }
@@ -1034,6 +1046,21 @@ mod tests {
         for ok in ["CF_BUILT", "BUILD_ID", "RUST_LOG", "VERGEN_SHA"] {
             assert!(build_env_name_ok(ok), "{ok}");
         }
+    }
+
+    /// CF-25: names compare case-insensitively on Windows only; on Unix a
+    /// variable listed as `MY_VAR` is not `my_var`.
+    #[test]
+    fn name_matching_is_case_sensitive_off_windows() {
+        assert!(env_name_eq("MY_VAR", "MY_VAR"));
+        assert_eq!(env_name_eq("My_Var", "MY_VAR"), cfg!(windows));
+        let job = spec(vec![("my_var", plain("v"))], &["my_var"]);
+        assert_eq!(ve(&job, &["MY_VAR"]).is_ok(), cfg!(windows));
+        assert_eq!(ve(&job, &["my_var"]), Ok(()));
+        // An undeclared lower-case twin of a declared name is not declared.
+        let mut twin = spec(vec![("My_Var", plain("v"))], &[]);
+        twin.build_env = vec!["MY_VAR".into()];
+        assert_eq!(ve(&twin, &[]).is_ok(), cfg!(windows));
     }
 
     /// CF-25: a node whose operator turned `accept_build_env` off refuses any

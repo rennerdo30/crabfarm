@@ -184,8 +184,25 @@ fn wrapper_in_config(file: &Path) -> Option<String> {
     Some(v)
 }
 
-/// `--config build.rustc-wrapper="x"` on the command line.
-fn wrapper_in_args(args: &[String]) -> Option<String> {
+/// True when a `--config` value is a `KEY=VALUE` setting (a dotted key made of
+/// key characters before the first `=`), false when it is the path of a config
+/// file, which may contain `=` in its name but then also `/`, `\` or `:`.
+fn is_config_setting(value: &str) -> bool {
+    value.split_once('=').is_some_and(|(k, _)| {
+        let k = k.trim();
+        !k.is_empty()
+            && k.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '"' | '\''))
+    })
+}
+
+/// `build.rustc-wrapper` given with `--config` on the command line, as cargo
+/// applies the options: in order, so the LAST one that sets the key wins, whether
+/// it is a `--config build.rustc-wrapper="x"` setting or a `--config <file>`
+/// (a path, relative to `cwd`; the file's own relative wrapper path follows the
+/// rule for config files). `Some("")` is an explicit "no wrapper".
+fn wrapper_in_args(args: &[String], cwd: &Path) -> Option<String> {
+    let mut found = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -198,16 +215,22 @@ fn wrapper_in_args(args: &[String]) -> Option<String> {
         } else {
             a.strip_prefix("--config=")
         };
-        if let Some(kv) = value
-            && let Some((k, v)) = kv.split_once('=')
-            && k.trim() == "build.rustc-wrapper"
-        {
-            let doc: toml::Table = toml::from_str(&format!("v = {}", v.trim())).ok()?;
-            return doc.get("v")?.as_str().map(str::to_string);
+        if let Some(value) = value {
+            if is_config_setting(value) {
+                if let Some((k, v)) = value.split_once('=')
+                    && k.trim() == "build.rustc-wrapper"
+                    && let Ok(doc) = toml::from_str::<toml::Table>(&format!("v = {}", v.trim()))
+                    && let Some(w) = doc.get("v").and_then(|v| v.as_str())
+                {
+                    found = Some(w.to_string());
+                }
+            } else if let Some(w) = wrapper_in_config(&cwd.join(value)) {
+                found = Some(w);
+            }
         }
         i += 1;
     }
-    None
+    found
 }
 
 /// The rustc wrapper that cargo would use without crabfarm, in cargo's order:
@@ -227,7 +250,7 @@ pub fn find_inner_wrapper(
     let var = |n: &str| env(n).and_then(|v| v.into_string().ok());
     // A set but empty RUSTC_WRAPPER switches a configured wrapper off, as in cargo.
     let found: Option<String> = var("RUSTC_WRAPPER")
-        .or_else(|| wrapper_in_args(args))
+        .or_else(|| wrapper_in_args(args, cwd))
         .or_else(|| var("CARGO_BUILD_RUSTC_WRAPPER"))
         .or_else(|| {
             let mut dirs: Vec<PathBuf> = cwd.ancestors().map(|d| d.join(".cargo")).collect();
@@ -491,6 +514,79 @@ rustc-wrapper = \"\"
             find_inner_wrapper(&[], empty_dir.path(), None, &no_env, None),
             None
         );
+    }
+
+    /// CF-25: cargo applies `--config` options in order, the last one that sets
+    /// the key wins; a `--config <file>` counts like a setting.
+    #[test]
+    fn repeated_config_options_last_one_wins_and_files_count() {
+        let t = tempfile::tempdir().unwrap();
+        let find = |args: &[String]| find_inner_wrapper(args, t.path(), None, &no_env, None);
+        let first = "build.rustc-wrapper=\"one\"";
+        let second = "build.rustc-wrapper=\"two\"";
+        assert_eq!(
+            find(&a(&["build", "--config", first, "--config", second])),
+            Some("two".into())
+        );
+        assert_eq!(
+            find(&a(&["build", "--config", second, "--config", first])),
+            Some("one".into())
+        );
+        // The `=` spelling and an unrelated option in between.
+        assert_eq!(
+            find(&a(&[
+                "build",
+                &format!("--config={first}"),
+                "--config",
+                "build.jobs=4",
+                &format!("--config={second}"),
+            ])),
+            Some("two".into())
+        );
+        // An empty value later switches the wrapper off.
+        assert_eq!(
+            find(&a(&[
+                "build",
+                "--config",
+                first,
+                "--config",
+                "build.rustc-wrapper=\"\""
+            ])),
+            None
+        );
+        // A config file, relative to the working directory, ordered with the settings.
+        std::fs::write(
+            t.path().join("extra.toml"),
+            "[build]\nrustc-wrapper = \"from-file\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            find(&a(&["build", "--config", first, "--config", "extra.toml"])),
+            Some("from-file".into())
+        );
+        assert_eq!(
+            find(&a(&["build", "--config", "extra.toml", "--config", second])),
+            Some("two".into())
+        );
+        // A file without the key, or a missing one, changes nothing.
+        std::fs::write(t.path().join("other.toml"), "[build]\njobs = 3\n").unwrap();
+        assert_eq!(
+            find(&a(&[
+                "build",
+                "--config",
+                first,
+                "--config",
+                "other.toml",
+                "--config",
+                "nope.toml"
+            ])),
+            Some("one".into())
+        );
+        // Options after `--` are not cargo's.
+        assert_eq!(find(&a(&["run", "--", "--config", first])), None);
+        assert!(is_config_setting("build.jobs=4"));
+        assert!(!is_config_setting("C:\\a=b\\x.toml"));
+        assert!(!is_config_setting("extra.toml"));
     }
 
     /// crabfarm is never chained to itself, whatever the spelling.

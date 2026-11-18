@@ -140,6 +140,21 @@ fn identity_and_token_files_grant_only_the_current_user() {
     assert_owner_only(&d.path().join("farm").join("invites.toml"));
 }
 
+/// CF-25: the DACL is there when the file is created, before anything is
+/// written to it and without a later "restrict" step: the file is checked while
+/// the handle that created it is still open and empty.
+#[test]
+fn a_private_file_is_restricted_at_creation() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("fresh.key");
+    let f = crabfarm::secfile::create_new_private(&p).unwrap();
+    assert_eq!(f.metadata().unwrap().len(), 0, "nothing written yet");
+    assert_owner_only(&p);
+    drop(f);
+    // `CREATE_NEW`: a second creation of the same name is refused.
+    assert!(crabfarm::secfile::create_new_private(&p).is_err());
+}
+
 #[test]
 fn rewriting_a_key_keeps_the_restriction() {
     let d = tempfile::tempdir().unwrap();

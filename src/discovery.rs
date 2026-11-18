@@ -131,8 +131,14 @@ pub fn gossip_addr_ok(addr: &str, allow_loopback: bool) -> bool {
     let Ok(sa) = addr.parse::<std::net::SocketAddr>() else {
         return false;
     };
-    let ip = sa.ip();
-    if sa.port() == 0 || ip.is_unspecified() || ip.is_multicast() {
+    // `::ffff:a.b.c.d` is the IPv4 address a.b.c.d for every rule below.
+    let ip = match sa.ip() {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
+        v4 => v4,
+    };
+    if sa.port() == 0 || ip.is_unspecified() || ip.is_multicast() || is_link_local_or_metadata(ip) {
         return false;
     }
     if let std::net::IpAddr::V4(v4) = ip
@@ -141,6 +147,27 @@ pub fn gossip_addr_ok(addr: &str, allow_loopback: bool) -> bool {
         return false;
     }
     allow_loopback || !ip.is_loopback()
+}
+
+/// Link-local addresses (169.254.0.0/16, fe80::/10), which also hold the usual
+/// cloud metadata service (169.254.169.254), and the metadata addresses of the
+/// providers that use other ranges: a gossiped address must not make this node
+/// connect to those (CF-25).
+fn is_link_local_or_metadata(ip: std::net::IpAddr) -> bool {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_link_local()
+                // Alibaba Cloud, Oracle Cloud.
+                || v4 == Ipv4Addr::new(100, 100, 100, 200)
+                || v4 == Ipv4Addr::new(192, 0, 0, 192)
+        }
+        IpAddr::V6(v6) => {
+            (v6.segments()[0] & 0xffc0) == 0xfe80
+                // AWS IMDS over IPv6.
+                || v6 == Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)
+        }
+    }
 }
 
 /// True when a configured peer address (`host:port`) is on this machine: the
@@ -360,6 +387,15 @@ mod tests {
             "[ff02::fb]:5353",
             "255.255.255.255:1",
             "10.0.0.2:0",
+            // CF-25: link-local and cloud metadata addresses, also IPv4-mapped.
+            "169.254.169.254:80",
+            "169.254.1.1:47070",
+            "[fe80::1]:47070",
+            "[febf::1]:47070",
+            "[::ffff:169.254.169.254]:80",
+            "100.100.100.200:80",
+            "192.0.0.192:80",
+            "[fd00:ec2::254]:80",
             "evil.example:47070",
             "localhost:47070",
             "10.0.0.2",
@@ -372,9 +408,14 @@ mod tests {
             "192.168.1.5:1",
             "[fd00::2]:47070",
             "100.64.0.1:47070",
+            "169.255.0.1:47070",
+            "[fec0::1]:47070",
+            "[::ffff:10.0.0.2]:47070",
         ] {
             assert!(gossip_addr_ok(ok, false), "{ok}");
         }
+        // Not even a local farm needs the metadata service.
+        assert!(!gossip_addr_ok("169.254.169.254:80", true));
         // A farm on one machine keeps its loopback addresses, and nothing else changes.
         assert!(gossip_addr_ok("127.0.0.1:47070", true));
         assert!(!gossip_addr_ok("0.0.0.0:47070", true));

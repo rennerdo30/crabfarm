@@ -12,6 +12,8 @@ pub struct Config {
     pub accept_remote_jobs: bool,
     pub peers: Vec<String>,
     pub auto_install: bool,
+    /// Most toolchains this node installs on its own for peers (DESIGN section 7).
+    pub max_auto_toolchains: usize,
     pub remote_incremental: RemoteIncremental,
     pub local_only: Vec<String>,
     pub sensitive: Vec<String>,
@@ -43,6 +45,7 @@ impl Default for Config {
             accept_remote_jobs: true,
             peers: Vec::new(),
             auto_install: true,
+            max_auto_toolchains: crate::toolchain::DEFAULT_MAX_AUTO_TOOLCHAINS,
             remote_incremental: RemoteIncremental::Local,
             local_only: Vec::new(),
             sensitive: Vec::new(),

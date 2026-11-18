@@ -3,7 +3,7 @@
 use crate::proto::ToolchainId;
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -14,6 +14,16 @@ use std::time::{Duration, Instant, SystemTime};
 const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout of one rustup install child.
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Timeout of one `rustup toolchain uninstall` child.
+const UNINSTALL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Timeout of the kill helper (`taskkill` / `kill`).
+const KILL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default of the `max_auto_toolchains` config value.
+pub const DEFAULT_MAX_AUTO_TOOLCHAINS: usize = 4;
+/// Remembered failed (spec, target) pairs; the least recently used is dropped.
+const FAILED_CAP: usize = 64;
+/// File in the data dir listing the toolchains this node installed itself.
+const AUTO_FILE: &str = "auto-toolchains.toml";
 
 /// Parse `rustc -vV` output.
 pub fn parse_version_verbose(out: &str) -> anyhow::Result<ToolchainId> {
@@ -67,7 +77,41 @@ struct State {
     installing: Option<InstallState>,
     /// (spec, target) pairs whose install failed in this process; not retried,
     /// so an unavailable toolchain does not trigger a download loop.
-    failed: HashSet<(String, String)>,
+    failed: FailedSet,
+    /// rustup names of the toolchains this node installed on its own (a peer
+    /// asked for them); persisted in `AUTO_FILE`, counted against the cap.
+    auto: Vec<String>,
+}
+
+/// Bounded LRU set: peers choose the specs, so the set must not grow with them.
+#[derive(Default)]
+struct FailedSet {
+    order: VecDeque<(String, String)>,
+}
+
+impl FailedSet {
+    /// True when `key` is present; a hit counts as a use.
+    fn contains(&mut self, key: &(String, String)) -> bool {
+        match self.order.iter().position(|k| k == key) {
+            Some(i) => {
+                if let Some(k) = self.order.remove(i) {
+                    self.order.push_back(k);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn insert(&mut self, key: (String, String)) {
+        if let Some(i) = self.order.iter().position(|k| *k == key) {
+            self.order.remove(i);
+        }
+        self.order.push_back(key);
+        while self.order.len() > FAILED_CAP {
+            self.order.pop_front();
+        }
+    }
 }
 
 struct InstallState {
@@ -77,6 +121,8 @@ struct InstallState {
 struct Inner {
     data_dir: PathBuf,
     auto_install: bool,
+    /// Most toolchains this node installs on its own (`max_auto_toolchains`).
+    max_auto: usize,
     state: Mutex<State>,
 }
 
@@ -92,17 +138,29 @@ impl Toolchains {
     /// Scan `rustup toolchain list` (+ `rustc -vV` per toolchain, cached on
     /// disk in `<data>/toolchains.toml` by toolchain dir mtime).
     pub fn scan(data_dir: &Path, auto_install: bool) -> anyhow::Result<Toolchains> {
+        Self::scan_with(data_dir, auto_install, DEFAULT_MAX_AUTO_TOOLCHAINS)
+    }
+
+    /// Like [`Toolchains::scan`] with an explicit `max_auto_toolchains`.
+    pub fn scan_with(data_dir: &Path, auto_install: bool, max_auto: usize) -> anyhow::Result<Toolchains> {
         let installed = scan_installed(data_dir)?;
-        Ok(Self::with_installed(data_dir, auto_install, installed))
+        Ok(Self::with_installed_cap(data_dir, auto_install, max_auto, installed))
     }
 
     /// Registry over a known list (no rustup access); used by tests.
     pub fn with_installed(data_dir: &Path, auto_install: bool, installed: Vec<Installed>) -> Toolchains {
+        Self::with_installed_cap(data_dir, auto_install, DEFAULT_MAX_AUTO_TOOLCHAINS, installed)
+    }
+
+    /// [`Toolchains::with_installed`] with an explicit cap.
+    pub fn with_installed_cap(data_dir: &Path, auto_install: bool, max_auto: usize, installed: Vec<Installed>) -> Toolchains {
+        let auto = load_auto(data_dir, &installed);
         Toolchains {
             inner: Arc::new(Inner {
                 data_dir: data_dir.to_path_buf(),
                 auto_install,
-                state: Mutex::new(State { installed, ..State::default() }),
+                max_auto,
+                state: Mutex::new(State { installed, auto, ..State::default() }),
             }),
         }
     }
@@ -110,8 +168,22 @@ impl Toolchains {
     /// Re-read the machine's toolchains (after an install).
     pub fn rescan(&self) -> anyhow::Result<()> {
         let installed = scan_installed(&self.inner.data_dir)?;
-        self.lock().installed = installed;
+        let mut st = self.lock();
+        // A toolchain the user removed by hand no longer counts against the cap.
+        st.auto.retain(|n| installed.iter().any(|t| t.name == *n));
+        st.installed = installed;
         Ok(())
+    }
+
+    /// Toolchains this node installed on its own (tests and diagnostics).
+    pub fn auto_installed(&self) -> Vec<String> {
+        self.lock().auto.clone()
+    }
+
+    fn save_auto(&self, names: &[String]) {
+        if let Err(e) = write_auto(&self.inner.data_dir, names) {
+            tracing::warn!("could not persist {AUTO_FILE}: {e:#}");
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -153,8 +225,21 @@ impl Toolchains {
         if !self.inner.auto_install || st.installing.is_some() {
             return None;
         }
+        // The id comes from a peer and ends up as rustup arguments and a
+        // download: nothing unvalidated reaches that far.
+        if let Err(e) = validate_request(id, target) {
+            tracing::warn!("toolchain request refused: {e}");
+            return None;
+        }
         let key = (spec.clone(), target.to_string());
         if st.failed.contains(&key) {
+            return None;
+        }
+        if found.is_none() && st.auto.len() >= self.inner.max_auto {
+            tracing::warn!(
+                "toolchain {spec} not installed: {} auto-installed toolchains reach max_auto_toolchains",
+                st.auto.len()
+            );
             return None;
         }
         st.installing = Some(InstallState { pid: None });
@@ -189,14 +274,31 @@ impl Toolchains {
         let mut found = self.list().into_iter().find(|t| t.id.same_compiler(id));
         if found.is_none() {
             tracing::info!("installing toolchain {spec}");
+            let before: Vec<String> = self.list().into_iter().map(|t| t.name).collect();
             let mut cmd = Command::new("rustup");
             cmd.args(["toolchain", "install", spec, "--profile", "minimal", "--no-self-update"]);
-            self.run_recorded(cmd)?;
-            self.rescan()?;
+            let install_res = self.run_recorded(cmd, INSTALL_TIMEOUT);
+            // Even a failed or timed out install may have left a toolchain.
+            let rescan_res = self.rescan();
+            let added = newly_added(&before, &self.list());
+            if !added.is_empty() {
+                let mut st = self.lock();
+                for n in &added {
+                    if !st.auto.contains(n) {
+                        st.auto.push(n.clone());
+                    }
+                }
+                let names = st.auto.clone();
+                drop(st);
+                self.save_auto(&names);
+            }
+            install_res?;
+            rescan_res?;
             found = self.list().into_iter().find(|t| t.id.same_compiler(id));
             if found.is_none() {
                 // The spec resolved to a different build (for example a newer
-                // nightly): never use it for this job.
+                // nightly): never use it for this job, and do not keep it.
+                self.uninstall_auto(&added);
                 bail!(
                     "toolchain {spec} installed but commit {} was not found; not used",
                     short(&id.commit_hash)
@@ -208,7 +310,7 @@ impl Toolchains {
             tracing::info!("adding target {target} to {}", t.name);
             let mut cmd = Command::new("rustup");
             cmd.args(["target", "add", "--toolchain", &t.name, target]);
-            self.run_recorded(cmd)?;
+            self.run_recorded(cmd, INSTALL_TIMEOUT)?;
             self.rescan()?;
             let ok = self
                 .list()
@@ -223,13 +325,13 @@ impl Toolchains {
 
     /// Run one rustup child with the install timeout, recording its PID so
     /// that only this process can be killed.
-    fn run_recorded(&self, mut cmd: Command) -> anyhow::Result<()> {
+    fn run_recorded(&self, mut cmd: Command, timeout: Duration) -> anyhow::Result<()> {
         cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         let mut child = cmd.spawn().context("spawn rustup")?;
         if let Some(i) = self.lock().installing.as_mut() {
             i.pid = Some(child.id());
         }
-        let res = wait_with_timeout(&mut child, INSTALL_TIMEOUT);
+        let res = wait_with_timeout(&mut child, timeout);
         if let Some(i) = self.lock().installing.as_mut() {
             i.pid = None;
         }
@@ -238,6 +340,23 @@ impl Toolchains {
             bail!("rustup exited with {status}");
         }
         Ok(())
+    }
+
+    /// Remove toolchains this node itself just installed (`names` come from
+    /// [`newly_added`]); never touches anything else. Failures are logged.
+    fn uninstall_auto(&self, names: &[String]) {
+        for name in names {
+            let mut cmd = Command::new("rustup");
+            cmd.args(["toolchain", "uninstall", name]);
+            if let Err(e) = self.run_recorded(cmd, UNINSTALL_TIMEOUT) {
+                tracing::warn!("could not uninstall {name}: {e:#}");
+            }
+        }
+        if let Err(e) = self.rescan() {
+            tracing::warn!("rescan after uninstall failed: {e:#}");
+        }
+        let names = self.lock().auto.clone();
+        self.save_auto(&names);
     }
 
     /// rustup spec for an id: `release` for stable/beta, `nightly-<commit
@@ -251,6 +370,111 @@ impl Toolchains {
         }
         id.release.clone()
     }
+}
+
+/// Names present in `after` but not in `before`: what one install added.
+fn newly_added(before: &[String], after: &[Installed]) -> Vec<String> {
+    after.iter().filter(|t| !before.contains(&t.name)).map(|t| t.name.clone()).collect()
+}
+
+fn load_auto(data_dir: &Path, installed: &[Installed]) -> Vec<String> {
+    #[derive(Deserialize, Default)]
+    struct F {
+        #[serde(default)]
+        names: Vec<String>,
+    }
+    let f: F = std::fs::read_to_string(data_dir.join(AUTO_FILE))
+        .ok()
+        .and_then(|s| toml::from_str(&s).ok())
+        .unwrap_or_default();
+    f.names.into_iter().filter(|n| installed.iter().any(|t| t.name == *n)).collect()
+}
+
+fn write_auto(data_dir: &Path, names: &[String]) -> anyhow::Result<()> {
+    #[derive(Serialize)]
+    struct F<'a> {
+        names: &'a [String],
+    }
+    let text = toml::to_string(&F { names }).context("encode auto toolchains")?;
+    std::fs::create_dir_all(data_dir).context("create data dir")?;
+    let tmp = data_dir.join(format!("{AUTO_FILE}.tmp"));
+    std::fs::write(&tmp, text).context("write auto toolchains")?;
+    std::fs::rename(&tmp, data_dir.join(AUTO_FILE)).context("replace auto toolchains")
+}
+
+// ---- validation of peer-controlled specs ----
+
+fn digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// `^\d+\.\d+\.\d+(-beta\.\d+|-nightly)?$`
+pub fn valid_release(s: &str) -> bool {
+    let (core, suffix) = match s.split_once('-') {
+        Some((c, rest)) => (c, Some(rest)),
+        None => (s, None),
+    };
+    let parts: Vec<&str> = core.split('.').collect();
+    if parts.len() != 3 || !parts.iter().all(|p| digits(p)) {
+        return false;
+    }
+    match suffix {
+        None | Some("nightly") => true,
+        Some(r) => r.strip_prefix("beta.").is_some_and(digits),
+    }
+}
+
+/// `YYYY-MM-DD` and a date that exists.
+pub fn valid_commit_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return false;
+    }
+    let (ys, ms, ds) = (&s[0..4], &s[5..7], &s[8..10]);
+    if !(digits(ys) && digits(ms) && digits(ds)) {
+        return false;
+    }
+    let (Ok(y), Ok(m), Ok(d)) = (ys.parse::<u32>(), ms.parse::<u32>(), ds.parse::<u32>()) else {
+        return false;
+    };
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let dim = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    y >= 2000 && (1..=dim).contains(&d)
+}
+
+/// 40 lowercase hex characters.
+pub fn valid_commit_hash(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// `^[A-Za-z0-9_.-]{1,64}$`, not starting with `-` (it becomes a rustup argument).
+pub fn valid_target(s: &str) -> bool {
+    (1..=64).contains(&s.len())
+        && !s.starts_with('-')
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// Check everything a peer-supplied id and target contribute to a rustup call.
+pub fn validate_request(id: &ToolchainId, target: &str) -> Result<(), &'static str> {
+    if !valid_release(&id.release) {
+        return Err("invalid release");
+    }
+    if !valid_commit_date(&id.commit_date) {
+        return Err("invalid commit date");
+    }
+    if !valid_commit_hash(&id.commit_hash) {
+        return Err("invalid commit hash");
+    }
+    if !valid_target(target) {
+        return Err("invalid target");
+    }
+    Ok(())
 }
 
 fn short(hash: &str) -> &str {
@@ -323,15 +547,32 @@ fn run_capture(mut cmd: Command, timeout: Duration) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// Run the kill helper with a timeout (the helper itself can hang).
+fn run_kill_helper(mut cmd: Command) {
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    match cmd.spawn() {
+        Ok(mut child) => {
+            if let Err(e) = wait_with_timeout(&mut child, KILL_TIMEOUT) {
+                tracing::warn!("kill helper: {e:#}");
+            }
+        }
+        Err(e) => tracing::warn!("kill helper did not start: {e}"),
+    }
+}
+
 #[cfg(windows)]
 fn kill_pid(pid: u32) {
     // Only called with a PID this module spawned and recorded.
-    let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).output();
+    let mut cmd = Command::new("taskkill");
+    cmd.args(["/PID", &pid.to_string(), "/T", "/F"]);
+    run_kill_helper(cmd);
 }
 
 #[cfg(not(windows))]
 fn kill_pid(pid: u32) {
-    let _ = Command::new("kill").args(["-KILL", &pid.to_string()]).output();
+    let mut cmd = Command::new("kill");
+    cmd.args(["-KILL", &pid.to_string()]);
+    run_kill_helper(cmd);
 }
 
 // ---- scanning and the on-disk cache ----
@@ -545,6 +786,117 @@ mod tests {
         let other = ToolchainId { commit_hash: "zzz".into(), ..want };
         assert!(tc.resolve(&other, "h").is_none(), "same release, other commit");
         assert!(!tc.is_installing());
+    }
+
+    const HASH: &str = "0ef1bc386059596dada8fb65b50425aab2ea637a";
+
+    fn wanted(release: &str, hash: &str, date: &str) -> ToolchainId {
+        ToolchainId { release: release.into(), commit_hash: hash.into(), commit_date: date.into(), host: "h".into() }
+    }
+
+    #[test]
+    fn release_validation() {
+        for ok in ["1.100.0", "1.101.0-beta.3", "1.102.0-nightly", "0.0.0"] {
+            assert!(valid_release(ok), "{ok}");
+        }
+        for bad in [
+            "", "-1.0.0", "--help", "1.100", "1.100.0.1", "1.100.0-beta", "1.100.0-beta.", "1.100.0-rc.1", "stable",
+            "nightly", "1.100.0 --x", "1.100.0-nightly.1", "a.b.c", "1.100.0\n",
+        ] {
+            assert!(!valid_release(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn date_validation() {
+        assert!(valid_commit_date("2026-11-09"));
+        assert!(valid_commit_date("2028-02-29"));
+        for bad in [
+            "", "2027-02-29", "2026-13-01", "2026-00-10", "2026-11-31", "2026-1-09", "26-11-09", "-026-11-09",
+            "2026-11-09x", "2026/11/09", "1999-01-01",
+        ] {
+            assert!(!valid_commit_date(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn hash_and_target_validation() {
+        assert!(valid_commit_hash(HASH));
+        assert!(!valid_commit_hash(&HASH.to_uppercase()));
+        assert!(!valid_commit_hash(&HASH[..39]));
+        assert!(!valid_commit_hash(&format!("{HASH}0")));
+        assert!(!valid_commit_hash(&format!("{}g", &HASH[..39])));
+        assert!(valid_target("x86_64-pc-windows-msvc"));
+        assert!(valid_target("wasm32-unknown-unknown"));
+        for bad in ["", "-v", "--help", "a b", "a/b", "a;b", &"x".repeat(65)] {
+            assert!(!valid_target(bad), "{bad:?}");
+        }
+        assert!(validate_request(&wanted("1.100.0", HASH, "2026-11-09"), "h").is_ok());
+        assert!(validate_request(&wanted("-v", HASH, "2026-11-09"), "h").is_err());
+        assert!(validate_request(&wanted("1.100.0", HASH, "x"), "h").is_err());
+        assert!(validate_request(&wanted("1.100.0", "abc", "2026-11-09"), "h").is_err());
+        assert!(validate_request(&wanted("1.100.0", HASH, "2026-11-09"), "--bad").is_err());
+    }
+
+    #[test]
+    fn invalid_request_never_starts_an_install() {
+        let d = tempfile::tempdir().unwrap();
+        let tc = Toolchains::with_installed(d.path(), true, vec![]);
+        // `--bogus-flag` would be a rustup argument on unvalidated code.
+        assert!(tc.resolve(&wanted("--bogus-flag", HASH, "2026-11-09"), "h").is_none());
+        assert!(!tc.is_installing(), "an invalid release must not start rustup");
+        assert!(tc.resolve(&wanted("9.99.9", HASH, "2026-11-09"), "--bogus-flag").is_none());
+        assert!(!tc.is_installing(), "an invalid target must not start rustup");
+        assert!(tc.resolve(&wanted("9.99.9", "deadbeef", "2026-11-09"), "h").is_none());
+        assert!(!tc.is_installing(), "an invalid commit hash must not start rustup");
+    }
+
+    #[test]
+    fn auto_install_cap_blocks_new_toolchains() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = fake("1.90.0", "abc", &["h"]);
+        a.name = "1.90.0-h".into();
+        let mut b = fake("1.91.0", "abd", &["h"]);
+        b.name = "1.91.0-h".into();
+        write_auto(d.path(), &["1.90.0-h".to_string(), "1.91.0-h".to_string(), "gone-h".to_string()]).unwrap();
+        let tc = Toolchains::with_installed_cap(d.path(), true, 2, vec![a, b]);
+        // The entry for a toolchain that no longer exists does not count.
+        assert_eq!(tc.auto_installed(), vec!["1.90.0-h", "1.91.0-h"]);
+        let new = wanted("9.99.9", HASH, "2026-11-09");
+        assert!(tc.resolve(&new, "h").is_none());
+        assert!(!tc.is_installing(), "cap reached: no new toolchain may be installed");
+        // Cap 0 disables toolchain auto installs entirely.
+        let tc0 = Toolchains::with_installed_cap(d.path(), true, 0, vec![]);
+        assert!(tc0.resolve(&new, "h").is_none());
+        assert!(!tc0.is_installing());
+    }
+
+    #[test]
+    fn failed_set_is_bounded_lru() {
+        let mut f = FailedSet::default();
+        let k = |i: usize| (format!("spec{i}"), "t".to_string());
+        for i in 0..FAILED_CAP {
+            f.insert(k(i));
+        }
+        assert!(f.contains(&k(0)), "refreshes entry 0");
+        f.insert(k(1000));
+        assert_eq!(f.order.len(), FAILED_CAP);
+        assert!(f.contains(&k(0)), "recently used survives");
+        assert!(!f.contains(&k(1)), "least recently used is evicted");
+        for i in 2000..2500 {
+            f.insert(k(i));
+        }
+        assert_eq!(f.order.len(), FAILED_CAP);
+    }
+
+    #[test]
+    fn only_newly_added_toolchains_are_removable() {
+        let before = vec!["stable-h".to_string(), "nightly-2026-11-01-h".to_string()];
+        let mut n = fake("1.1.1", "x", &[]);
+        n.name = "nightly-2026-11-10-h".into();
+        let mut s = fake("1.1.1", "y", &[]);
+        s.name = "stable-h".into();
+        assert_eq!(newly_added(&before, &[s, n]), vec!["nightly-2026-11-10-h"]);
     }
 
     #[test]

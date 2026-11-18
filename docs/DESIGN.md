@@ -111,7 +111,7 @@ Target: if no `--target` is given, the wrapper adds `--target <client host tripl
 
 - `ToolchainId { release: String, commit_hash: String, host: String }` from `rustc -vV` (`release`, `commit-hash`, `host`). The executing peer must have a toolchain with the same `release` and `commit_hash`; its own `host` may differ (P2/P3).
 - The submitting node caches `rustc -vV` per rustc path + file size + mtime.
-- Executing peer resolves the toolchain via `rustup toolchain list` and `rustc +<name> -vV`, cached. Missing: if `auto_install = true` (default), run `rustup toolchain install <spec> --profile minimal --no-self-update` in the background, where `<spec>` = `release` for stable/beta, `nightly-<commit-date + 1 day>` for nightly (verified by commit hash after install). Missing target: `rustup target add --toolchain <name> <target>`. While installing, the peer reports the toolchain as not installed, so jobs run elsewhere.
+- Executing peer resolves the toolchain via `rustup toolchain list` and `rustc +<name> -vV`, cached. Missing: if `auto_install = true` (default), run `rustup toolchain install <spec> --profile minimal --no-self-update` in the background, where `<spec>` = `release` for stable/beta, `nightly-<commit-date + 1 day>` for nightly (verified by commit hash after install). Missing target: `rustup target add --toolchain <name> <target>`. While installing, the peer reports the toolchain as not installed, so jobs run elsewhere. The toolchain id and target come from a peer and are validated before any rustup call: release `^\d+\.\d+\.\d+(-beta\.\d+|-nightly)?$`, commit date `YYYY-MM-DD` and an existing date, commit hash 40 lowercase hex, target `^[A-Za-z0-9_.-]{1,64}$` not starting with `-`; anything else is refused without a download. At most `max_auto_toolchains` (default 4) toolchains are installed by the node itself (the names are kept in `auto-toolchains.toml` in the data directory); a further request is refused. If the installed build's commit hash does not match, the node runs `rustup toolchain uninstall <name>` for the toolchain it just added (only that one) and remembers the (spec, target) as failed; the failed set keeps the 64 most recently used entries.
 - Rustup child processes have a 30-minute timeout and are recorded by PID; only those are ever killed.
 
 ## 8. Blob store and inputs
@@ -162,6 +162,7 @@ slots = 32                      # default: logical CPUs
 accept_remote_jobs = true
 peers = []                      # static peer addresses
 auto_install = true
+max_auto_toolchains = 4         # toolchains this node installs by itself for peers
 remote_incremental = "local"    # "local" | "strip"
 local_only = []                 # path prefixes never sent to peers
 sensitive = []                  # path prefixes: no blob retention on peers

@@ -636,9 +636,10 @@ pub async fn run(data_dir: PathBuf, shutdown: CancellationToken) -> anyhow::Resu
 
     let dd = data_dir.clone();
     let auto = cfg.auto_install;
+    let max_auto = cfg.max_auto_toolchains;
     let (toolchains, host_triple) = tokio::task::spawn_blocking(move || {
         let host = crate::toolchain::query(Path::new("rustc")).map(|t| t.host).ok();
-        (Toolchains::scan(&dd, auto), host)
+        (Toolchains::scan_with(&dd, auto, max_auto), host)
     })
     .await?;
     let toolchains = toolchains.context("scan toolchains")?;

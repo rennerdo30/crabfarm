@@ -24,6 +24,12 @@ pub struct Config {
     /// Variable names this node accepts from submitters beyond cargo's own
     /// (their `forward_env`); empty by default (DESIGN sections 9 and 12, CF-19).
     pub accept_env: Vec<String>,
+    /// Accept the variable names a submitter's build script declared with
+    /// `rustc-env` (`JobSpec.build_env`). Default true: a submitter's build
+    /// script already runs code on its own machine and the members of a farm
+    /// trust each other (SECURITY.md); false makes every job that declares one
+    /// run on its submitter (CF-25).
+    pub accept_build_env: bool,
     /// Concurrent local rustc runs on this machine (default logical CPUs).
     pub local_slots: u32,
     /// Announce and browse via mDNS (tests set false).
@@ -59,6 +65,7 @@ impl Default for Config {
             job_timeout_min: 30,
             forward_env: Vec::new(),
             accept_env: Vec::new(),
+            accept_build_env: true,
             local_slots: std::thread::available_parallelism()
                 .map(|n| n.get() as u32)
                 .unwrap_or(4),
@@ -77,6 +84,21 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CF-25: build-script variables are accepted unless the operator opts out.
+    #[test]
+    fn accept_build_env_defaults_to_true_and_can_be_turned_off() {
+        assert!(Config::default().accept_build_env);
+        let on: Config = toml::from_str("node_name = \"n\"").unwrap();
+        assert!(on.accept_build_env);
+        let off: Config = toml::from_str("accept_build_env = false").unwrap();
+        assert!(!off.accept_build_env);
     }
 }
 

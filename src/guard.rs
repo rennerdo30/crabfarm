@@ -517,6 +517,37 @@ fn never_forward(name: &str) -> bool {
         || up.starts_with("RUSTUP")
         || up.starts_with("CARGO_MAKEFLAGS")
         || up.starts_with("CARGO_REGISTR")
+        // Tools the compiler or linker starts, or whose search path and
+        // network behaviour they change (CF-25). `RUST_LOG` is not here: it only
+        // makes rustc print more, which the submitter treats as diagnostics.
+        || up.starts_with("SSL_")
+        || up.starts_with("GIT_")
+        || up.starts_with("SSH_")
+        || up.starts_with("PYTHON")
+        || up.starts_with("PERL5")
+        || up.starts_with("RUBY")
+        || matches!(
+            up.as_str(),
+            "NODE_OPTIONS"
+                | "NODE_PATH"
+                | "_LINK_"
+                | "LINK"
+                | "CL"
+                | "_CL_"
+                | "COMPILER_PATH"
+                | "GCC_EXEC_PREFIX"
+                | "LIBRARY_PATH"
+                | "CPATH"
+                | "C_INCLUDE_PATH"
+                | "CPLUS_INCLUDE_PATH"
+                | "SDKROOT"
+                | "DEVELOPER_DIR"
+                | "HTTP_PROXY"
+                | "HTTPS_PROXY"
+                | "ALL_PROXY"
+                | "NO_PROXY"
+                | "JAVA_TOOL_OPTIONS"
+        )
         || matches!(
             up.as_str(),
             "PATH"
@@ -583,6 +614,9 @@ pub struct Policy<'a> {
     pub node_has: &'a dyn Fn(&str) -> bool,
     /// The sandbox file system ignores case and Unicode normalization.
     pub case_insensitive: bool,
+    /// Config `accept_build_env` (CF-25): take the names a submitter's build
+    /// script declared. A job that declares any is refused when this is false.
+    pub accept_build_env: bool,
 }
 
 /// Check the job environment (CF-8, CF-18, CF-19, CF-21).
@@ -606,6 +640,9 @@ pub fn validate_env(spec: &JobSpec, policy: &Policy) -> Result<(), String> {
         if !extra_env_name_ok(n) || design_env(n) || !accepted || (policy.node_has)(n) {
             return Err("job declares a variable this node does not accept".into());
         }
+    }
+    if !spec.build_env.is_empty() && !policy.accept_build_env {
+        return Err("this node does not accept build-script variables".into());
     }
     if spec.build_env.len() > MAX_BUILD_ENV {
         return Err("job declares too many build-script variables".into());
@@ -665,6 +702,7 @@ mod tests {
                 accept_env: &accept,
                 node_has: &none,
                 case_insensitive: false,
+                accept_build_env: true,
             },
         )
     }
@@ -885,6 +923,7 @@ mod tests {
                     accept_env: &none_accepted,
                     node_has: &has,
                     case_insensitive: false,
+                    accept_build_env: true,
                 }
             )
             .is_err()
@@ -948,10 +987,77 @@ mod tests {
                     accept_env: &[],
                     node_has: &has,
                     case_insensitive: false,
+                    accept_build_env: true,
                 }
             )
             .is_err()
         );
+    }
+
+    /// CF-25: names that change how the compiler or linker runs, which tools it
+    /// starts or where it goes on the network are never accepted, in any case and
+    /// whether declared as `build_env` or `extra_env`.
+    #[test]
+    fn tool_affecting_names_are_on_the_never_list() {
+        for bad in [
+            "NODE_OPTIONS",
+            "_LINK_",
+            "LINK",
+            "CL",
+            "_CL_",
+            "INCLUDE",
+            "LIB",
+            "LIBPATH",
+            "COMPILER_PATH",
+            "GCC_EXEC_PREFIX",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "All_Proxy",
+            "no_proxy",
+            "SSL_CERT_FILE",
+            "GIT_DIR",
+            "GIT_SSH_COMMAND",
+            "SSH_AUTH_SOCK",
+            "PYTHONPATH",
+            "PERL5LIB",
+            "RUBYOPT",
+            "JAVA_TOOL_OPTIONS",
+        ] {
+            assert!(!build_env_name_ok(bad), "{bad} as build_env");
+            assert!(!extra_env_name_ok(bad), "{bad} as forward_env");
+            let mut s = spec(vec![(bad, plain("x"))], &[]);
+            s.build_env = vec![bad.into()];
+            assert!(ve(&s, &[bad]).is_err(), "{bad} accepted by the executor");
+        }
+        // Not tool-affecting, and the point of `build_env`: still accepted.
+        // `RUST_LOG` only makes rustc talk more (its output is diagnostics).
+        for ok in ["CF_BUILT", "BUILD_ID", "RUST_LOG", "VERGEN_SHA"] {
+            assert!(build_env_name_ok(ok), "{ok}");
+        }
+    }
+
+    /// CF-25: a node whose operator turned `accept_build_env` off refuses any
+    /// job that declares build-script variables, and only those.
+    #[test]
+    fn accept_build_env_false_refuses_declared_build_variables() {
+        let none = |_: &str| false;
+        let refuse = Policy {
+            peer_host: "h",
+            accept_env: &[],
+            node_has: &none,
+            case_insensitive: false,
+            accept_build_env: false,
+        };
+        let mut s = spec(vec![("CF_BUILT", plain("yes"))], &[]);
+        s.build_env = vec!["CF_BUILT".into()];
+        assert!(validate_env(&s, &refuse).is_err());
+        let plain_job = spec(vec![("CARGO_PKG_NAME", plain("x"))], &[]);
+        assert_eq!(validate_env(&plain_job, &refuse), Ok(()));
+        let accept = Policy {
+            accept_build_env: true,
+            ..refuse
+        };
+        assert_eq!(validate_env(&s, &accept), Ok(()));
     }
 
     /// CF-19: a declared name is accepted only when the node's operator listed

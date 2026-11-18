@@ -69,6 +69,7 @@ impl Node {
         exec::validate_spec(
             &spec,
             &self.cfg.accept_env,
+            self.cfg.accept_build_env,
             &self.host_triple,
             &self.data_dir.join("jobs"),
         )?;
@@ -87,6 +88,7 @@ impl Node {
             key: blob_key,
             timeout,
             accept_env: &self.cfg.accept_env,
+            accept_build_env: self.cfg.accept_build_env,
         };
         let missing = exec::missing_inputs(&ctx, &spec);
         if !missing.is_empty() {
@@ -119,6 +121,7 @@ impl Node {
                 key: blob_key,
                 timeout,
                 accept_env: &node.cfg.accept_env,
+                accept_build_env: node.cfg.accept_build_env,
             };
             exec::run(&ctx, &spec2, &toolchain, etx, cancel2).await
         });

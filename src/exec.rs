@@ -77,6 +77,8 @@ pub struct ExecContext<'a> {
     pub timeout: std::time::Duration,
     /// Config `accept_env` of this node (CF-19).
     pub accept_env: &'a [String],
+    /// Config `accept_build_env` of this node (CF-25).
+    pub accept_build_env: bool,
 }
 
 /// Inputs from `spec.inputs` that are not in the store for `owner`.
@@ -222,6 +224,7 @@ fn sandbox_case_insensitive(jobs_dir: &Path) -> bool {
 pub fn validate_spec(
     spec: &JobSpec,
     accept_env: &[String],
+    accept_build_env: bool,
     peer_host: &str,
     jobs_dir: &Path,
 ) -> anyhow::Result<()> {
@@ -231,6 +234,7 @@ pub fn validate_spec(
         accept_env,
         node_has: &node_has,
         case_insensitive: sandbox_case_insensitive(jobs_dir),
+        accept_build_env,
     };
     guard::validate_spec(spec, &policy).map_err(|why| anyhow::anyhow!("job refused: {why}"))
 }
@@ -652,7 +656,13 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let job_dir = ctx.jobs_dir.join(job_hex(ctx.owner, &spec.job_id));
     let map = SandboxMap::new(job_dir.join("root"));
-    validate_spec(spec, ctx.accept_env, &toolchain.id.host, &ctx.jobs_dir)?;
+    validate_spec(
+        spec,
+        ctx.accept_env,
+        ctx.accept_build_env,
+        &toolchain.id.host,
+        &ctx.jobs_dir,
+    )?;
     validate_paths(spec, &map)?;
     // Claimed before anything is deleted: a duplicate (owner, id) must not wipe
     // the sandbox of the job that is running.
@@ -979,6 +989,7 @@ mod tests {
             key: KEY,
             timeout,
             accept_env: &[],
+            accept_build_env: true,
         }
     }
 

@@ -66,6 +66,19 @@ enum Cmd {
     Cargo { args: Vec<String> },
     /// Show peers, slots, running jobs and counters.
     Status,
+    /// The compile cache: what it holds, and how to empty it.
+    Cache {
+        #[command(subcommand)]
+        cmd: CacheCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheCmd {
+    /// Entries and size on disk, and the hit counters of the running node.
+    Stats,
+    /// Delete every cached result on this machine.
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -344,6 +357,10 @@ fn real_main() -> anyhow::Result<i32> {
     match cli.cmd {
         Cmd::Cargo { args } => Ok(cargo_cmd::run(&args)),
         Cmd::Status => Ok(status::run()),
+        Cmd::Cache { cmd } => Ok(match cmd {
+            CacheCmd::Stats => status::cache_stats(),
+            CacheCmd::Clear => status::cache_clear(),
+        }),
         Cmd::Node { stop: true } => stop_cmd(),
         Cmd::Node { stop: false } => {
             crabfarm::daemon::run_node()?;

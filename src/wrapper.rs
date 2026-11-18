@@ -662,15 +662,11 @@ fn submit(
             }
             if let Some(conn) = conn.as_mut() {
                 // Releases the local slot the node reserved for this run.
-                let _ = rt.block_on(
-                    conn.send(&Message::LocalDone {
-                        code,
-                        produces: cand.produces.clone(),
-                        capture: (cacheable && relayed_notices.is_empty() && cfg.cache)
-                            .then_some(printed)
-                            .flatten(),
-                    }),
-                );
+                let _ = rt.block_on(conn.send(&Message::LocalDone {
+                    code,
+                    produces: cand.produces.clone(),
+                    capture: (cacheable && cfg.cache).then_some(printed).flatten(),
+                }));
             }
             code
         }
@@ -722,9 +718,7 @@ fn pump(
         }
         let text = String::from_utf8_lossy(&buf);
         let line = text.trim_end_matches(['\r', '\n']);
-        if !skip.is_empty() && is_skipped_notice(line, skip) {
-            continue;
-        }
+        let skipped = !skip.is_empty() && is_skipped_notice(line, skip);
         {
             let mut t = tee.lock().unwrap_or_else(|e| e.into_inner());
             t.bytes += buf.len();
@@ -733,6 +727,11 @@ fn pump(
             } else if t.valid {
                 t.lines.push((stdout, line.to_string()));
             }
+        }
+        // Kept for the cache either way: a run replayed from it prints every
+        // notice, as a whole run does.
+        if skipped {
+            continue;
         }
         if stdout {
             let mut o = std::io::stdout().lock();
@@ -748,8 +747,8 @@ fn pump(
 /// stdio would, while keeping it for the compile cache. Artifact notices cargo
 /// already got from the remote attempt (`skip`) are dropped: cargo must see
 /// each notice once, a repeated metadata notice would release dependents
-/// twice. The capture is `None` when the output cannot be replayed exactly
-/// (not text, too long) or a notice was dropped.
+/// twice; the capture still holds them. The capture is `None` when the output
+/// cannot be replayed exactly (not text, too long).
 fn run_local_capturing(
     rustc: &str,
     args: &[String],
@@ -782,8 +781,9 @@ fn run_local_capturing(
         Err(_) => 1,
     };
     let t = tee.into_inner().unwrap_or_else(|e| e.into_inner());
-    let capture =
-        (t.valid && skip.is_empty()).then_some(crate::proto::LocalCapture { lines: t.lines });
+    let capture = t
+        .valid
+        .then_some(crate::proto::LocalCapture { lines: t.lines });
     (code, capture)
 }
 

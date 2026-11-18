@@ -884,6 +884,7 @@ impl Node {
                 Err(err) => {
                     tracing::info!("cache entry unusable, running normally: {err:#}");
                     cc.forget(&key);
+                    node.count("cache_corrupt", 1);
                     None
                 }
             }
@@ -938,6 +939,7 @@ impl Node {
             }
         }
         self.count("cache_miss", 1);
+        tracing::info!(crate_name = ctx.spec.crate_name.as_str(), "cache miss");
         false
     }
 
@@ -990,6 +992,8 @@ impl Node {
         .flatten();
         if stored.is_some() {
             self.count("cache_stored", 1);
+        } else {
+            tracing::info!("cache: remote result not stored");
         }
     }
 
@@ -1061,6 +1065,8 @@ impl Node {
         .flatten();
         if stored.is_some() {
             self.count("cache_stored", 1);
+        } else {
+            tracing::info!("cache: local result not stored");
         }
     }
 

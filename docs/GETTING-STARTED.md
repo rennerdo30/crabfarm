@@ -130,7 +130,7 @@ sensitive = ['C:\Work']
 ```
 
 - `local_only` is the strong one: crates whose source or manifest lies under one of those folders are never sent. Their dependencies from crates.io may still be, because they are public; dependencies you keep under the folder are covered.
-- `sensitive` is weaker: the peer still reads the source while compiling; it just does not keep it afterwards.
+- `sensitive` is weaker: the peer still reads the source while compiling; it just does not keep it afterwards. Nothing under `sensitive` or `local_only` enters the compile cache (step 8) either.
 - For a work notebook the safe setup is: `local_only = ['C:\Work']` on the notebook. It can still serve builds for the desktop, which is the useful direction. Then the notebook stays a plain helper and none of the work code travels.
 
 Restart the node after changing the file (`crabfarm node --stop`, then `crabfarm service install`).
@@ -155,12 +155,23 @@ local because: NoPeer 2, ...
 - `remote failed`: a peer could not do a job and your machine redid it. A few are normal; many mean something is wrong (see below).
 - Slots are how many compiles a machine runs at once.
 
+### The compile cache
+
+Every library crate crabfarm compiles, here or on a peer, is also kept in a cache (default limit 10 GB). The next time the same crate comes up with the same compiler, flags, source files and dependencies, the stored result is used and rustc does not run: after `cargo clean`, after switching branches back and forth, and on another machine in the farm that builds the same project at the same path. `crabfarm status` shows a line like `compile cache: 41 hits (35 local, 6 farm), 3 misses, ...`.
+
+```powershell
+crabfarm cache stats    # entries and size on disk, hit counters
+crabfarm cache clear    # delete everything the cache holds on this machine
+```
+
+In `config.toml`: `cache = false` turns it off on this machine, `cache_entries_max_gb = 10` sets its size. Farm hits need the other machine to have the project at the same path (compiler messages and files name absolute paths); entries from a machine whose path differs are simply not found.
+
 ## 9. If something is wrong
 
 - **`the node is not running`**: run `crabfarm service status`. If autostart is off: `crabfarm service install`. Or start it by hand in a terminal with `crabfarm node` and read what it says.
 - **Everything runs locally (`NoPeer`)**: the machines do not see each other. Check the firewall (step 4), that both are on the same network, or add `peers` (step 5).
 - **First build is slow**: the first time, the desktop may have to install the Rust version your project needs (via `rustup`). That can take a few minutes once.
-- **Version mismatch**: an error like `peer speaks protocol 4, this node speaks 5` means two machines run different crabfarm versions. Install the same version on both.
+- **Version mismatch**: an error like `peer speaks protocol 5, this node speaks 6` means two machines run different crabfarm versions. Install the same version on both.
 - **The log**: `%APPDATA%\renner\crabfarm\data\logs\node.log`. If the node does not start at all, the reason is the last lines of that file. It holds crate names, sizes and timings, never your code.
 - **Stop the node**: `crabfarm node --stop`.
 

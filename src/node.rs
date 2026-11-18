@@ -3,6 +3,7 @@
 //! `executor`, job submission for local wrappers in `submitter`.
 
 use crate::cas::BlobStore;
+use crate::ccache::Ccache;
 use crate::config::Config;
 use crate::depgraph::DepGraph;
 use crate::discovery::{CandidateSet, ConnectLimiter, MDNS_FOUND_QUEUE, Mdns, PeerBook};
@@ -98,6 +99,8 @@ pub struct PeerState {
     pub sent: HashSet<BlobHash>,
     /// The address a job connection last opened on first; tried first next time.
     pub good_addr: Option<String>,
+    /// A cache question to this peer went unanswered: not asked again until then.
+    pub cache_slow_until: Option<Instant>,
 }
 
 impl PeerState {
@@ -111,6 +114,7 @@ impl PeerState {
             pending: 0,
             sent: HashSet::new(),
             good_addr: None,
+            cache_slow_until: None,
         }
     }
 }
@@ -122,6 +126,15 @@ pub struct Node {
     pub tls: TlsContext,
     pub host_triple: String,
     pub store: BlobStore,
+    /// The compile cache (DESIGN section 16); `None` when off or without the
+    /// farm's cache key.
+    pub ccache: Option<Ccache>,
+    /// Crates that built successfully on a peer: only their local results may
+    /// enter the compile cache (DESIGN section 16).
+    pub hermetic: Mutex<crate::hermetic::Hermetic>,
+    /// Cache questions this node has in flight / cache entries it serves at once.
+    pub cache_ask_sem: Arc<Semaphore>,
+    pub cache_serve_sem: Arc<Semaphore>,
     pub jobserver: NodeJobserver,
     pub toolchains: Toolchains,
     pub peers: Mutex<HashMap<NodeId, PeerState>>,
@@ -195,6 +208,7 @@ impl Node {
             .map(|(k, v)| (k.clone(), *v))
             .collect();
         v.push(("local_slots".into(), self.cfg.local_slots as u64));
+        v.push(("cache_enabled".into(), u64::from(self.ccache.is_some())));
         v.push((
             "running_local".into(),
             self.running_local.load(Ordering::Relaxed) as u64,
@@ -661,6 +675,10 @@ impl Node {
                         self.serve_job(node_id, link, job_id).await;
                         Ok(())
                     }
+                    Some(Message::CacheQuery { key }) => {
+                        self.serve_cache(link, key).await;
+                        Ok(())
+                    }
                     Some(m @ (Message::PeerList { .. } | Message::StatusUpdate(_))) => {
                         link.set_idle(Some(CONTROL_SILENCE));
                         self.run_control(node_id, hello, link, Some(m)).await;
@@ -759,10 +777,15 @@ impl Node {
             let _ = tokio::task::spawn_blocking(move || {
                 node.persist();
                 // Every 10 minutes.
-                if n.is_multiple_of(20)
-                    && let Err(e) = node.store.evict()
-                {
-                    tracing::warn!("blob store eviction failed: {e:#}");
+                if n.is_multiple_of(20) {
+                    if let Err(e) = node.store.evict() {
+                        tracing::warn!("blob store eviction failed: {e:#}");
+                    }
+                    if let Some(c) = &node.ccache
+                        && let Err(e) = c.evict()
+                    {
+                        tracing::warn!("compile cache eviction failed: {e:#}");
+                    }
                 }
             })
             .await;
@@ -943,7 +966,27 @@ pub async fn run(
         .and_then(|b| postcard::from_bytes(&b).ok())
         .unwrap_or_default();
     let (status_tx, _) = watch::channel(0u64);
+    let ccache = match (cfg.cache, id.cache_key) {
+        (true, Some(k)) => match Ccache::open(&data_dir, &k, cfg.cache_entries_max_gb) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!("compile cache unavailable: {e:#}");
+                None
+            }
+        },
+        (true, None) => {
+            tracing::warn!(
+                "compile cache off: this node has no farm cache key (it joined before the cache existed); join the farm again"
+            );
+            None
+        }
+        (false, _) => None,
+    };
     let node = Arc::new(Node {
+        ccache,
+        hermetic: Mutex::new(crate::hermetic::Hermetic::load(&data_dir)),
+        cache_ask_sem: Arc::new(Semaphore::new(crate::submitter::CACHE_ASK_CONCURRENCY)),
+        cache_serve_sem: Arc::new(Semaphore::new(crate::executor::SERVE_CACHE_LIMIT)),
         store: BlobStore::open(
             &data_dir.join("cache"),
             cfg.cache_max_gb.saturating_mul(1 << 30),

@@ -853,6 +853,8 @@ mod tests {
     #[test]
     fn only_rustc_runs_remotely() {
         assert!(is_plain_rustc("rustc"));
+        // A drive-letter path is a path only on Windows.
+        #[cfg(windows)]
         assert!(is_plain_rustc(
             r"C:\Users\me\.rustup\toolchains\stable\bin\rustc.exe"
         ));

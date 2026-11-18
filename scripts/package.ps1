@@ -46,7 +46,7 @@ if (!(Test-Path -LiteralPath $MakeNsis -PathType Leaf)) {
 }
 Write-Host "crabfarm $Version from commit $(& git -C $root rev-parse --short HEAD)"
 
-function Invoke-Bounded([string]$File, [string[]]$Arguments, [int]$Seconds) {
+function Invoke-BoundedCommand([string]$File, [string[]]$Arguments, [int]$Seconds) {
     $info = [Diagnostics.ProcessStartInfo]::new($File)
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
@@ -73,8 +73,8 @@ function Invoke-Bounded([string]$File, [string[]]$Arguments, [int]$Seconds) {
 
 $cargo = (Get-Command cargo -ErrorAction Stop).Source
 if (!$BinDir) {
-    Invoke-Bounded $cargo @('build', '--release', '--locked', '-j', "$Jobs") 3600 | Out-Null
-    $meta = Invoke-Bounded $cargo @('metadata', '--format-version', '1', '--no-deps') 120 | ConvertFrom-Json
+    Invoke-BoundedCommand $cargo @('build', '--release', '--locked', '-j', "$Jobs") 3600 | Out-Null
+    $meta = Invoke-BoundedCommand $cargo @('metadata', '--format-version', '1', '--no-deps') 120 | ConvertFrom-Json
     $BinDir = Join-Path $meta.target_directory 'release'
 }
 foreach ($exe in 'crabfarm.exe', 'crabfarmd.exe', 'cargo-crabfarm.exe') {
@@ -94,7 +94,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $root 'assets/crabfarm.ico') -Destination $stage
 
     $setup = Join-Path $out "crabfarm-$Version-setup.exe"
-    Invoke-Bounded $MakeNsis @('-V3', "-DVERSION=$Version", "-DVI_VERSION=$numeric", "-DSRC=$stage", "-DOUTFILE=$setup", (Join-Path $root 'installer/crabfarm.nsi')) 300 | Out-Null
+    Invoke-BoundedCommand $MakeNsis @('-V3', "-DVERSION=$Version", "-DVI_VERSION=$numeric", "-DSRC=$stage", "-DOUTFILE=$setup", (Join-Path $root 'installer/crabfarm.nsi')) 300 | Out-Null
 
     # The zip is the no-installer route: unpack anywhere, run `crabfarm path add` if wanted.
     $zip = Join-Path $out "crabfarm-$Version-windows-x64.zip"

@@ -92,30 +92,54 @@ pub fn missing_inputs(ctx: &ExecContext, spec: &JobSpec) -> Vec<BlobHash> {
         .collect()
 }
 
-/// Directory name of a job: the submitter's node id and the job id (CF-9).
-/// The job id alone is chosen by the submitter, so two submitters (or a
-/// malicious one) could otherwise pick the same name and wipe a running job.
+/// Directory name of a job: 12 hex characters of a hash over the submitter's
+/// node id and the job id (CF-9, CF-29). The job id alone is chosen by the
+/// submitter, so two submitters (or a malicious one) could otherwise pick the
+/// same name and wipe a running job. The name is short because the sandbox
+/// path (`<data>/jobs/<name>/r/<client path>`) must stay far below the Windows
+/// MAX_PATH even for deep client paths; a collision of two live jobs is caught
+/// by `RunningGuard`, which keys on this name.
 fn job_hex(owner: NodeId, id: &JobId) -> String {
-    let hex = |b: &[u8; 16]| b.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    format!("{}-{}", hex(&owner.0), hex(&id.0))
+    let mut input = [0u8; 32];
+    input[..16].copy_from_slice(&owner.0);
+    input[16..].copy_from_slice(&id.0);
+    let h = blake3::hash(&input);
+    h.as_bytes()[..6]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The jobs directory with symlinks resolved, on Unix. rustc reports the real
+/// path of its working directory (macOS temp folders live under the `/var`
+/// symlink to `/private/var`), so a remap prefix and the output scan built from
+/// the unresolved spelling would match nothing (CF-29). Windows keeps the path as
+/// configured: `canonicalize` there yields verbatim `\\?\` forms that differ from what
+/// rustc prints.
+fn real_jobs_dir(jobs_dir: &Path) -> PathBuf {
+    if cfg!(unix) {
+        let _ = std::fs::create_dir_all(jobs_dir);
+        std::fs::canonicalize(jobs_dir).unwrap_or_else(|_| jobs_dir.to_path_buf())
+    } else {
+        jobs_dir.to_path_buf()
+    }
 }
 
 /// Jobs running in this process, by `(jobs dir, owner, job id)`: a second
 /// request for the same key is refused instead of deleting the first one's
 /// sandbox (CF-9).
-fn running_jobs() -> &'static std::sync::Mutex<std::collections::HashSet<(PathBuf, NodeId, JobId)>>
-{
+fn running_jobs() -> &'static std::sync::Mutex<std::collections::HashSet<(PathBuf, String)>> {
     static RUNNING: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashSet<(PathBuf, NodeId, JobId)>>,
+        std::sync::Mutex<std::collections::HashSet<(PathBuf, String)>>,
     > = std::sync::OnceLock::new();
     RUNNING.get_or_init(Default::default)
 }
 
-struct RunningGuard((PathBuf, NodeId, JobId));
+struct RunningGuard((PathBuf, String));
 
 impl RunningGuard {
     fn claim(ctx: &ExecContext, spec: &JobSpec) -> anyhow::Result<RunningGuard> {
-        let key = (ctx.jobs_dir.clone(), ctx.owner, spec.job_id);
+        let key = (ctx.jobs_dir.clone(), job_hex(ctx.owner, &spec.job_id));
         let mut set = running_jobs().lock().unwrap_or_else(|e| e.into_inner());
         if !set.insert(key.clone()) {
             bail!("job is already running on this node");
@@ -654,8 +678,8 @@ pub async fn run(
     events: tokio::sync::mpsc::Sender<ExecEvent>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
-    let job_dir = ctx.jobs_dir.join(job_hex(ctx.owner, &spec.job_id));
-    let map = SandboxMap::new(job_dir.join("root"));
+    let job_dir = real_jobs_dir(&ctx.jobs_dir).join(job_hex(ctx.owner, &spec.job_id));
+    let map = SandboxMap::new(job_dir.join("r"));
     validate_spec(
         spec,
         ctx.accept_env,
@@ -1413,7 +1437,7 @@ fn main() {
         let other = async {
             let dir = f.jobs.join(job_hex(OWNER, &spec.job_id));
             for _ in 0..100 {
-                if dir.join("root").exists() {
+                if dir.join("r").exists() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1518,13 +1542,13 @@ fn main() {
         let canceller = async {
             // Wait until the first job has its sandbox, then try the duplicate.
             for _ in 0..100 {
-                if dir.join("root").exists() {
+                if dir.join("r").exists() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            assert!(dir.join("root").exists(), "first job never started");
-            let marker = dir.join("root").join("marker");
+            assert!(dir.join("r").exists(), "first job never started");
+            let marker = dir.join("r").join("marker");
             std::fs::write(&marker, b"alive").unwrap();
             let c = ctx(&f, Duration::from_secs(120));
             let (res, evs) = collect(&c, &spec, &fake, CancellationToken::new()).await;

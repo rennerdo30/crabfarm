@@ -318,6 +318,17 @@ fn commit_temp(tmp: &std::path::Path, dest: &std::path::Path) -> anyhow::Result<
 }
 
 /// Write `data` to `dest` through a temporary file in the same directory.
+/// The `message` of a rustc JSON diagnostic whose level is `error`, or the text
+/// of a plain `error...` line; `None` for everything else.
+fn first_error_message(line: &str) -> Option<String> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+        return (v.get("level")?.as_str()? == "error")
+            .then(|| v.get("message")?.as_str().map(str::to_string))
+            .flatten();
+    }
+    line.starts_with("error").then(|| line.to_string())
+}
+
 #[cfg(test)]
 fn write_atomic(dest: &std::path::Path, data: &[u8]) -> anyhow::Result<()> {
     commit_temp(&write_temp(dest, data)?, dest)
@@ -1086,6 +1097,9 @@ impl Node {
         // Started with the job: all `NeedBlobs` rounds share it.
         let upload_deadline = Instant::now() + UPLOAD_DEADLINE;
         let style = spec.out_dir.style;
+        // The first `error` diagnostic of the job, for the log when it exits
+        // nonzero: a remote failure that a local run then cures needs a cause.
+        let mut first_error: Option<String> = None;
         loop {
             let m = next_frame(link, job_deadline).await?;
             live.touch();
@@ -1107,6 +1121,9 @@ impl Node {
                     {
                         let _ = link.send(Message::Cancel).await;
                         return Ok(RemoteEnd::WrapperGone);
+                    }
+                    if first_error.is_none() {
+                        first_error = first_error_message(&line);
                     }
                     if let Some((m, early)) = relay.offer(Message::Stderr { line }, style)? {
                         if early {
@@ -1184,6 +1201,18 @@ impl Node {
                         return Ok(RemoteEnd::WrapperGone);
                     }
                     let ok = code == 0;
+                    if !ok {
+                        // Info: only the crate name and the first error message
+                        // (peer text, escaped and cut), never more of the output.
+                        tracing::info!(
+                            crate_name = plan.spec.crate_name.as_str(),
+                            code,
+                            "remote compile failed: {}",
+                            crate::proto::log_safe(
+                                first_error.as_deref().unwrap_or("no error line")
+                            )
+                        );
+                    }
                     let held = {
                         let mut r = std::mem::take(&mut relay);
                         tokio::task::spawn_blocking(move || r.finish(ok)).await??
@@ -1290,6 +1319,28 @@ impl Node {
 
 #[cfg(test)]
 mod tests {
+    /// CF-29: the cause of a remote failure is the first `error` diagnostic.
+    #[test]
+    fn first_error_message_picks_errors_only() {
+        let warn = r#"{"level":"warning","message":"unused variable"}"#;
+        let err = r#"{"level":"error","message":"couldn't read `x.rs`: path too long"}"#;
+        assert_eq!(super::first_error_message(warn), None);
+        assert_eq!(
+            super::first_error_message(err).as_deref(),
+            Some("couldn't read `x.rs`: path too long")
+        );
+        assert_eq!(
+            super::first_error_message("error: linking failed").as_deref(),
+            Some("error: linking failed")
+        );
+        assert_eq!(super::first_error_message("note: hi"), None);
+        // An artifact notice has no level.
+        assert_eq!(
+            super::first_error_message(r#"{"artifact":"a","emit":"link"}"#),
+            None
+        );
+    }
+
     /// CF-27 F4: one dead address never costs more than the deadline, and a
     /// live address wins at once even when others hang.
     #[tokio::test]

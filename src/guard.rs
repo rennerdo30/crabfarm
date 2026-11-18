@@ -1183,10 +1183,11 @@ mod tests {
         let job = spec(vec![("MY_VAR", plain("v"))], &["MY_VAR"]);
         assert!(ve(&job, &[]).is_err(), "nothing accepted by default");
         assert!(ve(&job, &["OTHER"]).is_err());
+        // Case-insensitive on Windows only; on Unix `my_var` is another variable.
         assert_eq!(
-            ve(&job, &["my_var"]),
-            Ok(()),
-            "names compare case-insensitively"
+            ve(&job, &["my_var"]).is_ok(),
+            cfg!(windows),
+            "names compare case-insensitively on Windows only"
         );
         // A name that is only declared (not set in env) is refused too.
         let declared_only = spec(vec![], &["MY_VAR"]);

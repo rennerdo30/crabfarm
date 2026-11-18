@@ -757,7 +757,12 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let member = make_workspace(d.path());
         let f = target_config(false, &member, None).unwrap();
-        assert_eq!(f, d.path().join(".cargo").join("config.toml"));
+        // cargo reports the real path (macOS temp dirs sit behind the `/var`
+        // symlink), so compare the resolved directories.
+        let real = |p: &Path| p.canonicalize().unwrap();
+        assert_eq!(f.file_name().unwrap(), "config.toml");
+        assert_eq!(f.parent().unwrap().file_name().unwrap(), ".cargo");
+        assert_eq!(real(f.parent().unwrap().parent().unwrap()), real(d.path()));
         // The no-cargo fallback agrees.
         assert_eq!(
             find_project_root_fallback(&member).unwrap(),

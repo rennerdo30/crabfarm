@@ -48,11 +48,11 @@ $utf8 = [System.Text.UTF8Encoding]::new($false)
 
 # Problems found in dry-run mode are reported and collected; otherwise they stop the script.
 $problems = [System.Collections.Generic.List[string]]::new()
-function Fail([string]$Message) {
+function Stop-Release([string]$Message) {
     if ($DryRun) { $problems.Add($Message); Write-Host "WOULD REFUSE: $Message" -ForegroundColor Yellow }
     else { throw $Message }
 }
-function Invoke-Git {
+function Invoke-GitCommand {
     $out = & git @args
     if ($LASTEXITCODE -ne 0) { throw "git $($args -join ' ') failed" }
     $out
@@ -60,30 +60,30 @@ function Invoke-Git {
 
 # --- Preconditions -----------------------------------------------------------
 # Check the remote before the first network call and before anything is pushed.
-$originUrl = (Invoke-Git remote get-url origin).Trim()
+$originUrl = (Invoke-GitCommand remote get-url origin).Trim()
 if ($originUrl -notmatch '^https://github\.com/rennerdo30/crabfarm(\.git)?$') {
-    Fail "origin is '$originUrl', not https://github.com/rennerdo30/crabfarm (a release is pushed only to the public repository)."
+    Stop-Release "origin is '$originUrl', not https://github.com/rennerdo30/crabfarm (a release is pushed only to the public repository)."
 }
-Invoke-Git fetch origin --quiet | Out-Null
+Invoke-GitCommand fetch origin --quiet | Out-Null
 
-if (Invoke-Git status --porcelain) { Fail 'The working tree is not clean (commit or remove changes first).' }
+if (Invoke-GitCommand status --porcelain) { Stop-Release 'The working tree is not clean (commit or remove changes first).' }
 
-$branch = (Invoke-Git rev-parse --abbrev-ref HEAD).Trim()
-if ($branch -ne 'main') { Fail "Releases are cut from main; this is '$branch'." }
+$branch = (Invoke-GitCommand rev-parse --abbrev-ref HEAD).Trim()
+if ($branch -ne 'main') { Stop-Release "Releases are cut from main; this is '$branch'." }
 
-$head = (Invoke-Git rev-parse HEAD).Trim()
-$remote = (Invoke-Git rev-parse origin/main).Trim()
-if ($head -ne $remote) { Fail "HEAD ($($head.Substring(0,7))) is not origin/main ($($remote.Substring(0,7)))." }
+$head = (Invoke-GitCommand rev-parse HEAD).Trim()
+$remote = (Invoke-GitCommand rev-parse origin/main).Trim()
+if ($head -ne $remote) { Stop-Release "HEAD ($($head.Substring(0,7))) is not origin/main ($($remote.Substring(0,7)))." }
 
-if (Invoke-Git tag --list $tag) { Fail "Tag $tag already exists locally." }
-if (Invoke-Git ls-remote --tags origin "refs/tags/$tag") { Fail "Tag $tag already exists on origin." }
+if (Invoke-GitCommand tag --list $tag) { Stop-Release "Tag $tag already exists locally." }
+if (Invoke-GitCommand ls-remote --tags origin "refs/tags/$tag") { Stop-Release "Tag $tag already exists on origin." }
 
 # The commit (author) and the annotated tag (committer) both carry an identity.
-$ident = (Invoke-Git var GIT_AUTHOR_IDENT).Trim()
-$committer = (Invoke-Git var GIT_COMMITTER_IDENT).Trim()
+$ident = (Invoke-GitCommand var GIT_AUTHOR_IDENT).Trim()
+$committer = (Invoke-GitCommand var GIT_COMMITTER_IDENT).Trim()
 foreach ($who in @(@('author', $ident), @('committer', $committer))) {
     if ($who[1] -notmatch '<[^>]*@users\.noreply\.github\.com>') {
-        Fail "The $($who[0]) identity is not a public GitHub noreply address (set GIT_AUTHOR_* and GIT_COMMITTER_* in the environment; this script never writes Git config)."
+        Stop-Release "The $($who[0]) identity is not a public GitHub noreply address (set GIT_AUTHOR_* and GIT_COMMITTER_* in the environment; this script never writes Git config)."
     }
 }
 
@@ -99,12 +99,12 @@ $pkg = [regex]::Match($toml, '(?ms)^\[package\]\s*\r?\n.*?^version = "([^"]+)"')
 if (-not $pkg.Success) { throw 'No version in the [package] table of Cargo.toml.' }
 $current = $pkg.Groups[1].Value
 
-function Parse-Version([string]$v) {
+function ConvertTo-VersionParts([string]$v) {
     $m = [regex]::Match($v, '^(\d+)\.(\d+)\.(\d+)(?:-(.+))?$')
     [pscustomobject]@{ Core = [version]"$($m.Groups[1].Value).$($m.Groups[2].Value).$($m.Groups[3].Value)"; Pre = $m.Groups[4].Value }
 }
-$old = Parse-Version $current
-$new = Parse-Version $Version
+$old = ConvertTo-VersionParts $current
+$new = ConvertTo-VersionParts $Version
 $goesUp = if ($new.Core -ne $old.Core) { $new.Core -gt $old.Core }
           elseif ($new.Pre -eq $old.Pre) { $false }
           elseif (-not $new.Pre) { $true }          # 0.2.0 ranks above 0.2.0-beta.1
@@ -112,15 +112,15 @@ $goesUp = if ($new.Core -ne $old.Core) { $new.Core -gt $old.Core }
           else { [string]::CompareOrdinal($new.Pre, $old.Pre) -gt 0 }
 # The first release has nothing to go up from: Cargo.toml says 1.0.0 and may be released as is,
 # or as a prerelease of it (1.0.0-rc.1, the dry run in docs/RELEASING.md).
-$firstRelease = -not (Invoke-Git tag --list 'v*')
+$firstRelease = -not (Invoke-GitCommand tag --list 'v*')
 if (-not $goesUp -and -not ($firstRelease -and $new.Core -eq $old.Core)) {
-    Fail "Version $Version does not go up from $current."
+    Stop-Release "Version $Version does not go up from $current."
 }
 
 $unreleased = [regex]::Match($log, '(?ms)^## Unreleased[ \t]*\r?\n(.*?)(?=^## |\z)')
 if (-not $unreleased.Success) { throw 'CHANGELOG.md has no "## Unreleased" section.' }
-if ([string]::IsNullOrWhiteSpace($unreleased.Groups[1].Value)) { Fail 'The Unreleased section of CHANGELOG.md is empty.' }
-if ($log -match "(?m)^## $([regex]::Escape($Version))[ \t]*$") { Fail "CHANGELOG.md already has a section for $Version." }
+if ([string]::IsNullOrWhiteSpace($unreleased.Groups[1].Value)) { Stop-Release 'The Unreleased section of CHANGELOG.md is empty.' }
+if ($log -match "(?m)^## $([regex]::Escape($Version))[ \t]*$") { Stop-Release "CHANGELOG.md already has a section for $Version." }
 
 $newToml = [regex]::Replace($toml, '(?ms)(^\[package\]\s*\r?\n.*?^version = ")[^"]+(")', "`${1}$Version`${2}", 1)
 $newLock = [regex]::Replace($lock, '(?m)(^name = "crabfarm"\r?\nversion = ")[^"]+(")', "`${1}$Version`${2}", 1)
@@ -159,15 +159,15 @@ try {
     }
 } catch {
     Write-Host 'Checks failed; restoring the edited files.' -ForegroundColor Red
-    Invoke-Git checkout -- Cargo.toml Cargo.lock CHANGELOG.md | Out-Null
+    Invoke-GitCommand checkout -- Cargo.toml Cargo.lock CHANGELOG.md | Out-Null
     throw
 }
 
-Invoke-Git add Cargo.toml Cargo.lock CHANGELOG.md | Out-Null
-Invoke-Git commit -m "Release $Version" | Out-Null
-Invoke-Git tag -a $tag -m "crabfarm $Version" | Out-Null
+Invoke-GitCommand add Cargo.toml Cargo.lock CHANGELOG.md | Out-Null
+Invoke-GitCommand commit -m "Release $Version" | Out-Null
+Invoke-GitCommand tag -a $tag -m "crabfarm $Version" | Out-Null
 
 # Explicit refs only; no -u, no force.
-Invoke-Git push origin HEAD:refs/heads/main
-Invoke-Git push origin "refs/tags/$tag"
+Invoke-GitCommand push origin HEAD:refs/heads/main
+Invoke-GitCommand push origin "refs/tags/$tag"
 Write-Host "Pushed $tag. CI builds the packages and prepares a DRAFT release; publishing it is the owner's yes."

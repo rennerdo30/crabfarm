@@ -10,15 +10,47 @@ use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_crabfarm");
 
-/// A started child that is killed (by its own handle) when dropped.
+/// Start `cmd` as the root of a process tree the test can end as a whole: on
+/// Unix its own process group, on Windows the tree below its PID (`taskkill /T`).
+fn spawn_tree(cmd: &mut Command) -> Child {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.spawn().expect("spawn")
+}
+
+/// End the tree below `child` (recorded PID only) and reap it: cargo, rustc and
+/// the linker that a timed-out build left behind must not outlive a failed test.
+fn kill_tree(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: signals the process group this test created for `child`.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A started child (and everything it started) that is killed when dropped.
 struct Proc {
     child: Child,
 }
 
 impl Drop for Proc {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        kill_tree(&mut self.child);
     }
 }
 
@@ -51,7 +83,7 @@ fn run(mut cmd: Command, secs: u64) -> Output {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn");
+    let mut child = spawn_tree(&mut cmd);
     // Drain the pipes on threads so a chatty child cannot block on a full pipe.
     let mut out = child.stdout.take().expect("stdout");
     let mut err = child.stderr.take().expect("stderr");
@@ -71,8 +103,7 @@ fn run(mut cmd: Command, secs: u64) -> Output {
             break Some(s);
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_tree(&mut child);
             break None;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -95,10 +126,19 @@ fn free_port() -> u16 {
     l.local_addr().expect("addr").port()
 }
 
-fn write_config(home: &Path, name: &str, port: u16, local_slots: u32, prefer_remote: bool) {
+/// `peer_port`: the other node, as a static peer. A farm on loopback needs one:
+/// gossiped loopback addresses are only taken when a configured peer is local.
+fn write_config(
+    home: &Path,
+    name: &str,
+    port: u16,
+    peer_port: u16,
+    local_slots: u32,
+    prefer_remote: bool,
+) {
     std::fs::create_dir_all(home).expect("home");
     let text = format!(
-        "node_name = \"{name}\"\nlisten = \"127.0.0.1:{port}\"\nmdns = false\nslots = 4\nlocal_slots = {local_slots}\nprefer_remote = {prefer_remote}\nauto_install = false\n"
+        "node_name = \"{name}\"\nlisten = \"127.0.0.1:{port}\"\npeers = [\"127.0.0.1:{peer_port}\"]\nmdns = false\nslots = 4\nlocal_slots = {local_slots}\nprefer_remote = {prefer_remote}\nauto_install = false\n"
     );
     std::fs::write(home.join("config.toml"), text).expect("config");
 }
@@ -192,8 +232,8 @@ fn two_nodes_build_the_fixture_remotely() {
     );
 
     let (p1, p2) = (free_port(), free_port());
-    write_config(&home1, "node-one", p1, 1, true);
-    write_config(&home2, "node-two", p2, 2, false);
+    write_config(&home1, "node-one", p1, p2, 1, true);
+    write_config(&home2, "node-two", p2, p1, 2, false);
 
     // Farm on node one, node two joins with an invite.
     let mut c = crabfarm(&home1);
@@ -323,12 +363,26 @@ fn two_nodes_build_the_fixture_remotely() {
         "warning does not show the client path {rel}\n{}",
         dump()
     );
-    let peer_dir = home2.to_string_lossy().replace('/', "\\");
+    // The peer's sandboxes live under `<home2>/jobs`. Look for that directory in
+    // both separator spellings on every OS: a check written for one spelling
+    // passes vacuously on the other.
+    let peer_jobs = home2.join("jobs").to_string_lossy().into_owned();
+    let leaks = |text: &str| {
+        text.contains(&peer_jobs)
+            || text.contains(&peer_jobs.replace('\\', "/"))
+            || text.contains(&peer_jobs.replace('/', "\\"))
+            || text.contains(&peer_jobs.replace('\\', "\\\\"))
+            || text.contains("/jobs/")
+            || text.contains("\\jobs\\")
+    };
     assert!(
-        !b1.stderr.contains(&peer_dir) && !b1.stderr.contains("jobs"),
+        !leaks(&b1.stderr),
         "a sandbox path leaked into stderr\n{}",
         dump()
     );
+    // The check must be able to fire: a spelling of a real sandbox path is caught.
+    assert!(leaks(&format!("{peer_jobs}/abc/root/x.rs")));
+    assert!(leaks(&(peer_jobs.replace('/', "\\") + r"\abc\root\x.rs"),));
     // A warning inside the build script's OUT_DIR is an absolute path in the
     // job; it must come back as the client's target directory.
     assert!(
@@ -372,7 +426,7 @@ fn two_nodes_build_the_fixture_remotely() {
         b3.stderr
     );
     assert!(
-        !b3.stderr.contains(&peer_dir),
+        !leaks(&b3.stderr),
         "a sandbox path leaked into the error:\n{}",
         b3.stderr
     );

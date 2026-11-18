@@ -122,6 +122,55 @@ impl ConnectLimiter {
     }
 }
 
+/// True when `addr` (`ip:port`) is somewhere another machine can be reached
+/// (CF-19). Gossip and mDNS come from the network, so only IP literals with a
+/// real port are taken: no host names (they could resolve to anything), no
+/// unspecified (`0.0.0.0`, `::`), multicast or broadcast address, and no
+/// loopback address unless `allow_loopback` (a farm on one machine).
+pub fn gossip_addr_ok(addr: &str, allow_loopback: bool) -> bool {
+    let Ok(sa) = addr.parse::<std::net::SocketAddr>() else {
+        return false;
+    };
+    let ip = sa.ip();
+    if sa.port() == 0 || ip.is_unspecified() || ip.is_multicast() {
+        return false;
+    }
+    if let std::net::IpAddr::V4(v4) = ip
+        && v4.is_broadcast()
+    {
+        return false;
+    }
+    allow_loopback || !ip.is_loopback()
+}
+
+/// True when a configured peer address (`host:port`) is on this machine: the
+/// farm is local (tests, several nodes on one PC), so its loopback addresses
+/// are meant.
+pub fn is_loopback_peer(addr: &str) -> bool {
+    match addr.parse::<std::net::SocketAddr>() {
+        Ok(sa) => sa.ip().is_loopback(),
+        Err(_) => addr
+            .rsplit_once(':')
+            .is_some_and(|(h, _)| h.eq_ignore_ascii_case("localhost")),
+    }
+}
+
+/// `peers` with every address that fails [`gossip_addr_ok`] removed.
+pub fn sanitize_gossip(peers: &[PeerInfo], allow_loopback: bool) -> Vec<PeerInfo> {
+    peers
+        .iter()
+        .map(|p| PeerInfo {
+            addrs: p
+                .addrs
+                .iter()
+                .filter(|a| gossip_addr_ok(a, allow_loopback))
+                .cloned()
+                .collect(),
+            ..p.clone()
+        })
+        .collect()
+}
+
 /// Known peers, persisted in `peers.toml`.
 #[derive(Default, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PeerBook {
@@ -259,6 +308,10 @@ impl Mdns {
                             std::net::IpAddr::V4(v4) => format!("{v4}:{}", svc.get_port()),
                             std::net::IpAddr::V6(v6) => format!("[{v6}]:{}", svc.get_port()),
                         };
+                        // Unauthenticated multicast: never loopback and the like (CF-19).
+                        if !gossip_addr_ok(&addr, false) {
+                            continue;
+                        }
                         match found.try_send((instance.to_string(), addr)) {
                             Ok(()) => {}
                             // Flooded or slow consumer: drop, never block or grow.
@@ -291,6 +344,56 @@ mod tests {
             addrs: addrs.iter().map(|s| s.to_string()).collect(),
             last_seen: seen,
         }
+    }
+
+    /// CF-19: addresses that only make sense on the sender's own machine, or
+    /// that are not addresses of a host at all, are not taken from gossip.
+    #[test]
+    fn gossip_drops_loopback_unspecified_multicast_and_names() {
+        for bad in [
+            "127.0.0.1:47070",
+            "127.8.9.1:1",
+            "[::1]:47070",
+            "0.0.0.0:47070",
+            "[::]:47070",
+            "224.0.0.251:5353",
+            "[ff02::fb]:5353",
+            "255.255.255.255:1",
+            "10.0.0.2:0",
+            "evil.example:47070",
+            "localhost:47070",
+            "10.0.0.2",
+            "",
+        ] {
+            assert!(!gossip_addr_ok(bad, false), "{bad}");
+        }
+        for ok in [
+            "10.0.0.2:47070",
+            "192.168.1.5:1",
+            "[fd00::2]:47070",
+            "100.64.0.1:47070",
+        ] {
+            assert!(gossip_addr_ok(ok, false), "{ok}");
+        }
+        // A farm on one machine keeps its loopback addresses, and nothing else changes.
+        assert!(gossip_addr_ok("127.0.0.1:47070", true));
+        assert!(!gossip_addr_ok("0.0.0.0:47070", true));
+        assert!(is_loopback_peer("127.0.0.1:1"));
+        assert!(is_loopback_peer("[::1]:1"));
+        assert!(is_loopback_peer("LocalHost:1"));
+        assert!(!is_loopback_peer("10.0.0.2:1"));
+        assert!(!is_loopback_peer("desktop.tailnet:47070"));
+        let got = sanitize_gossip(
+            &[peer(
+                2,
+                "b",
+                &["127.0.0.1:1", "10.0.0.2:47070", "0.0.0.0:1"],
+                5,
+            )],
+            false,
+        );
+        assert_eq!(got[0].addrs, vec!["10.0.0.2:47070"]);
+        assert_eq!(got[0].node_name, "b");
     }
 
     #[test]

@@ -140,6 +140,9 @@ pub struct Node {
     pub shutdown: CancellationToken,
     pub listen_addr: SocketAddr,
     inbound: InboundLimits,
+    /// A configured static peer is on this machine, so gossiped loopback
+    /// addresses are meant (CF-19).
+    allow_loopback_gossip: bool,
 }
 
 pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -578,7 +581,11 @@ impl Node {
 
     fn on_control_message(self: &Arc<Self>, peer: NodeId, m: Message) {
         match m {
-            Message::PeerList { peers } => self.learn_peers(&peers),
+            Message::PeerList { peers } => {
+                // Addresses from the network: only ones another machine can use (CF-19).
+                let peers = crate::discovery::sanitize_gossip(&peers, self.allow_loopback_gossip);
+                self.learn_peers(&peers)
+            }
             Message::StatusUpdate(s) => {
                 // A member may only report for itself.
                 if s.node_id != peer {
@@ -927,6 +934,10 @@ pub async fn run(
         shutdown: shutdown.clone(),
         listen_addr,
         inbound: InboundLimits::new(MAX_INBOUND, MAX_UNAUTHENTICATED),
+        allow_loopback_gossip: cfg
+            .peers
+            .iter()
+            .any(|p| crate::discovery::is_loopback_peer(p)),
         host_triple,
         tls,
         id,

@@ -164,6 +164,12 @@ fn farm_cmd(cmd: FarmCmd) -> anyhow::Result<i32> {
             let rt = runtime()?;
             let (id, known) = rt.block_on(farm::join(&data_dir, &name, &code))?;
             let mut book = PeerBook::load(&data_dir)?;
+            // The inviter's list is gossip too (CF-19); loopback addresses only
+            // make sense when the code itself pointed at this machine.
+            let known = crabfarm::discovery::sanitize_gossip(
+                &known,
+                crabfarm::discovery::is_loopback_peer(&code.addr),
+            );
             book.merge(&known, id.node_id);
             book.save(&data_dir)?;
             println!("Joined farm {} as `{}`.", id.short_farm_id(), id.node_name);

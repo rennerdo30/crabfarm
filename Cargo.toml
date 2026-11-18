@@ -1,6 +1,6 @@
 [package]
 name = "crabfarm"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.100"
 description = "Distributed rustc over a peer-to-peer farm of Windows, macOS and Linux machines"
@@ -32,6 +32,12 @@ path = "src/main.rs"
 [[bin]]
 name = "crabfarmd"
 path = "src/bin/crabfarmd.rs"
+
+# `cargo crabfarm build` = `crabfarm cargo build`: cargo runs `cargo-<name>`
+# for `cargo <name>`.
+[[bin]]
+name = "cargo-crabfarm"
+path = "src/bin/cargo-crabfarm.rs"
 
 [dependencies]
 anyhow = "1.0.104"

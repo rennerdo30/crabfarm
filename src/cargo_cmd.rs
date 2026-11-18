@@ -280,6 +280,41 @@ pub fn query_status(data_dir: &std::path::Path) -> Option<Message> {
     })
 }
 
+/// The arguments for [`run`] when this process is `cargo-crabfarm`: cargo
+/// calls `cargo-crabfarm crabfarm <args>` for `cargo crabfarm <args>`, so the
+/// program name and that one inserted `crabfarm` are dropped. Started by hand
+/// without it (`cargo-crabfarm build`), the arguments are taken as they are.
+pub fn args_from_cargo_subcommand(argv: &[String]) -> Vec<String> {
+    let rest = argv.get(1..).unwrap_or_default();
+    match rest.first() {
+        Some(first) if first == "crabfarm" => rest[1..].to_vec(),
+        _ => rest.to_vec(),
+    }
+}
+
+/// The program cargo must use as `RUSTC_WRAPPER`: this executable, or, when
+/// this is `cargo-crabfarm`, the `crabfarm` next to it (only that one acts
+/// as a wrapper).
+fn wrapper_exe() -> std::io::Result<PathBuf> {
+    let me = std::env::current_exe()?;
+    let is_subcommand = me
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("cargo-crabfarm"));
+    if !is_subcommand {
+        return Ok(me);
+    }
+    let sibling = me.with_file_name(format!("crabfarm{}", std::env::consts::EXE_SUFFIX));
+    if sibling.is_file() {
+        Ok(sibling)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{} is missing next to cargo-crabfarm", sibling.display()),
+        ))
+    }
+}
+
 pub fn run(args: &[String]) -> i32 {
     let Ok(data_dir) = config::data_dir() else {
         eprintln!("crabfarm: cannot find the data directory");
@@ -304,7 +339,7 @@ pub fn run(args: &[String]) -> i32 {
             );
         }
     }
-    let exe = match std::env::current_exe() {
+    let exe = match wrapper_exe() {
         Ok(e) => e,
         Err(e) => {
             eprintln!("crabfarm: cannot find my own executable: {e}");
@@ -336,6 +371,31 @@ pub fn run(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cargo_subcommand_name_is_dropped_once() {
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            args_from_cargo_subcommand(&v(&["cargo-crabfarm", "crabfarm", "build", "-p", "x"])),
+            v(&["build", "-p", "x"])
+        );
+        assert_eq!(
+            args_from_cargo_subcommand(&v(&["cargo-crabfarm", "crabfarm"])),
+            Vec::<String>::new()
+        );
+        // By hand, without cargo's inserted name; and a second `crabfarm`
+        // belongs to the user.
+        assert_eq!(
+            args_from_cargo_subcommand(&v(&["cargo-crabfarm", "build"])),
+            v(&["build"])
+        );
+        assert_eq!(
+            args_from_cargo_subcommand(&v(&["cargo-crabfarm", "crabfarm", "crabfarm"])),
+            v(&["crabfarm"])
+        );
+        assert!(args_from_cargo_subcommand(&v(&["cargo-crabfarm"])).is_empty());
+        assert!(args_from_cargo_subcommand(&[]).is_empty());
+    }
     use crate::proto::{NodeId, PeerInfo, Status};
 
     fn a(xs: &[&str]) -> Vec<String> {

@@ -417,7 +417,22 @@ impl Node {
                         search_dirs,
                         link_libs,
                     };
+                    // The wrapper tells a busy node from a dead one by these
+                    // (CF-19). Input collection, a wait for a peer or for a local
+                    // slot can all take a while without any other frame.
+                    let tx = link.tx.clone();
+                    let ticker = tokio::spawn(async move {
+                        let mut t = tokio::time::interval(crate::ipc::KEEPALIVE_INTERVAL);
+                        t.tick().await;
+                        loop {
+                            t.tick().await;
+                            if tx.send(Message::Keepalive).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
                     self.handle_submit(&mut link, spec, info, force_local).await;
+                    ticker.abort();
                     break;
                 }
                 _ => break,

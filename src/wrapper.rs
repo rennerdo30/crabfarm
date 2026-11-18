@@ -424,10 +424,11 @@ fn submit(
     let mut stale_early = false;
 
     let verdict = loop {
-        let msg = match rt.block_on(conn.recv()) {
-            Ok(Some(m)) => m,
-            // The node went away mid-job: the farm side failed, build here.
-            Ok(None) | Err(_) => {
+        // The node sends a keepalive every few seconds while it works; silence
+        // means it is hung or gone (CF-19): the farm side failed, build here.
+        let msg = match rt.block_on(ipc::recv_within(&mut conn, ipc::NODE_SILENCE_LIMIT)) {
+            Some(m) => m,
+            None => {
                 break Verdict::Local {
                     printed,
                     reason: None,
@@ -435,6 +436,7 @@ fn submit(
             }
         };
         match msg {
+            Message::Keepalive => {}
             Message::RunLocal { reason } => {
                 break Verdict::Local {
                     printed,

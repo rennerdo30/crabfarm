@@ -336,6 +336,11 @@ pub enum Message {
     Tainted {
         path: ClientPath,
     },
+    /// Node -> wrapper (appended in protocol 3, CF-19): sent every
+    /// `ipc::KEEPALIVE_INTERVAL` while a `Submit` is in flight, so a wrapper can
+    /// tell a busy node from a dead one. The wrapper runs rustc itself after
+    /// `ipc::NODE_SILENCE_LIMIT` without any frame.
+    Keepalive,
 }
 
 /// Escape and truncate (200 characters) a string that came from a peer before
@@ -485,6 +490,7 @@ impl std::fmt::Debug for Message {
             Message::Exit { code } => f.debug_struct("Exit").field("code", code).finish(),
             Message::Cancel => f.write_str("Cancel"),
             Message::Tainted { path } => f.debug_struct("Tainted").field("path", path).finish(),
+            Message::Keepalive => f.write_str("Keepalive"),
             Message::IpcAuth { .. } => f.debug_struct("IpcAuth").field("token", &Redacted).finish(),
             Message::Submit {
                 spec,

@@ -14,6 +14,11 @@ use tokio::net::{TcpListener, TcpStream};
 /// A wrapper must not slow a build down when the node is gone.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(2);
+/// The node sends `Message::Keepalive` this often while a `Submit` is in flight.
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+/// A wrapper that heard nothing from the node for this long runs rustc itself
+/// (a node that is hung or gone must not hang the build).
+pub const NODE_SILENCE_LIMIT: Duration = Duration::from_secs(30);
 /// `IpcAuth` is 33 bytes; nothing bigger is accepted before authentication.
 const AUTH_MAX_FRAME: usize = 256;
 
@@ -57,6 +62,17 @@ pub async fn authenticate(conn: &mut FramedConn<TcpStream>, token: &[u8; 32]) ->
     match first {
         Ok(Ok(Some(Message::IpcAuth { token: got }))) => bool::from(got.ct_eq(token)),
         _ => false,
+    }
+}
+
+/// Client side: the next frame, or `None` when the node ended the connection,
+/// broke the framing, or stayed silent for `limit` (a `Keepalive` counts as a
+/// frame: callers skip it and call again). The connection must not be used
+/// again after `None` (a timed-out read is not cancel-safe).
+pub async fn recv_within(conn: &mut FramedConn<TcpStream>, limit: Duration) -> Option<Message> {
+    match tokio::time::timeout(limit, conn.recv()).await {
+        Ok(Ok(Some(m))) => Some(m),
+        _ => None,
     }
 }
 

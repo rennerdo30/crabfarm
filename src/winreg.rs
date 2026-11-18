@@ -5,6 +5,7 @@
 use anyhow::bail;
 use std::ptr::null;
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HWND};
+use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_EXPAND_SZ,
     REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW,
@@ -106,7 +107,15 @@ pub fn read_str(subkey: &str, name: &str) -> anyhow::Result<Option<StrValue>> {
         bail!("read HKCU\\{subkey}\\{name} failed (error {rc})");
     }
     let chars = (size2 as usize / 2).min(buf.len());
-    let end = buf[..chars].iter().position(|c| *c == 0).unwrap_or(chars);
+    // The terminating NUL(s) are not part of the text; a NUL before them would
+    // make the text end early, and a rewrite would cut the value (CF-27).
+    let mut end = chars;
+    while end > 0 && buf[end - 1] == 0 {
+        end -= 1;
+    }
+    if buf[..end].contains(&0) {
+        bail!("HKCU\\{subkey}\\{name} contains an embedded NUL character; not touching it");
+    }
     Ok(Some(StrValue {
         value: String::from_utf16_lossy(&buf[..end]),
         expand: ty == REG_EXPAND_SZ,
@@ -118,6 +127,9 @@ pub fn write_str(subkey: &str, name: &str, v: &StrValue) -> anyhow::Result<()> {
     let Some(key) = open(subkey, KEY_SET_VALUE, true)? else {
         bail!("cannot create HKCU\\{subkey}");
     };
+    if v.value.contains('\0') {
+        bail!("refusing to write HKCU\\{subkey}\\{name}: the value contains a NUL character");
+    }
     let n = wide(name);
     let data = wide(&v.value);
     let ty = if v.expand { REG_EXPAND_SZ } else { REG_SZ };
@@ -152,8 +164,30 @@ pub fn delete_value(subkey: &str, name: &str) -> anyhow::Result<bool> {
     }
 }
 
+/// `%VAR%` references in `s` replaced by their values (for comparing only).
+/// Returns `s` unchanged when the expansion fails.
+pub fn expand_env(s: &str) -> String {
+    let src = wide(s);
+    // SAFETY: `src` is NUL-terminated; the buffer length is passed in chars.
+    unsafe {
+        let need = ExpandEnvironmentStringsW(src.as_ptr(), std::ptr::null_mut(), 0);
+        if need == 0 {
+            return s.to_string();
+        }
+        let mut buf = vec![0u16; need as usize];
+        let got = ExpandEnvironmentStringsW(src.as_ptr(), buf.as_mut_ptr(), need);
+        if got == 0 || got > need {
+            return s.to_string();
+        }
+        let end = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+        String::from_utf16_lossy(&buf[..end])
+    }
+}
+
 /// Tell running programs (Explorer, new terminals) that the environment
-/// changed. Bounded: a hung window cannot hold us longer than 3 s in total.
+/// changed. The 3 s timeout applies to EACH top-level window and
+/// `SMTO_ABORTIFHUNG` skips windows that already hang, so the total can be
+/// longer than 3 s when many windows are slow.
 pub fn broadcast_environment_change() {
     let param = wide("Environment");
     let mut result = 0usize;
@@ -168,5 +202,24 @@ pub fn broadcast_environment_change() {
             3000,
             &mut result,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_env_replaces_known_variables_and_leaves_unknown_ones() {
+        let root = std::env::var("SystemRoot").expect("SystemRoot on Windows");
+        assert_eq!(
+            expand_env(r"%SystemRoot%\system32"),
+            format!(r"{root}\system32")
+        );
+        assert_eq!(
+            expand_env("%CRABFARM_NO_SUCH_VARIABLE%"),
+            "%CRABFARM_NO_SUCH_VARIABLE%"
+        );
+        assert_eq!(expand_env(r"C:\plain"), r"C:\plain");
     }
 }

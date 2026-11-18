@@ -17,6 +17,11 @@ pub trait EnvBackend {
     fn write(&mut self, v: &PathValue) -> anyhow::Result<()>;
     /// Tell running programs the environment changed.
     fn broadcast(&mut self);
+    /// `%VAR%` references replaced by their values, for COMPARING entries
+    /// only: what is written is never expanded. The default expands nothing.
+    fn expand(&self, entry: &str) -> String {
+        entry.to_string()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,16 +38,33 @@ fn norm(entry: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Append `dir` unless it is already an entry. Everything else in the value
-/// stays byte for byte as it was, and the registry type is kept (a new value
-/// is REG_EXPAND_SZ, like the one Windows creates).
+/// A value with an embedded NUL cannot be represented once read as text;
+/// writing it back would cut it, so such a PATH is refused, never rewritten.
+fn refuse_nul(value: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !value.contains('\0'),
+        "the user PATH contains an embedded NUL character; not touching it (a rewrite would cut it)"
+    );
+    Ok(())
+}
+
+/// Append `dir` unless it is already an entry (compared with `%VAR%`
+/// references expanded, so `%LOCALAPPDATA%\Programs\crabfarm` counts). Everything
+/// else in the value stays byte for byte as it was, and the registry type is
+/// kept (a new value is REG_EXPAND_SZ, like the one Windows creates).
 pub fn add(backend: &mut dyn EnvBackend, dir: &str) -> anyhow::Result<Change> {
     let current = backend.read()?;
     let (value, expand) = match &current {
         Some(v) => (v.value.as_str(), v.expand),
         None => ("", true),
     };
-    if value.split(';').any(|e| norm(e) == norm(dir)) {
+    refuse_nul(value)?;
+    refuse_nul(dir)?;
+    let want = norm(&backend.expand(dir));
+    if value
+        .split(';')
+        .any(|e| norm(e) == norm(dir) || norm(&backend.expand(e)) == want)
+    {
         return Ok(Change::Unchanged);
     }
     let new = if value.trim().is_empty() {
@@ -62,6 +84,7 @@ pub fn remove(backend: &mut dyn EnvBackend, dir: &str) -> anyhow::Result<Change>
     let Some(current) = backend.read()? else {
         return Ok(Change::Unchanged);
     };
+    refuse_nul(&current.value)?;
     let kept: Vec<&str> = current
         .value
         .split(';')
@@ -109,6 +132,9 @@ impl EnvBackend for RegistryEnv {
     fn broadcast(&mut self) {
         crate::winreg::broadcast_environment_change();
     }
+    fn expand(&self, entry: &str) -> String {
+        crate::winreg::expand_env(entry)
+    }
 }
 
 #[cfg(test)]
@@ -120,6 +146,8 @@ pub mod tests {
         pub value: Option<PathValue>,
         pub writes: u32,
         pub broadcasts: u32,
+        /// Variables `expand` knows (name without percent signs, value).
+        pub vars: Vec<(String, String)>,
     }
 
     impl FakeEnv {
@@ -146,6 +174,13 @@ pub mod tests {
         fn broadcast(&mut self) {
             self.broadcasts += 1;
         }
+        fn expand(&self, entry: &str) -> String {
+            let mut s = entry.to_string();
+            for (k, v) in &self.vars {
+                s = s.replace(&format!("%{k}%"), v);
+            }
+            s
+        }
     }
 
     const DIR: &str = r"C:\Users\a\AppData\Local\Programs\crabfarm";
@@ -165,6 +200,35 @@ pub mod tests {
             Change::Unchanged
         );
         assert_eq!((e.writes, e.broadcasts), (1, 1));
+    }
+
+    /// CF-27: an entry written with `%VAR%` is the same directory once
+    /// expanded; it is not added a second time, and nothing is expanded in
+    /// what is written.
+    #[test]
+    fn an_entry_that_expands_to_the_directory_counts_as_present() {
+        let mut e = FakeEnv::with(r"C:\Windows;%LOCALAPPDATA%\Programs\crabfarm", true);
+        e.vars = vec![("LOCALAPPDATA".into(), r"C:\Users\a\AppData\Local".into())];
+        assert_eq!(add(&mut e, DIR).unwrap(), Change::Unchanged);
+        assert_eq!(e.writes, 0);
+        // A different directory is still appended, the other entry stays unexpanded.
+        let mut e = FakeEnv::with(r"%LOCALAPPDATA%\Other", true);
+        e.vars = vec![("LOCALAPPDATA".into(), r"C:\Users\a\AppData\Local".into())];
+        assert_eq!(add(&mut e, DIR).unwrap(), Change::Changed);
+        assert_eq!(
+            e.value.unwrap().value,
+            format!(r"%LOCALAPPDATA%\Other;{DIR}")
+        );
+    }
+
+    #[test]
+    fn a_path_with_an_embedded_nul_is_refused_and_not_written() {
+        let mut e = FakeEnv::with("C:\\a;C:\\b\0C:\\c", true);
+        assert!(add(&mut e, DIR).is_err());
+        assert!(remove(&mut e, DIR).is_err());
+        assert_eq!(e.writes, 0);
+        let mut e = FakeEnv::default();
+        assert!(add(&mut e, "C:\\x\0y").is_err());
     }
 
     #[test]

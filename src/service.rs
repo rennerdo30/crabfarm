@@ -220,14 +220,19 @@ pub fn install(host: &mut dyn Host, t: &Target) -> anyhow::Result<Vec<String>> {
 pub fn uninstall(host: &mut dyn Host, t: &Target) -> anyhow::Result<Vec<String>> {
     let mut out = Vec::new();
     match t.os {
-        Os::Windows => {
-            let was = host.run_key_delete()?;
-            out.push(if was {
-                "Autostart off.".to_string()
-            } else {
-                "Autostart was not on.".to_string()
-            });
-        }
+        Os::Windows => match host.run_key_get()? {
+            None => out.push("Autostart was not on.".to_string()),
+            // Another install's entry is not ours to remove (CF-27).
+            Some(v) if v != run_value(&t.daemon) => out.push(
+                "Autostart points at another crabfarm install; it was left alone. \
+                 Run `crabfarm service uninstall` from that install to turn it off."
+                    .to_string(),
+            ),
+            Some(_) => {
+                host.run_key_delete()?;
+                out.push("Autostart off.".to_string());
+            }
+        },
         Os::MacOs => {
             let _ = host.run(
                 "launchctl",
@@ -303,6 +308,14 @@ pub fn start_after_setup(host: &mut dyn Host, t: &Target) -> anyhow::Result<Opti
     Ok(Some("Started the node (autostart is on).".into()))
 }
 
+/// Whether autostart (the Run key, the LaunchAgent, the systemd unit) belongs
+/// to the data directory in use. A custom `CRABFARM_HOME` is another node
+/// (a test, a second node on one machine): the autostart entry starts the
+/// default one, so nothing is read or started for it (CF-27).
+pub fn autostart_covers_data_dir(custom_home: Option<&std::ffi::OsStr>) -> bool {
+    custom_home.is_none_or(|h| h.is_empty())
+}
+
 /// The `crabfarmd` next to this executable.
 pub fn daemon_path(exe: &Path) -> anyhow::Result<PathBuf> {
     let name = if cfg!(windows) {
@@ -342,6 +355,73 @@ pub fn current_target() -> anyhow::Result<Target> {
         daemon: daemon_path(&exe)?,
         data_dir: crate::config::data_dir()?,
     })
+}
+
+/// Start `crabfarmd` with no console and NO inherited handles. `std`'s
+/// `Command` always passes `bInheritHandles = TRUE`, so any inheritable handle
+/// of the caller (the output pipe of an installer or a CI step that waits for
+/// end-of-output) would stay open inside the node for as long as it runs. Here
+/// the child gets no handles at all (`bInheritHandles = FALSE`, no standard
+/// handles; the node logs to a file) and a neutral working directory, so it
+/// does not pin the caller's folder either.
+#[cfg(windows)]
+fn spawn_detached_windows(daemon: &Path) -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+        DETACHED_PROCESS, PROCESS_INFORMATION, STARTUPINFOW,
+    };
+    let wide = |p: &std::ffi::OsStr| -> Vec<u16> { p.encode_wide().collect() };
+    let exe = wide(daemon.as_os_str());
+    anyhow::ensure!(
+        !exe.contains(&0) && !exe.contains(&(b'"' as u16)),
+        "unusable path for {}",
+        daemon.display()
+    );
+    let app: Vec<u16> = exe.iter().copied().chain(std::iter::once(0)).collect();
+    // The quoted path is the whole command line.
+    let mut cmdline: Vec<u16> = std::iter::once(b'"' as u16)
+        .chain(exe.iter().copied())
+        .chain([b'"' as u16, 0])
+        .collect();
+    let cwd: Vec<u16> = wide(std::env::temp_dir().as_os_str())
+        .into_iter()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: zeroed STARTUPINFOW/PROCESS_INFORMATION are the documented
+    // initial state; every pointer passed is valid and NUL-terminated for the
+    // duration of the call.
+    unsafe {
+        let mut si: STARTUPINFOW = std::mem::zeroed();
+        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+        let ok = CreateProcessW(
+            app.as_ptr(),
+            cmdline.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0, // bInheritHandles = FALSE
+            DETACHED_PROCESS
+                | CREATE_NEW_PROCESS_GROUP
+                | CREATE_NO_WINDOW
+                | CREATE_UNICODE_ENVIRONMENT,
+            std::ptr::null(),
+            cwd.as_ptr(),
+            &si,
+            &mut pi,
+        );
+        if ok == 0 {
+            anyhow::bail!(
+                "start {}: {}",
+                daemon.display(),
+                std::io::Error::last_os_error()
+            );
+        }
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    Ok(())
 }
 
 pub struct RealHost {
@@ -439,29 +519,25 @@ impl Host for RealHost {
     }
 
     fn start_detached(&mut self, daemon: &Path) -> anyhow::Result<()> {
-        use std::process::Stdio;
-        let mut cmd = std::process::Command::new(daemon);
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
-            const DETACHED_PROCESS: u32 = 0x0000_0008;
-            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+            spawn_detached_windows(daemon)
         }
-        #[cfg(unix)]
+        #[cfg(not(windows))]
         {
             use std::os::unix::process::CommandExt;
+            use std::process::Stdio;
+            let mut cmd = std::process::Command::new(daemon);
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
             cmd.process_group(0);
+            // The node is the user's process from here on; nothing is recorded.
+            let _child = cmd
+                .spawn()
+                .with_context(|| format!("start {}", daemon.display()))?;
+            Ok(())
         }
-        // The node is the user's process from here on; nothing is recorded.
-        let _child = cmd
-            .spawn()
-            .with_context(|| format!("start {}", daemon.display()))?;
-        Ok(())
     }
 
     fn node_running(&self) -> bool {
@@ -558,6 +634,48 @@ mod tests {
         assert!(!status(&h, &t).unwrap().autostart);
         // Nothing to remove the second time is not an error.
         uninstall(&mut h, &t).unwrap();
+    }
+
+    /// CF-27: `service uninstall` removes only the Run value that points at
+    /// THIS install, and says so when it is another one.
+    #[test]
+    fn windows_uninstall_leaves_another_installs_entry_alone() {
+        let t = target(Os::Windows);
+        let mut other = target(Os::Windows);
+        other.daemon = PathBuf::from(r"D:\elsewhere\crabfarmd.exe");
+        let mut h = Fake {
+            run_key: Some(run_value(&other.daemon)),
+            ..Default::default()
+        };
+        let lines = uninstall(&mut h, &t).unwrap();
+        assert_eq!(h.run_key, Some(run_value(&other.daemon)));
+        assert!(lines[0].contains("another crabfarm install"), "{lines:?}");
+        // Its own entry still goes.
+        h.run_key = Some(run_value(&t.daemon));
+        assert_eq!(uninstall(&mut h, &t).unwrap(), vec!["Autostart off."]);
+        assert!(h.run_key.is_none());
+    }
+
+    /// The detached start works with a real (harmless, short-lived) program
+    /// and returns without waiting for it.
+    #[cfg(windows)]
+    #[test]
+    fn the_detached_start_launches_a_process_without_inheriting_handles() {
+        let root = std::env::var("SystemRoot").expect("SystemRoot");
+        let exe = PathBuf::from(root).join(r"System32\hostname.exe");
+        assert!(exe.is_file());
+        spawn_detached_windows(&exe).expect("start");
+        assert!(spawn_detached_windows(Path::new(r"C:\no\such\crabfarmd.exe")).is_err());
+    }
+
+    #[test]
+    fn a_custom_data_directory_has_no_autostart() {
+        use std::ffi::OsStr;
+        assert!(autostart_covers_data_dir(None));
+        assert!(autostart_covers_data_dir(Some(OsStr::new(""))));
+        assert!(!autostart_covers_data_dir(Some(OsStr::new(
+            "/tmp/second-node"
+        ))));
     }
 
     #[test]

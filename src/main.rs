@@ -226,6 +226,12 @@ fn path_cmd(cmd: PathCmd) -> anyhow::Result<i32> {
 /// exited; start it now (see `service::start_after_setup`).
 fn start_node_after_setup() {
     use crabfarm::service;
+    // Autostart belongs to the default data directory only: with a custom
+    // CRABFARM_HOME (tests, a second node) nothing is read or started, so the
+    // real Run key is never touched from there.
+    if !service::autostart_covers_data_dir(std::env::var_os("CRABFARM_HOME").as_deref()) {
+        return;
+    }
     let Ok(target) = service::current_target() else {
         return;
     };

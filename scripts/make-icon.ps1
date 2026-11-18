@@ -27,13 +27,25 @@ try {
     $html = Join-Path $work 'icon.html'
     Set-Content -Path $html -Encoding utf8 -Value "<!doctype html><html><body style='margin:0;background:transparent'><img src='$svgUri' width='$master' height='$master' style='display:block'></body></html>"
     $png = Join-Path $work 'master.png'
-    $args = @('--headless=new', '--disable-gpu', '--hide-scrollbars', '--default-background-color=00000000',
-              "--user-data-dir=$(Join-Path $work 'profile')", "--window-size=$master,$master",
-              "--screenshot=$png", ([Uri]$html).AbsoluteUri)
-    # Only this Edge process (recorded by its handle) is ever stopped.
-    $p = Start-Process -FilePath $edge -ArgumentList $args -PassThru -WindowStyle Hidden
-    if (-not $p.WaitForExit(60000)) { $p.Kill(); throw 'Edge did not finish rendering within 60 s.' }
-    if (-not (Test-Path $png)) { throw 'Edge produced no screenshot.' }
+    # ArgumentList quotes every argument, so paths with spaces stay one argument.
+    $info = [Diagnostics.ProcessStartInfo]::new($edge)
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    foreach ($a in @('--headless=new', '--disable-gpu', '--hide-scrollbars', '--default-background-color=00000000',
+                     "--user-data-dir=$(Join-Path $work 'profile')", "--window-size=$master,$master",
+                     "--screenshot=$png", ([Uri]$html).AbsoluteUri)) { $info.ArgumentList.Add($a) }
+    $p = [Diagnostics.Process]::Start($info)
+    Write-Host "Started Edge, PID $($p.Id) (timeout 60 s)"
+    try {
+        # Edge starts helper processes (renderer, GPU); on a timeout the whole tree of
+        # THIS process (recorded by its handle) is stopped, nothing else.
+        if (-not $p.WaitForExit(60000)) {
+            $p.Kill($true)
+            $p.WaitForExit()
+            throw "Edge (PID $($p.Id)) did not finish rendering within 60 s and was stopped."
+        }
+    } finally { $p.Dispose() }
+    if (-not (Test-Path -LiteralPath $png)) { throw 'Edge produced no screenshot.' }
 
     $src = [Drawing.Bitmap]::FromFile($png)
     $entries = foreach ($s in $sizes) {

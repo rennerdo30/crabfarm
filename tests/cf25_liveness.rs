@@ -18,6 +18,11 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
+/// These tests start whole farms and wait on timing; run side by side on a
+/// busy machine they starve each other (CF-27: the "wrapper has gone" check
+/// failed when the node noticed the closed connection late). One at a time.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct Proc(Child);
 
 impl Drop for Proc {
@@ -323,9 +328,11 @@ async fn answer_after_wrapper(keep_wrapper: bool) -> (PathBuf, bool) {
         }
     } else {
         drop(conn);
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Time for the node to notice the closed connection, even when the
+        // machine is busy, before the peer answers.
+        tokio::time::sleep(Duration::from_secs(3)).await;
         go.notify_one();
-        tokio::time::sleep(Duration::from_secs(4)).await;
+        tokio::time::sleep(Duration::from_secs(6)).await;
     }
     let exists = target.exists();
     (target, exists)
@@ -335,6 +342,7 @@ async fn answer_after_wrapper(keep_wrapper: bool) -> (PathBuf, bool) {
 /// client's out-dir, so the next test can fail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_output_of_a_remote_job_is_written_while_the_wrapper_waits() {
+    let _serial = SERIAL.lock().await;
     let (target, exists) = answer_after_wrapper(true).await;
     assert!(exists, "{} was not written", target.display());
 }
@@ -343,6 +351,7 @@ async fn the_output_of_a_remote_job_is_written_while_the_wrapper_waits() {
 /// it must not write the remote output over the local rustc's files.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_remote_output_is_not_written_once_the_wrapper_has_gone() {
+    let _serial = SERIAL.lock().await;
     let (target, exists) = answer_after_wrapper(false).await;
     assert!(
         !exists,
@@ -357,6 +366,7 @@ async fn a_remote_output_is_not_written_once_the_wrapper_has_gone() {
 /// with keepalives of its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_peer_that_goes_silent_mid_job_does_not_stall_the_build() {
+    let _serial = SERIAL.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let (_node, peer, work, _tc) = start_farm(tmp.path(), Peer::SilentAfterStart).await;
     wait_for_peer(&tmp.path().join("home")).await;
@@ -389,6 +399,7 @@ async fn a_peer_that_goes_silent_mid_job_does_not_stall_the_build() {
 /// (On the old code the connection stayed open until rustc had finished.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_wrapper_closes_its_ipc_connection_before_the_local_rustc_runs() {
+    let _serial = SERIAL.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let work = make_crate(
@@ -433,6 +444,7 @@ async fn the_wrapper_closes_its_ipc_connection_before_the_local_rustc_runs() {
 /// once, without talking to the node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_node_that_just_went_silent_is_skipped_by_the_next_wrapper() {
+    let _serial = SERIAL.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let work = make_crate(tmp.path(), "pub fn f() {}\n");
@@ -481,6 +493,7 @@ async fn a_node_that_just_went_silent_is_skipped_by_the_next_wrapper() {
 /// CF-25: a running node that answers removes the marker by itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_node_that_answers_removes_the_unresponsive_marker() {
+    let _serial = SERIAL.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let (_node, _peer, _work, _tc) = start_farm(tmp.path(), Peer::SilentAfterStart).await;
     let home = tmp.path().join("home");

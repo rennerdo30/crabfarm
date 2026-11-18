@@ -35,7 +35,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
           persist-credentials: false
+      # Same rule as release.yml: only a commit that is on main is published
+      # (CF-25). A manual run with a tag that points elsewhere is refused.
+      - name: Tag commit is an ancestor of origin/main
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          sha=$(git rev-parse HEAD)
+          if ! git merge-base --is-ancestor "$sha" refs/remotes/origin/main; then
+            echo "Tag $TAG (${sha:0:7}) is not on main; refusing to publish it." >&2
+            exit 1
+          fi
       - name: Tag matches the crate version
         env:
           TAG: ${{ inputs.tag }}

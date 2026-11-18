@@ -427,3 +427,71 @@ async fn the_wrapper_closes_its_ipc_connection_before_the_local_rustc_runs() {
         "the connection was still open when the local rustc had written its output"
     );
 }
+
+/// CF-25: after one wrapper found the node silent, the wrappers that follow do
+/// not wait 30 s each: they see the short-lived marker and build locally at
+/// once, without talking to the node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_that_just_went_silent_is_skipped_by_the_next_wrapper() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = make_crate(tmp.path(), "pub fn f() {}\n");
+    let node = FakeNode::start(&home, vec![Behavior::Silent]).await;
+
+    let first = tokio::task::spawn_blocking({
+        let (home, work) = (home.clone(), work.clone());
+        move || run_wrapper(&home, &work, &[], 90)
+    })
+    .await
+    .unwrap();
+    assert_eq!(first.code, Some(0), "{}", first.stderr);
+    assert!(
+        first.elapsed >= Duration::from_secs(29),
+        "{:?}",
+        first.elapsed
+    );
+    assert!(
+        home.join("node-unresponsive").exists(),
+        "the silent node was not recorded"
+    );
+    assert_eq!(node.submitted(), 1);
+
+    // The local rustc of the first run wrote this; the second must write it again.
+    std::fs::remove_file(work.join("out").join("libx-abc.rlib")).unwrap();
+    let second = tokio::task::spawn_blocking({
+        let (home, work) = (home.clone(), work.clone());
+        move || run_wrapper(&home, &work, &[], 20)
+    })
+    .await
+    .unwrap();
+    assert_eq!(second.code, Some(0), "{}", second.stderr);
+    assert!(
+        second.elapsed < Duration::from_secs(15),
+        "the second wrapper waited {:?} for a node known to be silent",
+        second.elapsed
+    );
+    assert_eq!(
+        node.submitted(),
+        1,
+        "the second wrapper asked the node anyway"
+    );
+    assert!(work.join("out").join("libx-abc.rlib").exists());
+}
+
+/// CF-25: a running node that answers removes the marker by itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_that_answers_removes_the_unresponsive_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_node, _peer, _work, _tc) = start_farm(tmp.path(), Peer::SilentAfterStart).await;
+    let home = tmp.path().join("home");
+    crabfarm::ipc::mark_unresponsive(&home);
+    assert!(home.join("node-unresponsive").exists());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while home.join("node-unresponsive").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the node left the marker in place"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}

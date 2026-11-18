@@ -30,6 +30,52 @@ pub fn token_path(data_dir: &Path) -> PathBuf {
     data_dir.join("ipc.token")
 }
 
+/// How long one wrapper's finding that the node is unresponsive makes later
+/// wrappers skip the node (CF-25).
+pub const UNRESPONSIVE_TTL: Duration = Duration::from_secs(180);
+
+/// The marker a wrapper writes after the node stayed silent for
+/// [`NODE_SILENCE_LIMIT`]: its content is the unix second it expires.
+pub fn unresponsive_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("node-unresponsive")
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Record that the node did not answer (atomic: a temporary file renamed over
+/// the marker, so a reader never sees half of it). Best effort.
+pub fn mark_unresponsive(data_dir: &Path) {
+    let path = unresponsive_path(data_dir);
+    let tmp = path.with_extension("tmp");
+    let until = unix_secs() + UNRESPONSIVE_TTL.as_secs();
+    if std::fs::write(&tmp, until.to_string()).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// When the marker expires (unix seconds), or `None` when there is none, it is
+/// expired, or its content is not a plausible expiry (a leftover or a
+/// hand-written file must not switch the farm off for long).
+pub fn unresponsive_until(data_dir: &Path) -> Option<u64> {
+    unresponsive_until_at(data_dir, unix_secs())
+}
+
+fn unresponsive_until_at(data_dir: &Path, now: u64) -> Option<u64> {
+    let text = std::fs::read_to_string(unresponsive_path(data_dir)).ok()?;
+    let until: u64 = text.trim().parse().ok()?;
+    (until > now && until <= now + UNRESPONSIVE_TTL.as_secs()).then_some(until)
+}
+
+/// The node answers: forget an earlier finding that it did not.
+pub fn clear_unresponsive(data_dir: &Path) {
+    let _ = std::fs::remove_file(unresponsive_path(data_dir));
+}
+
 /// Write a file other users must not read (see `secfile`).
 pub fn write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     crate::secfile::write_private(path, data)
@@ -39,6 +85,8 @@ pub fn write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
 /// The old port file is removed first so a wrapper never reads a stale pair.
 pub async fn bind(data_dir: &Path) -> anyhow::Result<(TcpListener, [u8; 32])> {
     let _ = std::fs::remove_file(port_path(data_dir));
+    // A node that starts is answering: whatever an earlier wrapper found is stale.
+    clear_unresponsive(data_dir);
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .context("bind IPC port")?;
@@ -142,6 +190,35 @@ mod tests {
         let mut c = FramedConn::new(TcpStream::connect(("127.0.0.1", port)).await.unwrap());
         c.send(&Message::QueryStatus).await.unwrap();
         assert!(!server.await.unwrap());
+    }
+
+    /// CF-25: the marker is short-lived, rejects implausible content, and goes
+    /// away when the node answers.
+    #[test]
+    fn the_unresponsive_marker_expires_and_is_cleared() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(unresponsive_until(d.path()), None);
+        mark_unresponsive(d.path());
+        let until = unresponsive_until(d.path()).expect("fresh marker");
+        assert!(until > unix_secs() && until <= unix_secs() + 180);
+        assert!(
+            !d.path().join("node-unresponsive.tmp").exists(),
+            "no temporary file is left"
+        );
+        // Expired, absurdly far in the future, and not a number.
+        let now = unix_secs();
+        for (text, want) in [
+            (format!("{}", now - 1), None),
+            (format!("{}", now + 100_000), None),
+            ("soon".to_string(), None),
+            (format!("{}", now + 60), Some(now + 60)),
+        ] {
+            std::fs::write(unresponsive_path(d.path()), text).unwrap();
+            assert_eq!(unresponsive_until_at(d.path(), now), want);
+        }
+        clear_unresponsive(d.path());
+        assert_eq!(unresponsive_until(d.path()), None);
+        clear_unresponsive(d.path());
     }
 
     #[tokio::test]

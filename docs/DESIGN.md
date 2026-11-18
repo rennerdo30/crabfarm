@@ -175,6 +175,7 @@ Environment forwarded from the wrapper (CF-18): an **allow-list**, not a prefix.
 - **Output paths**: an `Output` must lie under the job's `out_dir` (or be one of the files the invocation announced as products), must be a normalized absolute path of the client's style, and its size and hash must match; otherwise the job is abandoned and runs locally. Every file is written to a temporary name in its directory and renamed, before any later frame (such as the artifact notice) is passed on to the wrapper.
 - Infrastructure failure at any point (CF-21: no diagnostics are shown before the result is known, so there is no "after stderr began" case): rerun locally; the buffered remote diagnostics are dropped.
 - **A wrapper that went local owns its files (CF-25)**: when the wrapper's 30 s silence limit expires without a `RunLocal` (a node that is hung, or frozen with the machine), it shuts down and drops the IPC connection BEFORE it starts the local rustc. The node, for its part, checks that the wrapper connection is still open (a 10 ms read that must not see end-of-file or an unexpected frame) and that the node is not shutting down immediately before it moves any staged file into the client's directories (an early metadata or dep-info notice, or the files at `Exit`). Otherwise it tells the executor to cancel, drops the staged files and counts `wrapper_gone`. So a node that was only stalled and resumes cannot rename remote outputs onto files the local rustc is writing. Once the node itself sent `RunLocal`, the job is local and none of its outputs is written either.
+- **A frozen node costs one wait, not one per rustc call (CF-25)**: after a wrapper's 30 s silence fallback it writes `<data>/node-unresponsive` (its content is the unix second it expires, 3 minutes ahead; written to a temporary file and renamed). While it is live, every wrapper that finds it builds locally at once, without connecting to the node. A running node removes it within 5 s (and at start), so a node that was only briefly stalled is used again immediately; content that is expired, not a number or more than 3 minutes ahead is ignored.
 - Every fallback is counted per reason in node stats.
 
 ## 11. Wire protocol
@@ -213,7 +214,7 @@ prefer_remote = false           # true: eligible jobs go to a peer with a free s
 
 - `crabfarm status`: table of peers (name, OS/host, slots busy/total, speed, RTT, bandwidth), local running jobs (crate, where, elapsed), counters (remote ok, local by reason, bytes up/down, cache hits).
 - Logs: `tracing` to stderr and appended to `<data>/logs/node.log` (**rotation is P2**), level from `CRABFARM_LOG` (default `info`; the wrapper prints its local-classification reasons to stderr when `CRABFARM_LOG` is set). Info level logs crate names, sizes and timings, never stderr contents, environment values, keys or tokens.
-- `status` also shows peers that are known but offline, and a one-line summary first.
+- `status` also shows peers that are known but offline, and a one-line summary first. While the `node-unresponsive` marker (section 10, CF-25) is live it starts with a warning line saying how long wrappers still skip the node, also when the node does not answer the status query. The counter `wrapper_gone` counts remote jobs dropped because their wrapper had left.
 
 ## 14. Testing
 

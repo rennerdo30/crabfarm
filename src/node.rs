@@ -738,10 +738,17 @@ impl Node {
 
     async fn housekeeping(self: Arc<Self>) {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
+        // Wrappers that found this node silent skip it for a few minutes; a
+        // node that is running and answering says so soon (CF-25).
+        let mut alive = tokio::time::interval(Duration::from_secs(5));
         let mut n = 0u32;
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => return,
+                _ = alive.tick() => {
+                    ipc::clear_unresponsive(&self.data_dir);
+                    continue;
+                }
                 _ = tick.tick() => {}
             }
             n += 1;

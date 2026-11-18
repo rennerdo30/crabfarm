@@ -42,6 +42,14 @@ pub fn run(rustc: &str, args: &[String]) -> i32 {
     if !ipc::port_path(&data_dir).exists() {
         return passthrough(rustc, args);
     }
+    // An earlier wrapper found the node silent a moment ago: do not pay the
+    // 30 s wait again for every rustc call while it is frozen (CF-25).
+    if ipc::unresponsive_until(&data_dir).is_some() {
+        if debug {
+            eprintln!("crabfarm: local (the node did not answer recently)");
+        }
+        return passthrough(rustc, args);
+    }
     let Ok(expanded) = rustc_args::expand_argfiles(args) else {
         return passthrough(rustc, args);
     };
@@ -526,6 +534,8 @@ fn submit(
         let msg = match rt.block_on(ipc::recv_within(&mut conn, ipc::NODE_SILENCE_LIMIT)) {
             Some(m) => m,
             None => {
+                // Silence or a lost connection: tell the wrappers that follow.
+                ipc::mark_unresponsive(data_dir);
                 break Verdict::Local { reason: None };
             }
         };

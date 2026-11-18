@@ -125,22 +125,38 @@ pub fn format_status(
     out
 }
 
+/// The line shown while wrappers skip the node because one of them found it
+/// silent (CF-25), `None` when there is no such finding.
+pub fn unresponsive_note(until: Option<u64>, now: u64) -> Option<String> {
+    let left = until?.checked_sub(now).filter(|s| *s > 0)?;
+    Some(format!(
+        "warning: the node did not answer a wrapper recently; rustc runs locally without asking it for {left} more seconds (a node that answers removes this)\n"
+    ))
+}
+
 pub fn run() -> i32 {
     let Ok(data_dir) = config::data_dir() else {
         eprintln!("crabfarm: cannot find the data directory");
         return 1;
     };
+    let now = crate::node::unix_now();
+    let note = unresponsive_note(crate::ipc::unresponsive_until(&data_dir), now);
     match query_status(&data_dir) {
         Some(Message::FarmStatus {
             local,
             peers,
             counters,
         }) => {
-            let now = crate::node::unix_now();
+            if let Some(n) = &note {
+                print!("{n}");
+            }
             print!("{}", format_status(&local, &peers, &counters, now));
             0
         }
         _ => {
+            if let Some(n) = &note {
+                eprint!("{n}");
+            }
             eprintln!("crabfarm: the node is not running. Start it with `crabfarm node`.");
             1
         }
@@ -165,6 +181,14 @@ mod tests {
             targets: vec![],
             accepting: true,
         }
+    }
+
+    #[test]
+    fn status_says_when_wrappers_skip_the_node() {
+        assert_eq!(unresponsive_note(None, 100), None);
+        assert_eq!(unresponsive_note(Some(100), 100), None, "expired");
+        let line = unresponsive_note(Some(160), 100).expect("marker is live");
+        assert!(line.contains("did not answer") && line.contains("60 more seconds"));
     }
 
     #[test]

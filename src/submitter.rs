@@ -317,7 +317,6 @@ fn commit_temp(tmp: &std::path::Path, dest: &std::path::Path) -> anyhow::Result<
     Ok(())
 }
 
-/// Write `data` to `dest` through a temporary file in the same directory.
 /// The `message` of a rustc JSON diagnostic whose level is `error`, or the text
 /// of a plain `error...` line; `None` for everything else.
 fn first_error_message(line: &str) -> Option<String> {
@@ -329,6 +328,7 @@ fn first_error_message(line: &str) -> Option<String> {
     line.starts_with("error").then(|| line.to_string())
 }
 
+/// Write `data` to `dest` through a temporary file in the same directory.
 #[cfg(test)]
 fn write_atomic(dest: &std::path::Path, data: &[u8]) -> anyhow::Result<()> {
     commit_temp(&write_temp(dest, data)?, dest)

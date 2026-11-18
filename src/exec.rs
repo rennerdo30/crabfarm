@@ -583,7 +583,9 @@ fn dylib_install_name_args(spec: &JobSpec) -> Vec<String> {
         })
     };
     let crate_type = value("--crate-type", None);
-    if !matches!(crate_type, Some("proc-macro" | "dylib" | "cdylib")) {
+    // The guard only lets `lib`, `rlib` and `proc-macro` through, so this only
+    // ever fires for proc-macros.
+    if crate_type != Some("proc-macro") {
         return Vec::new();
     }
     let name = value("--crate-name", None).unwrap_or(&spec.crate_name);
@@ -591,7 +593,17 @@ fn dylib_install_name_args(spec: &JobSpec) -> Vec<String> {
         .iter()
         .find_map(|s| s.strip_prefix("extra-filename="))
         .unwrap_or("");
-    // cdylib files carry no `lib` prefix on every OS, but on macOS they do.
+    // Both parts are spliced into one `-Wl,` argument, where a comma would start
+    // another linker argument: allow only the characters cargo itself uses
+    // (crate names and `-<hash>` suffixes) and otherwise add nothing (the
+    // install name is then the sandbox path, which the output scan catches).
+    let safe = |s: &str| {
+        s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    };
+    if name.is_empty() || !safe(name) || !safe(extra) {
+        return Vec::new();
+    }
     vec![
         "-C".into(),
         format!("link-arg=-Wl,-install_name,@rpath/lib{name}{extra}.dylib"),
@@ -1437,6 +1449,21 @@ fn main() {
         );
         spec.target = "x86_64-pc-windows-msvc".into();
         assert!(dylib_install_name_args(&spec).is_empty(), "other target");
+
+        // A comma in extra-filename would start another linker argument inside
+        // the one `-Wl,` value: such a job gets no install-name flag at all.
+        spec.target = "aarch64-apple-darwin".into();
+        for a in &mut spec.args {
+            if let Arg::Plain(s) = a
+                && s.starts_with("extra-filename=")
+            {
+                *s = "extra-filename=-x,-sectcreate,a,b,f".into();
+            }
+        }
+        assert!(
+            dylib_install_name_args(&spec).is_empty(),
+            "unsafe extra-filename must not reach the linker"
+        );
     }
 
     #[test]

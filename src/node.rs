@@ -101,6 +101,64 @@ pub struct PeerState {
     pub good_addr: Option<String>,
     /// A cache question to this peer went unanswered: not asked again until then.
     pub cache_slow_until: Option<Instant>,
+    /// Senders of the live control connections: cache questions travel on
+    /// them (already authenticated, no new handshake per question).
+    pub ctrl: Vec<(u64, tokio::sync::mpsc::Sender<Message>)>,
+    /// Cache questions waiting for their answer, by key.
+    pub cache_waiters: HashMap<[u8; 32], Vec<tokio::sync::oneshot::Sender<Option<u64>>>>,
+    /// At most [`CACHE_ASKS_PER_PEER`] questions to this peer at once.
+    pub cache_ask: Arc<Semaphore>,
+}
+
+/// Cache questions in flight to one peer, at most.
+pub const CACHE_ASKS_PER_PEER: usize = 2;
+/// Cache questions from peers answered at once; the rest are answered "miss".
+const CACHE_PROBES: usize = 16;
+static CONTROL_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The body of [`Node::cache_ask`], on the peer table alone.
+async fn ask_over_control(
+    peers: &Mutex<HashMap<NodeId, PeerState>>,
+    peer: NodeId,
+    key: [u8; 32],
+    deadline: tokio::time::Instant,
+) -> Option<Option<u64>> {
+    let sem = lock(peers).get(&peer)?.cache_ask.clone();
+    // Held until the answer (or the deadline): this is what bounds the
+    // questions in flight to one peer.
+    let _permit = tokio::time::timeout_at(deadline, sem.acquire_owned())
+        .await
+        .ok()?
+        .ok()?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let ctrl = {
+        let mut book = lock(peers);
+        let p = book.get_mut(&peer)?;
+        let ctrl = p.ctrl.first()?.1.clone();
+        let waiting = p.cache_waiters.entry(key).or_default();
+        waiting.retain(|w| !w.is_closed());
+        waiting.push(tx);
+        ctrl
+    };
+    ctrl.try_send(Message::CacheQuery { key }).ok()?;
+    tokio::time::timeout_at(deadline, rx).await.ok()?.ok()
+}
+
+/// Hand a `CacheHave` (`Some`) or `CacheMiss` (`None`) from `peer` to the
+/// questions waiting for `key`.
+fn answer_waiters(
+    peers: &Mutex<HashMap<NodeId, PeerState>>,
+    peer: NodeId,
+    key: [u8; 32],
+    have: Option<u64>,
+) {
+    let waiting = lock(peers)
+        .get_mut(&peer)
+        .and_then(|p| p.cache_waiters.remove(&key))
+        .unwrap_or_default();
+    for w in waiting {
+        let _ = w.send(have);
+    }
 }
 
 impl PeerState {
@@ -115,6 +173,9 @@ impl PeerState {
             sent: HashSet::new(),
             good_addr: None,
             cache_slow_until: None,
+            ctrl: Vec::new(),
+            cache_waiters: HashMap::new(),
+            cache_ask: Arc::new(Semaphore::new(CACHE_ASKS_PER_PEER)),
         }
     }
 }
@@ -135,6 +196,11 @@ pub struct Node {
     /// Cache questions this node has in flight / cache entries it serves at once.
     pub cache_ask_sem: Arc<Semaphore>,
     pub cache_serve_sem: Arc<Semaphore>,
+    /// Entry downloads this node starts at once (each opens a connection
+    /// that counts against the peer's unauthenticated limit while it connects).
+    pub cache_fetch_sem: Arc<Semaphore>,
+    /// Questions from peers answered at once.
+    pub cache_probe_sem: Arc<Semaphore>,
     pub jobserver: NodeJobserver,
     pub toolchains: Toolchains,
     pub peers: Mutex<HashMap<NodeId, PeerState>>,
@@ -208,7 +274,7 @@ impl Node {
             .map(|(k, v)| (k.clone(), *v))
             .collect();
         v.push(("local_slots".into(), self.cfg.local_slots as u64));
-        v.push(("cache_enabled".into(), u64::from(self.ccache.is_some())));
+        v.push(("cache_enabled".into(), u64::from(self.cache_enabled())));
         v.push((
             "running_local".into(),
             self.running_local.load(Ordering::Relaxed) as u64,
@@ -542,10 +608,74 @@ impl Node {
             return;
         };
         self.peer_connected(peer, node_name, host_triple);
+        let conn_id = CONTROL_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        if let Some(p) = lock(&self.peers).get_mut(&peer) {
+            p.ctrl.push((conn_id, link.tx.clone()));
+        }
         if let Err(e) = self.control_loop(peer, &mut link, first).await {
             tracing::debug!("control connection ended: {e:#}");
         }
+        if let Some(p) = lock(&self.peers).get_mut(&peer) {
+            p.ctrl.retain(|(id, _)| *id != conn_id);
+            if p.ctrl.is_empty() {
+                // Nobody will answer these any more: the askers see a miss.
+                p.cache_waiters.clear();
+            }
+        }
         self.peer_disconnected(peer);
+    }
+
+    /// Ask `peer` over its control connection whether it holds the cache
+    /// entry for `key`. `Some(Some(bytes))` = it does, `Some(None)` = it does
+    /// not, `None` = no answer in time or no control connection. At most
+    /// [`CACHE_ASKS_PER_PEER`] questions are in flight to one peer; the others
+    /// wait for a place until `deadline`. No new connection is made, so a
+    /// burst of questions cannot take the peer's unauthenticated accept slots
+    /// away from job connections.
+    pub(crate) async fn cache_ask(
+        self: &Arc<Self>,
+        peer: NodeId,
+        key: [u8; 32],
+        deadline: tokio::time::Instant,
+    ) -> Option<Option<u64>> {
+        ask_over_control(&self.peers, peer, key, deadline).await
+    }
+
+    fn cache_answered(&self, peer: NodeId, key: [u8; 32], have: Option<u64>) {
+        answer_waiters(&self.peers, peer, key, have);
+    }
+
+    /// Answer a peer's `CacheQuery`: whether this node holds the entry. Any
+    /// reason not to look (cache off, too many questions) is a miss.
+    fn answer_cache_query(
+        self: &Arc<Self>,
+        key: [u8; 32],
+        reply: &tokio::sync::mpsc::Sender<Message>,
+    ) {
+        let permit = self.cache_probe_sem.clone().try_acquire_owned().ok();
+        let (node, reply) = (self.clone(), reply.clone());
+        tokio::spawn(async move {
+            let bytes = match permit {
+                Some(_p) if node.cache_enabled() => {
+                    let n = node.clone();
+                    tokio::task::spawn_blocking(move || {
+                        n.ccache
+                            .as_ref()?
+                            .lookup(&crate::ccache::CacheKey(key))
+                            .map(|e| e.total_bytes())
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                }
+                _ => None,
+            };
+            let m = match bytes {
+                Some(bytes) => Message::CacheHave { key, bytes },
+                None => Message::CacheMiss { key },
+            };
+            let _ = reply.send(m).await;
+        });
     }
 
     async fn push_status(&self, link: &Link) -> anyhow::Result<()> {
@@ -563,8 +693,9 @@ impl Node {
         })
         .await?;
         self.push_status(link).await?;
+        let reply = link.tx.clone();
         if let Some(m) = first {
-            self.on_control_message(peer, m);
+            self.on_control_message(peer, m, &reply);
         }
         let mut status_rx = self.status_tx.subscribe();
         let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -575,7 +706,7 @@ impl Node {
                 m = link.recv() => {
                     let Some(m) = m else { return Ok(()) };
                     last_rx = Instant::now();
-                    self.on_control_message(peer, m);
+                    self.on_control_message(peer, m, &reply);
                 }
                 _ = tick.tick() => {
                     if last_rx.elapsed() > CONTROL_SILENCE {
@@ -596,8 +727,16 @@ impl Node {
         }
     }
 
-    fn on_control_message(self: &Arc<Self>, peer: NodeId, m: Message) {
+    fn on_control_message(
+        self: &Arc<Self>,
+        peer: NodeId,
+        m: Message,
+        reply: &tokio::sync::mpsc::Sender<Message>,
+    ) {
         match m {
+            Message::CacheQuery { key } => self.answer_cache_query(key, reply),
+            Message::CacheHave { key, bytes } => self.cache_answered(peer, key, Some(bytes)),
+            Message::CacheMiss { key } => self.cache_answered(peer, key, None),
             Message::PeerList { peers } => {
                 // Addresses from the network: only ones another machine can use (CF-19).
                 let peers = crate::discovery::sanitize_gossip(&peers, self.allow_loopback_gossip);
@@ -675,7 +814,7 @@ impl Node {
                         self.serve_job(node_id, link, job_id).await;
                         Ok(())
                     }
-                    Some(Message::CacheQuery { key }) => {
+                    Some(Message::CacheFetch { key }) => {
                         self.serve_cache(link, key).await;
                         Ok(())
                     }
@@ -987,6 +1126,8 @@ pub async fn run(
         hermetic: Mutex::new(crate::hermetic::Hermetic::load(&data_dir)),
         cache_ask_sem: Arc::new(Semaphore::new(crate::submitter::CACHE_ASK_CONCURRENCY)),
         cache_serve_sem: Arc::new(Semaphore::new(crate::executor::SERVE_CACHE_LIMIT)),
+        cache_fetch_sem: Arc::new(Semaphore::new(crate::submitter::CACHE_FETCH_CONCURRENCY)),
+        cache_probe_sem: Arc::new(Semaphore::new(CACHE_PROBES)),
         store: BlobStore::open(
             &data_dir.join("cache"),
             cfg.cache_max_gb.saturating_mul(1 << 30),
@@ -1099,6 +1240,88 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type Book = Arc<Mutex<HashMap<NodeId, PeerState>>>;
+
+    fn book_with_control_link() -> (Book, NodeId, tokio::sync::mpsc::Receiver<Message>) {
+        let id = NodeId([5; 16]);
+        let mut st = PeerState::new(PeerInfo {
+            node_id: id,
+            node_name: "p".into(),
+            addrs: Vec::new(),
+            last_seen: 0,
+        });
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        st.ctrl.push((1, tx));
+        let book = Arc::new(Mutex::new(HashMap::from([(id, st)])));
+        (book, id, rx)
+    }
+
+    /// CF-30 P2.2: cache questions travel on the control connection, never
+    /// more than [`CACHE_ASKS_PER_PEER`] at a time to one peer; a further one
+    /// waits for a place and goes out when an answer frees one.
+    #[tokio::test]
+    async fn cache_asks_to_one_peer_are_capped_and_answered_by_key() {
+        let (book, peer, mut wire) = book_with_control_link();
+        let far = tokio::time::Instant::now() + Duration::from_secs(30);
+        let keys: Vec<[u8; 32]> = (1..=5u8).map(|i| [i; 32]).collect();
+        let mut asks = Vec::new();
+        for k in &keys {
+            let (book, k) = (book.clone(), *k);
+            asks.push(tokio::spawn(async move {
+                ask_over_control(&book, peer, k, far).await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut sent = Vec::new();
+        while let Ok(Message::CacheQuery { key }) = wire.try_recv() {
+            sent.push(key);
+        }
+        assert_eq!(sent.len(), 2, "never more than two asks in flight");
+        // An answer (matched by key) frees a place for the next question.
+        answer_waiters(&book, peer, sent[0], Some(7));
+        answer_waiters(&book, peer, sent[1], None);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut more = Vec::new();
+        while let Ok(Message::CacheQuery { key }) = wire.try_recv() {
+            more.push(key);
+        }
+        assert_eq!(more.len(), 2, "two more went out after two answers");
+        for k in &more {
+            answer_waiters(&book, peer, *k, Some(1));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let last = match wire.try_recv() {
+            Ok(Message::CacheQuery { key }) => key,
+            other => panic!("the fifth question never went out: {other:?}"),
+        };
+        answer_waiters(&book, peer, last, None);
+        let mut results = Vec::new();
+        for a in asks {
+            results.push(a.await.unwrap());
+        }
+        assert_eq!(results.iter().filter(|r| r.is_some()).count(), 5);
+        let by_key = |k: [u8; 32]| results[keys.iter().position(|x| *x == k).unwrap()];
+        assert_eq!(by_key(sent[0]), Some(Some(7)));
+        assert_eq!(by_key(sent[1]), Some(None));
+    }
+
+    /// No control connection (or none that answers in time) is a miss, not a
+    /// new connection and not a hang.
+    #[tokio::test]
+    async fn a_cache_ask_without_an_answer_ends_at_its_deadline() {
+        let (book, peer, _wire) = book_with_control_link();
+        let soon = tokio::time::Instant::now() + Duration::from_millis(100);
+        assert_eq!(ask_over_control(&book, peer, [1; 32], soon).await, None);
+        lock(&book).get_mut(&peer).unwrap().ctrl.clear();
+        let far = tokio::time::Instant::now() + Duration::from_secs(30);
+        assert_eq!(ask_over_control(&book, peer, [2; 32], far).await, None);
+        assert_eq!(
+            ask_over_control(&book, NodeId([9; 16]), [2; 32], far).await,
+            None,
+            "unknown peer"
+        );
+    }
 
     #[test]
     fn inbound_limits_cap_total_and_unauthenticated() {

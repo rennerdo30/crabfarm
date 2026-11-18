@@ -19,9 +19,13 @@ use std::time::SystemTime;
 
 /// Bump when the key recipe or the entry layout changes: every older entry is
 /// then simply never found.
-pub const CACHE_FORMAT: u32 = 1;
+pub const CACHE_FORMAT: u32 = 2;
 /// An entry with more output bytes than this is not stored.
 pub const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
+/// One output file of an entry, at most: the size a replay can carry (a blob
+/// is reassembled up to [`crate::cas::MAX_BLOB_BYTES`]). Refusing here what
+/// could never be replayed keeps the store free of dead entries.
+pub const MAX_ENTRY_FILE_BYTES: u64 = crate::cas::MAX_BLOB_BYTES;
 /// Output files per entry.
 pub const MAX_ENTRY_FILES: usize = 64;
 /// What the wrapper may capture of rustc's printed lines, and an entry keeps.
@@ -148,12 +152,17 @@ pub fn target_is_file(target: &str) -> bool {
     target.ends_with(".json") || target.contains('/') || target.contains('\\')
 }
 
-/// The identity of the crate a job compiles, for the hermetic proofs
-/// ([`crate::hermetic`]): package name and version (`CARGO_PKG_NAME`,
-/// `CARGO_PKG_VERSION`), the client manifest dir, the target and the crate
-/// types. `None` when the job does not carry them all; such a crate can never
-/// be proven and its local results are never stored.
-pub fn crate_identity(spec: &JobSpec) -> Option<String> {
+/// The id a hermetic proof is recorded under ([`crate::hermetic`]): the
+/// identity of the crate (package name and version `CARGO_PKG_NAME`,
+/// `CARGO_PKG_VERSION`, the client manifest dir, the target and the crate
+/// types) together with the content hashes of the proc-macro libraries in its
+/// `--extern` closure (`macros`). The macros are part of the id because a
+/// proc macro runs inside rustc while the crate compiles and can read
+/// anything: another macro build is another proof to earn, whereas a source
+/// edit of the crate itself keeps the proof (the macros that run are the same
+/// ones). `None` when the job does not carry the identity fields; such a crate
+/// can never be proven.
+pub fn proof_id(spec: &JobSpec, macros: &[BlobHash]) -> Option<String> {
     let var = |name: &str| spec.env.iter().find(|(k, _)| k == name).map(|(_, v)| v);
     let (Some(EnvValue::Plain(name)), Some(EnvValue::Plain(version)), Some(EnvValue::Path(dir))) = (
         var("CARGO_PKG_NAME"),
@@ -189,6 +198,13 @@ pub fn crate_identity(spec: &JobSpec) -> Option<String> {
     e.num(5, types.len() as u64);
     for t in types {
         e.str(6, t);
+    }
+    let mut macros: Vec<&BlobHash> = macros.iter().collect();
+    macros.sort_by_key(|h| h.0);
+    macros.dedup();
+    e.num(7, macros.len() as u64);
+    for m in macros {
+        e.bytes(8, &m.0);
     }
     Some(data_encoding::HEXLOWER.encode(e.0.finalize().as_bytes()))
 }
@@ -277,6 +293,7 @@ pub fn entry_from(spec: &JobSpec, key: &CacheKey, c: Captured, now: u64) -> Opti
     if c.outputs.is_empty()
         || c.outputs.len() > MAX_ENTRY_FILES
         || total > MAX_ENTRY_BYTES
+        || c.outputs.iter().any(|o| o.size > MAX_ENTRY_FILE_BYTES)
         || line_bytes > MAX_LINES_BYTES
         || target_is_file(&spec.target)
     {
@@ -348,7 +365,7 @@ pub fn disk_usage(data_dir: &Path) -> DiskUsage {
 pub fn clear(data_dir: &Path) -> anyhow::Result<DiskUsage> {
     let before = disk_usage(data_dir);
     let root = root_dir(data_dir);
-    for sub in ["entries", "blobs"] {
+    for sub in ["entries", "blobs", "proofs"] {
         let d = root.join(sub);
         match std::fs::remove_dir_all(&d) {
             Ok(()) => {}
@@ -385,6 +402,80 @@ impl Ccache {
     /// Keep one output file (plaintext, verified against `hash` by the store).
     pub fn put_blob(&self, hash: &BlobHash, data: &[u8]) -> anyhow::Result<()> {
         self.blobs.put(FARM_OWNER, &self.key, hash, data)
+    }
+
+    fn proof_dir(&self, proof: &str) -> PathBuf {
+        self.root.join("proofs").join(proof)
+    }
+
+    /// Store a result of a LOCAL run that is allowed only because its crate was
+    /// proven hermetic under `proof` (DESIGN section 16): a marker records
+    /// that this key was stored under the proof, so that revoking the proof
+    /// can remove the entry again ([`Ccache::revoke_proof`]).
+    pub fn store_proven(&self, key: &CacheKey, entry: &Entry, proof: &str) -> anyhow::Result<()> {
+        if proof.len() != 64 || !proof.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("malformed proof id");
+        }
+        let dir = self.proof_dir(proof);
+        std::fs::create_dir_all(&dir).context("create proof marker directory")?;
+        std::fs::write(dir.join(key.to_hex()), b"").context("write proof marker")?;
+        self.store(key, entry)
+    }
+
+    /// Remove every entry that was stored under `proof` by a local run, and
+    /// the markers. Returns how many entries were removed. Entries other
+    /// nodes hold are not touched (they were produced by remote runs or by
+    /// their own proofs).
+    pub fn revoke_proof(&self, proof: &str) -> usize {
+        if proof.len() != 64 || !proof.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return 0;
+        }
+        let dir = self.proof_dir(proof);
+        let mut removed = 0;
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for f in rd.flatten() {
+                let name = f.file_name();
+                let Some(hex) = name.to_str().filter(|n| n.len() == 64) else {
+                    continue;
+                };
+                let Ok(bytes) = data_encoding::HEXLOWER.decode(hex.as_bytes()) else {
+                    continue;
+                };
+                let Ok(k) = <[u8; 32]>::try_from(bytes.as_slice()) else {
+                    continue;
+                };
+                if std::fs::remove_file(self.entry_path(&CacheKey(k))).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        removed
+    }
+
+    /// Markers whose entry is gone (evicted) are dropped, and empty proof
+    /// directories with them.
+    fn prune_proof_markers(&self) {
+        let Ok(rd) = std::fs::read_dir(self.root.join("proofs")) else {
+            return;
+        };
+        for d in rd.flatten() {
+            if let Ok(files) = std::fs::read_dir(d.path()) {
+                for f in files.flatten() {
+                    let name = f.file_name();
+                    let gone = name
+                        .to_str()
+                        .and_then(|h| data_encoding::HEXLOWER.decode(h.as_bytes()).ok())
+                        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                        .is_none_or(|k| !self.entry_path(&CacheKey(k)).exists());
+                    if gone {
+                        let _ = std::fs::remove_file(f.path());
+                    }
+                }
+            }
+            // Fails (and is left) while markers remain.
+            let _ = std::fs::remove_dir(d.path());
+        }
     }
 
     /// Write the entry index atomically.
@@ -437,7 +528,7 @@ impl Ccache {
                 .all(|o| self.blobs.has(FARM_OWNER, &o.hash))
         });
         if ok.is_none() {
-            let _ = std::fs::remove_file(&path);
+            remove_if_unchanged(&path, &raw);
             return None;
         }
         // Recently used: the index is evicted by age too.
@@ -481,15 +572,24 @@ impl Ccache {
         Ok(out)
     }
 
-    /// Delete an entry (its blobs stay for other entries and age out).
-    pub fn forget(&self, key: &CacheKey) {
-        let _ = std::fs::remove_file(self.entry_path(key));
+    /// Delete `entry` (its blobs stay for other entries and age out), but
+    /// only while the file under its key still holds exactly that entry: a
+    /// concurrent `store` of a fresh result must survive.
+    pub fn forget(&self, key: &CacheKey, entry: &Entry) {
+        let path = self.entry_path(key);
+        let Ok(raw) = std::fs::read(&path) else {
+            return;
+        };
+        if self.open_entry(key, &raw).as_ref() == Some(entry) {
+            remove_if_unchanged(&path, &raw);
+        }
     }
 
     /// Least-recently-used eviction of the blobs (the size limit) and of the
     /// index.
     pub fn evict(&self) -> anyhow::Result<u64> {
         let freed = self.blobs.evict()?;
+        self.prune_proof_markers();
         let mut files: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
         let mut total = 0u64;
         for f in walkdir::WalkDir::new(self.root.join("entries"))
@@ -522,6 +622,32 @@ impl Ccache {
     }
 }
 
+/// Delete the file at `path` only if it still holds `raw`, the bytes that were
+/// judged broken. A `store` renames a new file over the path at any time; a
+/// plain `remove_file` after the judgement could delete that fresh entry. The
+/// file is taken out of the way by an atomic rename first, compared, and put
+/// back (without replacing anything that was stored meanwhile) when it turns
+/// out to be a different file.
+fn remove_if_unchanged(path: &Path, raw: &[u8]) {
+    let Some(parent) = path.parent() else { return };
+    let mut tag = [0u8; 8];
+    rand::fill(&mut tag[..]);
+    let taken = parent.join(format!(
+        ".tmp-gone-{}",
+        data_encoding::HEXLOWER.encode(&tag)
+    ));
+    if std::fs::rename(path, &taken).is_err() {
+        return;
+    }
+    if std::fs::read(&taken).is_ok_and(|now| now == raw) {
+        let _ = std::fs::remove_file(&taken);
+        return;
+    }
+    // A newer entry: back to its place unless an even newer one is there.
+    let _ = std::fs::hard_link(&taken, path);
+    let _ = std::fs::remove_file(&taken);
+}
+
 fn aad(key: &CacheKey) -> Vec<u8> {
     let mut v = ENTRY_MAGIC.to_vec();
     v.extend_from_slice(&key.0);
@@ -530,17 +656,35 @@ fn aad(key: &CacheKey) -> Vec<u8> {
 
 // ----------------------------------------------------------- local outputs
 
-/// The files a local rustc run left in `out_dir` for this invocation: every
-/// file named `<crate><extra-filename>.*` or `lib<crate><extra-filename>.*`
-/// (rlib, rmeta, `.d`, a proc-macro library and its import library). Cargo's
-/// `-C extra-filename` carries a hash that is unique to the unit, which is what
-/// makes this exact in a directory shared by every crate; without it the set
-/// cannot be told apart and `None` is returned. `None` too when a file the
-/// invocation announced is missing or the dep-info is.
+/// Files a local run leaves that no later build reads and an entry does not
+/// hold (DESIGN section 16): debug symbols and the import library of a
+/// proc-macro DLL.
+fn is_unreplayed_output(name: &str) -> bool {
+    [".pdb", ".dll.lib", ".exp"]
+        .iter()
+        .any(|ext| name.ends_with(ext))
+}
+
+/// Slack for file systems whose timestamps are coarse or whose clock reads a
+/// little behind the system clock.
+const MTIME_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The files a local rustc run (started at `started`) left in `out_dir` for
+/// this invocation: every file named `<crate><extra-filename>.*` or
+/// `lib<crate><extra-filename>.*` (rlib, rmeta, `.d`, a proc-macro library),
+/// written during THIS run: a file with an older modification time is a
+/// leftover of an earlier invocation of the unit (another emit set, say) and
+/// is not part of this result. `.pdb`, `.dll.lib` and `.exp` files are left
+/// out (nothing reads them from a cache entry). Cargo's `-C extra-filename`
+/// carries a hash that is unique to the unit, which is what makes this exact
+/// in a directory shared by every crate; without it the set cannot be told
+/// apart and `None` is returned. `None` too when a file the invocation
+/// announced is missing or the dep-info is.
 pub fn local_output_files(
     spec: &JobSpec,
     produces: &[ClientPath],
     extra_filename: &str,
+    started: SystemTime,
 ) -> Option<Vec<ClientPath>> {
     if extra_filename.is_empty() {
         return None;
@@ -555,8 +699,14 @@ pub fn local_output_files(
         let entry = entry.ok()?;
         let name = entry.file_name();
         let name = name.to_str()?;
-        if !stems.iter().any(|s| name.starts_with(s.as_str())) || !entry.file_type().ok()?.is_file()
+        if !stems.iter().any(|s| name.starts_with(s.as_str()))
+            || is_unreplayed_output(name)
+            || !entry.file_type().ok()?.is_file()
         {
+            continue;
+        }
+        let written = entry.metadata().ok()?.modified().ok()?;
+        if written + MTIME_SLACK < started {
             continue;
         }
         found.push(ClientPath::from_local(&entry.path(), Path::new("."))?);
@@ -632,18 +782,18 @@ mod tests {
     /// The identity is the package, its version, where it lives, the target and
     /// the crate types, and nothing a source edit changes.
     #[test]
-    fn the_crate_identity_is_name_version_dir_target_and_types() {
+    fn the_proof_id_is_identity_plus_the_proc_macro_builds() {
         let mut base = spec();
         base.env
             .push(("CARGO_PKG_VERSION".into(), EnvValue::Plain("1.2.3".into())));
         base.args.push(Arg::Plain("--crate-type".into()));
         base.args.push(Arg::Plain("lib".into()));
-        let id = crate_identity(&base).expect("identity");
+        let id = proof_id(&base, &[]).expect("identity");
         assert_eq!(id.len(), 64);
         let with = |f: &dyn Fn(&mut JobSpec)| {
             let mut s = base.clone();
             f(&mut s);
-            crate_identity(&s)
+            proof_id(&s, &[])
         };
         assert_eq!(
             with(&|s| s.inputs[0].hash = BlobHash::of(b"edited")).as_deref(),
@@ -691,6 +841,23 @@ mod tests {
             None,
             "without a version there is no identity"
         );
+        // The proc macros that run while the crate compiles are part of it
+        // (CF-30 P1): a changed macro build needs a new proof, the order and
+        // repetition of the macros do not matter.
+        let (m1, m2) = (BlobHash::of(b"macro one"), BlobHash::of(b"macro two"));
+        let one = proof_id(&base, &[m1]).expect("id");
+        assert_ne!(one, id, "a macro in the closure is another proof");
+        assert_ne!(
+            proof_id(&base, &[BlobHash::of(b"macro one, edited")]).as_deref(),
+            Some(one.as_str()),
+            "an edited macro is another proof"
+        );
+        assert_eq!(
+            proof_id(&base, &[m1, m2]),
+            proof_id(&base, &[m2, m1, m2]),
+            "order and repetition"
+        );
+        assert_ne!(proof_id(&base, &[m1, m2]).as_deref(), Some(one.as_str()));
     }
 
     /// Every component of the key matters (CF-28): changing any one of them
@@ -753,6 +920,15 @@ mod tests {
             (
                 "env path",
                 Box::new(|s| s.env[1].1 = EnvValue::Path(cp(r"C:\other"))),
+            ),
+            (
+                "Apple deployment target (rustc bakes it into the objects)",
+                Box::new(|s| {
+                    s.env.push((
+                        "MACOSX_DEPLOYMENT_TARGET".into(),
+                        EnvValue::Plain("11.0".into()),
+                    ))
+                }),
             ),
             (
                 "input content",
@@ -975,6 +1151,11 @@ mod tests {
             "foo-bb.d",
             "libfoobar-aa.rlib",
             "other.txt",
+            // Never part of an entry (CF-30).
+            "foo-aa.pdb",
+            "foo-aa.dll.lib",
+            "foo-aa.dll.exp",
+            "foo-aa.exp",
         ] {
             std::fs::write(deps.join(n), n).unwrap();
         }
@@ -982,17 +1163,121 @@ mod tests {
         s.out_dir = ClientPath::from_local(&deps, Path::new(".")).unwrap();
         let produces =
             vec![ClientPath::from_local(&deps.join("libfoo-aa.rlib"), Path::new(".")).unwrap()];
-        let got = local_output_files(&s, &produces, "-aa").unwrap();
+        let before = SystemTime::now() - std::time::Duration::from_secs(60);
+        let got = local_output_files(&s, &produces, "-aa", before).unwrap();
         let names: Vec<String> = got
             .iter()
             .map(|p| p.path.rsplit(['\\', '/']).next().unwrap().to_string())
             .collect();
-        assert_eq!(names, vec!["foo-aa.d", "libfoo-aa.rlib", "libfoo-aa.rmeta"]);
+        assert_eq!(
+            names,
+            vec!["foo-aa.d", "libfoo-aa.rlib", "libfoo-aa.rmeta"],
+            "no .pdb, .dll.lib or .exp"
+        );
         // Without the hash suffix the unit cannot be told apart.
-        assert!(local_output_files(&s, &produces, "").is_none());
+        assert!(local_output_files(&s, &produces, "", before).is_none());
         // A missing announced product, or a missing dep-info, is not cacheable.
         std::fs::remove_file(deps.join("libfoo-aa.rlib")).unwrap();
-        assert!(local_output_files(&s, &produces, "-aa").is_none());
-        assert!(local_output_files(&s, &[], "-cc").is_none());
+        assert!(local_output_files(&s, &produces, "-aa", before).is_none());
+        assert!(local_output_files(&s, &[], "-cc", before).is_none());
+    }
+
+    /// CF-30 P3: a file of this unit that an EARLIER run left (it was not
+    /// written during this run) is not an output of this run.
+    #[test]
+    fn local_outputs_exclude_what_an_earlier_run_left() {
+        let d = tempfile::tempdir().unwrap();
+        let deps = d.path().join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        for n in ["libfoo-aa.rlib", "libfoo-aa.rmeta", "foo-aa.d"] {
+            std::fs::write(deps.join(n), n).unwrap();
+        }
+        // The rmeta is a day old: a leftover of an earlier invocation.
+        let old = SystemTime::now() - std::time::Duration::from_secs(86_400);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(deps.join("libfoo-aa.rmeta"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let mut s = spec();
+        s.out_dir = ClientPath::from_local(&deps, Path::new(".")).unwrap();
+        let produces =
+            vec![ClientPath::from_local(&deps.join("libfoo-aa.rlib"), Path::new(".")).unwrap()];
+        let started = SystemTime::now() - std::time::Duration::from_secs(5);
+        let got = local_output_files(&s, &produces, "-aa", started).unwrap();
+        let names: Vec<&str> = got
+            .iter()
+            .map(|p| p.path.rsplit(['\\', '/']).next().unwrap())
+            .collect();
+        assert_eq!(names, vec!["foo-aa.d", "libfoo-aa.rlib"]);
+    }
+
+    /// CF-30 P3: an entry with a file a replay could not carry is refused.
+    #[test]
+    fn an_entry_with_an_unreplayable_file_is_refused() {
+        let s = spec();
+        let k = cache_key(&s);
+        let out = |size: u64| Captured {
+            outputs: vec![EntryOutput {
+                path: cp(r"C:\p\target\debug\deps\libfoo-1.rlib"),
+                hash: BlobHash::of(b"x"),
+                size,
+            }],
+            lines: vec![],
+            dep_info: Some(DEP.into()),
+        };
+        assert!(entry_from(&s, &k, out(MAX_ENTRY_FILE_BYTES), 1).is_some());
+        assert!(entry_from(&s, &k, out(MAX_ENTRY_FILE_BYTES + 1), 1).is_none());
+        const { assert!(MAX_ENTRY_FILE_BYTES <= crate::cas::MAX_BLOB_BYTES) };
+    }
+
+    /// CF-30 P3: revoking a proof removes the local results stored under it
+    /// and nothing else.
+    #[test]
+    fn revoking_a_proof_removes_the_entries_stored_under_it() {
+        let d = tempfile::tempdir().unwrap();
+        let c = store(d.path());
+        let proof = "ab".repeat(32);
+        let (k1, e1) = put(&c, &spec(), &[("foo-1.rlib", b"one")]);
+        let mut s2 = spec();
+        s2.crate_name = "bar".into();
+        s2.args.push(Arg::Plain("--cfg=bar".into()));
+        let (k2, e2) = put(&c, &s2, &[("bar-1.rlib", b"two")]);
+        // `put` stored both plainly; store e1 again under the proof.
+        c.store_proven(&k1, &e1, &proof).unwrap();
+        assert!(c.lookup(&k1).is_some() && c.lookup(&k2).is_some());
+        assert!(c.store_proven(&k1, &e1, "not hex").is_err());
+        assert_eq!(c.revoke_proof(&proof), 1);
+        assert!(c.lookup(&k1).is_none(), "stored under the proof: gone");
+        assert!(c.lookup(&k2).is_some(), "another entry stays");
+        assert_eq!(c.revoke_proof(&proof), 0, "nothing left to remove");
+        let _ = e2;
+    }
+
+    /// CF-30 P3: deleting a broken entry must not delete one that a
+    /// concurrent `store` wrote in its place.
+    #[test]
+    fn removing_a_broken_entry_spares_a_fresh_one() {
+        let d = tempfile::tempdir().unwrap();
+        let c = store(d.path());
+        let (k, e) = put(&c, &spec(), &[("foo-1.rlib", b"one")]);
+        let path = c.entry_path(&k);
+        let stale = b"broken bytes judged earlier".to_vec();
+        // The file holds a good entry now: it is not the file that was judged.
+        remove_if_unchanged(&path, &stale);
+        assert_eq!(c.lookup(&k).as_ref(), Some(&e), "the fresh entry survived");
+        // The very bytes that were judged are removed.
+        let raw = std::fs::read(&path).unwrap();
+        remove_if_unchanged(&path, &raw);
+        assert!(!path.exists());
+        // `forget` only removes the entry it was given.
+        let (k, e) = put(&c, &spec(), &[("foo-1.rlib", b"one")]);
+        let mut other = e.clone();
+        other.crate_name = "other".into();
+        c.forget(&k, &other);
+        assert!(c.lookup(&k).is_some(), "a different entry is not forgotten");
+        c.forget(&k, &e);
+        assert!(c.lookup(&k).is_none());
     }
 }

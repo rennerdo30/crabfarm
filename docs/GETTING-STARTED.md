@@ -157,7 +157,7 @@ local because: NoPeer 2, ...
 
 ### The compile cache
 
-Every library crate crabfarm compiles, here or on a peer, is also kept in a cache (default limit 10 GB). The next time the same crate comes up with the same compiler, flags, source files and dependencies, the stored result is used and rustc does not run: after `cargo clean`, after switching branches back and forth, and on another machine in the farm that builds the same project at the same path. `crabfarm status` shows a line like `compile cache: 41 hits (35 local, 6 farm), 3 misses, ...`.
+Every library crate crabfarm compiles, here or on a peer, is also kept in a cache (default limit 10 GB). The next time the same crate comes up with the same compiler, flags, source files and dependencies, the stored result is used and rustc does not run: after `cargo clean`, after switching branches back and forth, and on another machine in the farm that builds the same project at the same path. A crate that uses a proc macro is kept from a local run only after it has built successfully on a peer (proc macros can read any file while rustc runs, and only a peer's sandbox shows that they do not need one). `crabfarm status` shows a line like `compile cache: 41 hits (35 local, 6 farm), 3 misses, ...`.
 
 ```powershell
 crabfarm cache stats    # entries and size on disk, hit counters

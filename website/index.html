@@ -142,7 +142,7 @@
       </div>
       <div class="card">
         <h3>Never compiled twice</h3>
-        <p>Every library compile is kept in a built-in cache, on your machine and on the peer that ran it. After <code>cargo clean</code>, a branch switch or on another farm machine, the stored result is used and rustc does not run. <code>crabfarm cache stats</code> shows it, <code>crabfarm status</code> counts the hits.</p>
+        <p>Every library compile is kept in a built-in cache, on your machine and on the peer that ran it. After <code>cargo clean</code>, a branch switch or on another farm machine that builds the project at the same path, the stored result is used and rustc does not run. <code>crabfarm cache stats</code> shows it, <code>crabfarm status</code> counts the hits.</p>
       </div>
       <div class="card">
         <h3>If anything goes wrong</h3>

@@ -366,19 +366,24 @@ pub enum Message {
     Shutdown,
 
     // ---- compile cache (protocol 6, CF-28) ----
-    /// Peer -> peer, first frame of a connection: does the receiver hold a
-    /// cache entry for `key`? Answered with `CacheHave` or `CacheMiss`.
+    /// Peer -> peer on the authenticated CONTROL connection (a few may be in
+    /// flight at once; answers are matched by `key`): does the receiver hold
+    /// a cache entry for `key`? Answered with `CacheHave` or `CacheMiss`.
     CacheQuery {
         key: [u8; 32],
     },
     CacheHave {
+        key: [u8; 32],
         /// Total size of the entry's output files.
         bytes: u64,
     },
-    CacheMiss,
-    /// Asker -> holder after `CacheHave`: send the entry. The holder answers
-    /// like an executor: `Started`, `Output` + `BlobChunk`s and the recorded
-    /// `Stderr`/`Stdout` lines, then `Exit { code: 0 }`; or `Error`.
+    CacheMiss {
+        key: [u8; 32],
+    },
+    /// Asker -> holder, first frame of a fresh connection opened after a
+    /// `CacheHave`: send the entry. The holder answers like an executor:
+    /// `Started`, `Output` + `BlobChunk`s and the recorded `Stderr`/`Stdout`
+    /// lines, then `Exit { code: 0 }`; or `Error`.
     CacheFetch {
         key: [u8; 32],
     },
@@ -577,10 +582,10 @@ impl std::fmt::Debug for Message {
                 .field("capture", &capture.as_ref().map(|c| c.lines.len()))
                 .finish(),
             Message::CacheQuery { .. } => f.write_str("CacheQuery"),
-            Message::CacheHave { bytes } => {
+            Message::CacheHave { bytes, .. } => {
                 f.debug_struct("CacheHave").field("bytes", bytes).finish()
             }
-            Message::CacheMiss => f.write_str("CacheMiss"),
+            Message::CacheMiss { .. } => f.write_str("CacheMiss"),
             Message::CacheFetch { .. } => f.write_str("CacheFetch"),
             Message::QueryStatus => f.write_str("QueryStatus"),
             Message::FarmStatus {

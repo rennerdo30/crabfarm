@@ -1,16 +1,19 @@
 //! Crates proven hermetic (DESIGN section 16, CF-28).
 //!
-//! A proc macro or any build-time code can read a file that is neither in the
-//! dep-info nor in the package directory (sqlx's offline data in the workspace
-//! root, say), so a result of a LOCAL rustc run may be stale the next time the
+//! A proc macro is native code that runs inside rustc while a crate compiles
+//! and can read a file that is neither in the dep-info nor in the package
+//! directory (sqlx's offline data in the workspace root, say), so a result of
+//! a LOCAL rustc run of a crate that uses one may be stale the next time the
 //! cache key matches. A result of a REMOTE run cannot: the peer's sandbox held
-//! only the files that were shipped. So a local result is stored only for a
-//! crate that has already built successfully on a peer: its identity is
-//! "proven hermetic". When a remote run of such a crate fails and the local
-//! rerun succeeds, it needs something outside the sandbox and the proof is
-//! revoked.
+//! only the files that were shipped. So such a local result is stored only for
+//! a crate that has already built successfully on a peer with the same proc
+//! macros: its proof id is "proven hermetic". When a remote run of it fails and
+//! the local rerun succeeds, it needs something outside the sandbox and the
+//! proof is revoked. (Crates without a proc macro in their closure need no
+//! proof: rustc reads only what the key and the dep-info cover.)
 //!
-//! The proofs are keyed by [`crate::ccache::crate_identity`], kept in
+//! The proofs are keyed by [`crate::ccache::proof_id`] (the crate identity and
+//! the content hashes of the proc-macro libraries it is compiled with), kept in
 //! `<data>/hermetic.txt` (one `<hex> <unix seconds>` line each), bounded, and
 //! replaced atomically. The file is in a directory other programs may write
 //! to, so everything read from it is capped and sanitized.

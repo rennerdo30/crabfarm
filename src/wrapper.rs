@@ -891,6 +891,12 @@ mod tests {
             "OUT_DIR",
             "RUSTC_BOOTSTRAP",
             "MY_TOKEN_FREE",
+            // CF-28: rustc reads these for Apple targets; they are in the cache key.
+            "MACOSX_DEPLOYMENT_TARGET",
+            "IPHONEOS_DEPLOYMENT_TARGET",
+            "TVOS_DEPLOYMENT_TARGET",
+            "WATCHOS_DEPLOYMENT_TARGET",
+            "XROS_DEPLOYMENT_TARGET",
         ] {
             assert!(is_forwarded(n, &extra), "{n} must be forwarded");
         }

@@ -374,22 +374,23 @@ impl Recorder {
     }
 }
 
-/// Answer a peer's cache questions on one connection (DESIGN section 16):
-/// `CacheQuery` -> `CacheHave` or `CacheMiss`; after `CacheHave` a
-/// `CacheFetch` gets the entry replayed like a finished job. At most
-/// [`SERVE_CACHE_LIMIT`] are served at once; beyond that the answer is a miss.
+/// Serve a peer's `CacheFetch` (the first frame of a connection it opened
+/// after a `CacheHave` on the control connection, DESIGN section 16): the
+/// entry is replayed like a finished job. At most [`SERVE_CACHE_LIMIT`] are
+/// served at once, and none when this node keeps no cache (`cache = false` or
+/// `retain_blobs = false`); the answer is then an `Error` and the asker runs
+/// the job normally.
 pub const SERVE_CACHE_LIMIT: usize = 8;
-const FETCH_WAIT: Duration = Duration::from_secs(5);
 /// The whole replay of one entry.
 const REPLAY_TOTAL: Duration = Duration::from_secs(600);
 
 impl Node {
-    pub async fn serve_cache(self: &Arc<Self>, mut link: Link, key: [u8; 32]) {
+    pub async fn serve_cache(self: &Arc<Self>, link: Link, key: [u8; 32]) {
         let _permit = self.cache_serve_sem.clone().try_acquire_owned().ok();
         let ck = CacheKey(key);
         let node = self.clone();
-        let entry = match (&_permit, &self.ccache) {
-            (Some(_), Some(_)) => {
+        let entry = match (&_permit, self.cache_enabled()) {
+            (Some(_), true) => {
                 tokio::task::spawn_blocking(move || node.ccache.as_ref()?.lookup(&ck))
                     .await
                     .ok()
@@ -398,26 +399,14 @@ impl Node {
             _ => None,
         };
         let Some(entry) = entry else {
-            let _ = link.send(Message::CacheMiss).await;
+            let _ = link
+                .send(Message::Error {
+                    message: "no such cache entry".into(),
+                })
+                .await;
             link.close().await;
             return;
         };
-        if link
-            .send(Message::CacheHave {
-                bytes: entry.total_bytes(),
-            })
-            .await
-            .is_err()
-        {
-            return;
-        }
-        match tokio::time::timeout(FETCH_WAIT, link.recv()).await {
-            Ok(Some(Message::CacheFetch { key: k })) if k == key => {}
-            _ => {
-                link.close().await;
-                return;
-            }
-        }
         let node = self.clone();
         let e2 = entry.clone();
         let loaded = tokio::task::spawn_blocking(move || {
@@ -427,7 +416,7 @@ impl Node {
                 Err(err) => {
                     // Tampered or half-evicted: the entry goes, the asker runs normally.
                     tracing::info!("cache entry unusable: {err:#}");
-                    cc.forget(&ck);
+                    cc.forget(&ck, &e2);
                     None
                 }
             }

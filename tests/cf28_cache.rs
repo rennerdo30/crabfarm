@@ -421,11 +421,14 @@ fn fixture() -> Fixture {
     }
 }
 
-/// The fixture crates that are remote-eligible libraries and build on a peer:
-/// core_lib, derive_mac (proc macro) and util. `embed` bakes in its manifest
-/// dir, so a peer's result is always tainted: it only ever runs locally, never
-/// has a remote success and is therefore never cached (CF-28, section 16).
-const ELIGIBLE: u64 = 3;
+/// The fixture crates that are cacheable libraries: core_lib, derive_mac (proc
+/// macro), util and embed. `embed` bakes in its manifest dir, so a peer's
+/// result is always tainted and it only ever runs locally; no proc macro runs
+/// while it compiles, so its local result needs no proof and is cached anyway
+/// (CF-30, section 16).
+const ELIGIBLE: u64 = 4;
+/// Of those, the ones that build on a peer.
+const REMOTE_PROVEN: u64 = 3;
 
 /// Two nodes where the first sends its eligible jobs to the second, so every
 /// crate has a remote success (and with it the proof that it is hermetic).
@@ -470,9 +473,6 @@ fn a_clean_rebuild_is_served_from_the_cache() {
         c1.stored >= ELIGIBLE,
         "every eligible crate is stored: {c1:?}"
     );
-    // `embed` ran locally without ever succeeding on a peer: not proven, so
-    // its result was not kept.
-    assert!(not_proven(&n1.home) >= 1, "embed is not proven hermetic");
     // The executing node kept what it built (peers keep the entries of jobs
     // they executed).
     let c2 = cache(&n2.home);
@@ -486,11 +486,12 @@ fn a_clean_rebuild_is_served_from_the_cache() {
         "all eligible crates should be local hits: {c1b:?}\n{}",
         b2.stderr
     );
-    // Only `embed` (never proven hermetic, so never cached) misses again.
+    // Nothing misses again: `embed` ran locally, needs no proof (no proc
+    // macro runs while it compiles) and was kept.
     assert_eq!(
         c1b.misses,
-        c1.misses + 1,
-        "only embed may miss: {c1b:?}
+        c1.misses,
+        "no crate may miss: {c1b:?}
 {}",
         node_log(&n1.home)
     );
@@ -530,7 +531,10 @@ fn a_second_node_gets_the_first_nodes_results() {
     let first = outputs(&f.target);
     let ca = cache(&a.home);
     assert!(ca.stored >= ELIGIBLE, "{ca:?}");
-    assert!(cache(&b.home).stored >= ELIGIBLE, "B kept what it executed");
+    assert!(
+        cache(&b.home).stored >= REMOTE_PROVEN,
+        "B kept what it executed"
+    );
     let mut c = crabfarm(&b.home);
     c.args(["cache", "clear"]);
     assert!(run(c, 20).ok);
@@ -749,10 +753,11 @@ fn a_variable_the_crate_reads_never_makes_a_stale_hit() {
     assert_eq!(build(None), "probe=none", "a stale entry was served");
     assert_eq!(build(Some("2")), "probe=2");
     assert_eq!(build(Some("1")), "probe=1");
-    // A single node has no peer, so nothing ever ran remotely and no local
-    // result is proven hermetic: nothing is kept, nothing can be stale.
+    // No proc macro runs while `probe_lib` compiles, so its local result needs
+    // no proof: the run without the variable was kept (once), and the runs
+    // that saw the variable were not.
     let c = cache(&n.home);
-    assert_eq!((c.local, c.stored), (0, 0), "{c:?}");
+    assert_eq!(c.stored, 1, "{c:?}");
 }
 
 /// A workspace whose `user` crate calls a proc macro that reads
@@ -824,7 +829,9 @@ fn a_crate_that_reads_a_file_outside_its_package_is_never_served_stale() {
     assert_eq!(build("two"), "outside=two", "a stale result was served");
     assert_eq!(build("three"), "outside=three", "a stale result was served");
     let c = cache(&n.home);
-    assert_eq!((c.local, c.farm, c.stored), (0, 0, 0), "{c:?}");
+    // `mac` has no proc macro of its own, so its result is kept; `user` runs
+    // the macro, was never proven on a peer and is never kept.
+    assert_eq!((c.farm, c.stored), (0, 1), "{c:?}");
     assert!(not_proven(&n.home) >= 1);
 }
 
@@ -839,7 +846,7 @@ fn a_crate_proven_on_a_peer_is_cached_when_it_builds_locally() {
     let (mut n1, n2) = proving_farm(&f);
     build_ok(&n1, &f.work, &f.target);
     assert!(
-        remote_ok(&n1.home) >= ELIGIBLE,
+        remote_ok(&n1.home) >= REMOTE_PROVEN,
         "the first build uses the peer"
     );
 
@@ -862,10 +869,6 @@ fn a_crate_proven_on_a_peer_is_cached_when_it_builds_locally() {
     assert_eq!(remote_ok(&n1.home), 0, "nothing went to the peer");
     let c = cache(&n1.home);
     assert!(c.stored >= 1, "the proven crate was not stored: {c:?}");
-    assert!(
-        not_proven(&n1.home) >= 1,
-        "embed (never run on a peer) must be reported as not proven"
-    );
 
     wipe(&f.target);
     build_ok(&n1, &f.work, &f.target);
@@ -913,4 +916,193 @@ fn a_crate_that_fails_on_a_peer_and_builds_locally_is_not_cached() {
         not_proven(&n.home) >= 3,
         "user ran locally three times and was never cached"
     );
+}
+
+// ------------------------------------------------------------ CF-30 proofs
+
+/// The macro of the proof tests: it returns a constant and reads nothing.
+const MAC_CONST: &str = "use proc_macro::TokenStream;\n\
+     #[proc_macro]\n\
+     pub fn outside(_: TokenStream) -> TokenStream {\n\
+     \x20   \"\\\"v1\\\"\".parse().expect(\"literal\")\n\
+     }\n";
+
+/// The same macro after an edit that makes it read `../outside.txt` while it
+/// expands: a file neither the dep-info nor the cache key knows about.
+const MAC_READS_OUTSIDE: &str = "use proc_macro::TokenStream;\n\
+     #[proc_macro]\n\
+     pub fn outside(_: TokenStream) -> TokenStream {\n\
+     \x20   let dir = std::env::var(\"CARGO_MANIFEST_DIR\").expect(\"manifest dir\");\n\
+     \x20   let p = std::path::Path::new(&dir).parent().expect(\"parent\").join(\"outside.txt\");\n\
+     \x20   let text = std::fs::read_to_string(p).expect(\"outside.txt\");\n\
+     \x20   format!(\"{:?}\", text.trim()).parse().expect(\"literal\")\n\
+     }\n";
+
+const USER_PLAIN: &str = "pub const OUTSIDE: &str = mac::outside!();\n";
+
+/// `mac` (proc macro), `user` (calls it) and `app` (prints the result).
+fn proof_workspace(root: &Path, mac_src: &str, user_src: &str) -> PathBuf {
+    let work = outside_workspace(root);
+    write(&work.join("mac/src/lib.rs"), mac_src);
+    write(&work.join("user/src/lib.rs"), user_src);
+    work
+}
+
+/// Restart `n` with new config lines and wait until it sees its peer again.
+fn restart(n: &mut Node, peer_port: u16, extra: &str) {
+    drop(n._proc.take());
+    let _ = std::fs::remove_file(n.home.join("ipc.port"));
+    write_config(&n.home, "node-one", n.port, peer_port, extra);
+    n._proc = Some(start_node(&n.home));
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while !status(&n.home).contains("1 of 1 peers online") {
+        assert!(
+            Instant::now() < deadline,
+            "peer never reconnected\nlog:\n{}",
+            node_log(&n.home)
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Build the proof workspace from a clean target and return what `app` prints.
+fn build_app(n: &Node, work: &Path, target: &Path) -> String {
+    let _ = std::fs::remove_dir_all(target);
+    let b = cargo_build(&n.home, work, target);
+    assert!(b.ok, "build failed: {}\n{}", b.stderr, node_log(&n.home));
+    let exe = target
+        .join("release")
+        .join(if cfg!(windows) { "app.exe" } else { "app" });
+    let o = run(Command::new(exe), 30);
+    assert!(o.ok, "the app failed to run");
+    o.stdout.trim().to_string()
+}
+
+/// CF-30 P1. `user` is proven hermetic on a peer while its proc macro is a
+/// constant. The macro is then edited to read a file outside the package, and
+/// the node builds locally (a free local slot: nothing revokes anything). The
+/// proof must not carry over to the edited macro, or the local result is
+/// stored under a key that the outside file does not change: the next build
+/// after the file changed would be served the old text.
+#[test]
+fn a_proven_crate_whose_proc_macro_changes_is_not_served_stale() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let work = proof_workspace(tmp.path(), MAC_CONST, USER_PLAIN);
+    let target = tmp.path().join("target");
+    let (mut n, peer) = two_nodes(
+        tmp.path(),
+        "local_slots = 1\nprefer_remote = true",
+        "local_slots = 2",
+    );
+    assert_eq!(build_app(&n, &work, &target), "outside=v1");
+    assert!(remote_ok(&n.home) >= 2, "mac and user ran on the peer");
+
+    restart(&mut n, peer.port, "local_slots = 4");
+    write(&work.join("mac/src/lib.rs"), MAC_READS_OUTSIDE);
+    for text in ["one", "two", "three"] {
+        write(&work.join("outside.txt"), text);
+        assert_eq!(
+            build_app(&n, &work, &target),
+            format!("outside={text}"),
+            "a stale result was served\n{}",
+            node_log(&n.home)
+        );
+    }
+    // No remote failure: `user` was built here every time, so nothing revoked
+    // the proof for the old macro or told the node about the outside file.
+    let st = status(&n.home);
+    assert!(st.contains("0 remote failed"), "{st}");
+    assert!(
+        not_proven(&n.home) >= 1,
+        "user ran the edited macro without a proof for it"
+    );
+}
+
+/// CF-30 P2.1. A proven crate that later fails on the peer while the local
+/// rerun works (here: it now includes a file outside the package) loses its
+/// proof, and the local results stored under it are removed: the same source
+/// as before is then rebuilt, not served.
+#[test]
+fn a_proven_crate_that_fails_on_a_peer_loses_its_proof_and_local_entries() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plus = format!("{USER_PLAIN}pub fn added() {{}}\n");
+    let work = proof_workspace(tmp.path(), MAC_CONST, USER_PLAIN);
+    let target = tmp.path().join("target");
+    let (mut n, peer) = two_nodes(
+        tmp.path(),
+        "local_slots = 1\nprefer_remote = true",
+        "local_slots = 2",
+    );
+    // A: user builds on the peer: proven.
+    assert_eq!(build_app(&n, &work, &target), "outside=v1");
+    assert!(remote_ok(&n.home) >= 2);
+
+    // B: built here (an edit: another key, the same proof), the local result
+    // is kept and then served.
+    restart(&mut n, peer.port, "local_slots = 4");
+    write(&work.join("user/src/lib.rs"), &plus);
+    assert_eq!(build_app(&n, &work, &target), "outside=v1");
+    let c = cache(&n.home);
+    assert_eq!(
+        c.stored, 1,
+        "the proven crate's local result is kept: {c:?}"
+    );
+    let first = cache(&n.home);
+    assert_eq!(build_app(&n, &work, &target), "outside=v1");
+    // Every cacheable crate is a hit now: that many hits per clean build.
+    let all_hit = cache(&n.home).local - first.local;
+    assert!(all_hit >= 2, "mac and user come from the cache: {first:?}");
+
+    // C: the crate now reads a file the peer does not have: it fails there,
+    // the rerun here works, and the proof is revoked.
+    restart(&mut n, peer.port, "local_slots = 1\nprefer_remote = true");
+    write(&work.join("outside.txt"), "x");
+    write(
+        &work.join("user/src/lib.rs"),
+        &format!("{USER_PLAIN}pub const OUT: &str = include_str!(\"../../outside.txt\");\n"),
+    );
+    assert_eq!(build_app(&n, &work, &target), "outside=v1");
+
+    // D: the source of step B again, built here: its stored result is gone
+    // (revoked with the proof) and, unproven, it is not stored again.
+    restart(&mut n, peer.port, "local_slots = 4");
+    write(&work.join("user/src/lib.rs"), &plus);
+    assert_eq!(build_app(&n, &work, &target), "outside=v1");
+    let c = cache(&n.home);
+    assert_eq!(
+        c.local,
+        all_hit - 1,
+        "everything but user is a hit; its entry was revoked: {c:?}"
+    );
+    assert_eq!(c.stored, 0, "an unproven result was stored: {c:?}");
+}
+
+/// CF-30 P3: a node that keeps nothing (`retain_blobs = false`) does not serve
+/// entries either, even ones an earlier run of it stored.
+#[test]
+fn a_node_that_retains_nothing_serves_nothing_to_the_farm() {
+    let _g = serial();
+    let f = fixture();
+    let (mut a, b) = proving_farm(&f);
+    build_ok(&a, &f.work, &f.target);
+    assert!(cache(&a.home).stored >= ELIGIBLE);
+    let mut c = crabfarm(&b.home);
+    c.args(["cache", "clear"]);
+    assert!(run(c, 20).ok);
+
+    restart(
+        &mut a,
+        b.port,
+        "local_slots = 1\nprefer_remote = true\nretain_blobs = false",
+    );
+    wipe(&f.target);
+    build_ok(&b, &f.work, &f.target);
+    let cb = cache(&b.home);
+    assert_eq!(
+        cb.farm, 0,
+        "B was served by a node that keeps nothing: {cb:?}"
+    );
+    assert_eq!(run_app(&f.target), app_text(&f.work));
 }

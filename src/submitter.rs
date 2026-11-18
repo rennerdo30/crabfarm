@@ -31,6 +31,9 @@ const OPEN_DEADLINE: Duration = Duration::from_secs(12);
 const CACHE_ASK_DEADLINE: Duration = Duration::from_millis(300);
 const CACHE_ASK_PEERS: usize = 8;
 pub(crate) const CACHE_ASK_CONCURRENCY: usize = 16;
+/// Entry downloads started at once, and how long one may wait to connect.
+pub(crate) const CACHE_FETCH_CONCURRENCY: usize = 4;
+const CACHE_FETCH_CONNECT: Duration = Duration::from_secs(3);
 const CACHE_SLOW_PAUSE: Duration = Duration::from_secs(30);
 /// The address that worked last time gets this head start over the others.
 const ADDR_HEAD_START: Duration = Duration::from_millis(300);
@@ -291,8 +294,41 @@ enum Origin {
 struct CacheCtx {
     key: CacheKey,
     spec: JobSpec,
-    /// The crate's identity for the hermetic proofs; `None` = never provable.
-    identity: Option<String>,
+    /// What may be stored from a local run of this crate.
+    proof: Proof,
+}
+
+/// Whether a LOCAL run's result of a crate may enter the cache (DESIGN
+/// section 16).
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Proof {
+    /// No proc macro runs while the crate compiles: rustc reads only the
+    /// files the dep-info lists (checked before storing) and the variables it
+    /// reports (checked by the wrapper), so the key covers everything and no
+    /// proof is needed.
+    NotNeeded,
+    /// A proc macro runs inside rustc and may read anything: stored only
+    /// while this proof id (the crate identity and the macro builds) has a
+    /// remote success on record.
+    Id(String),
+    /// A proc macro runs and the job lacks what an identity needs: never stored.
+    Never,
+}
+
+impl Proof {
+    fn of(spec: &JobSpec, macros: &[BlobHash]) -> Proof {
+        if macros.is_empty() {
+            return Proof::NotNeeded;
+        }
+        ccache::proof_id(spec, macros).map_or(Proof::Never, Proof::Id)
+    }
+
+    fn id(&self) -> Option<&str> {
+        match self {
+            Proof::Id(id) => Some(id),
+            _ => None,
+        }
+    }
 }
 
 enum RemoteEnd {
@@ -522,6 +558,8 @@ fn env_path(spec: &JobSpec, name: &str) -> Option<ClientPath> {
 struct Prepared {
     spec: JobSpec,
     files: HashMap<BlobHash, PathBuf>,
+    /// Content hashes of the proc-macro libraries in the `--extern` closure.
+    macros: Vec<BlobHash>,
 }
 
 /// Whether the result of a local run is kept for the compile cache, by the
@@ -546,6 +584,7 @@ struct Built {
     inputs: Vec<InputFile>,
     files: HashMap<BlobHash, PathBuf>,
     has_proc_macro: bool,
+    macros: Vec<BlobHash>,
 }
 
 /// Collect and hash everything the job needs (DESIGN section 8).
@@ -584,6 +623,11 @@ fn build_inputs(node: &Node, spec: &JobSpec, info: &SubmitInfo) -> Result<Built,
         LocalReason::UnknownDependency
     })?;
     let has_proc_macro = closure.iter().any(is_proc_macro_lib);
+    let macro_paths: Vec<ClientPath> = closure
+        .iter()
+        .filter(|c| is_proc_macro_lib(c))
+        .cloned()
+        .collect();
 
     let mut seen: HashSet<ClientPath> = HashSet::new();
     let mut inputs_out: Vec<InputFile> = Vec::new();
@@ -622,10 +666,18 @@ fn build_inputs(node: &Node, spec: &JobSpec, info: &SubmitInfo) -> Result<Built,
         }
         add(local, false)?;
     }
+    let mut macros: Vec<BlobHash> = inputs_out
+        .iter()
+        .filter(|i| macro_paths.contains(&i.path))
+        .map(|i| i.hash)
+        .collect();
+    macros.sort_by_key(|h| h.0);
+    macros.dedup();
     Ok(Built {
         inputs: inputs_out,
         files,
         has_proc_macro,
+        macros,
     })
 }
 
@@ -759,7 +811,13 @@ impl Node {
         // cheapest way to run the job.
         let mut prepared: Option<Result<Prepared, LocalReason>> = None;
         let mut ctx: Option<Arc<CacheCtx>> = None;
-        if self.cache_enabled() && !self.paths_forbid_cache(&spec, &info) {
+        // Only a job the cache can use is prepared here (a target given as a
+        // file is never cached): everything else is prepared by `plan`, and
+        // only when a peer looks better than a free local slot.
+        if self.cache_enabled()
+            && !ccache::target_is_file(&spec.target)
+            && !self.paths_forbid_cache(&spec, &info)
+        {
             let r = self.prepare(spec.clone(), &info, false).await;
             if let Ok(p) = &r
                 && covers_input(&p.spec, &info.input)
@@ -767,7 +825,7 @@ impl Node {
             {
                 ctx = Some(Arc::new(CacheCtx {
                     key: ccache::cache_key(&p.spec),
-                    identity: ccache::crate_identity(&p.spec),
+                    proof: Proof::of(&p.spec, &p.macros),
                     spec: p.spec.clone(),
                 }));
             }
@@ -869,7 +927,7 @@ impl Node {
                 // now on. A farm hit proves nothing about this node's crate.
                 if hit.is_none()
                     && done.ok
-                    && let Some(id) = ctx.and_then(|c| c.identity.clone())
+                    && let Some(id) = ctx.and_then(|c| c.proof.id().map(str::to_string))
                 {
                     self.hermetic_update(id, true).await;
                 }
@@ -886,7 +944,7 @@ impl Node {
 
     // ---------------------------------------------------------------- cache
 
-    fn cache_enabled(&self) -> bool {
+    pub(crate) fn cache_enabled(&self) -> bool {
         self.ccache.is_some() && self.cfg.retain_blobs
     }
 
@@ -920,7 +978,7 @@ impl Node {
                 Ok(files) => Some((e, files)),
                 Err(err) => {
                     tracing::info!("cache entry unusable, running normally: {err:#}");
-                    cc.forget(&key);
+                    cc.forget(&key, &e);
                     node.count("cache_corrupt", 1);
                     None
                 }
@@ -1016,7 +1074,8 @@ impl Node {
     }
 
     /// Record (`prove`) or withdraw a crate's hermetic proof, off the async
-    /// threads (the file is rewritten).
+    /// threads (the file is rewritten). Withdrawing also removes the local
+    /// results that were stored under the proof: they may be stale.
     async fn hermetic_update(self: &Arc<Self>, id: String, prove: bool) {
         let node = self.clone();
         let done = tokio::task::spawn_blocking(move || {
@@ -1024,7 +1083,12 @@ impl Node {
             if prove {
                 h.prove(&id, ccache::Ccache::now())
             } else {
-                h.revoke(&id)
+                let r = h.revoke(&id);
+                let removed = node.ccache.as_ref().map_or(0, |c| c.revoke_proof(&id));
+                if removed > 0 {
+                    node.count("cache_revoked", removed as u64);
+                }
+                r
             }
         })
         .await;
@@ -1059,11 +1123,13 @@ impl Node {
         ctx: &CacheCtx,
         info: &SubmitInfo,
         capture: crate::proto::LocalCapture,
+        started: std::time::SystemTime,
     ) {
         let node = self.clone();
         let key = ctx.key;
         let spec = ctx.spec.clone();
         let produces = info.produces.clone();
+        let proof = ctx.proof.id().map(str::to_string);
         let stored = tokio::task::spawn_blocking(move || {
             let cc = node.ccache.as_ref()?;
             for i in &spec.inputs {
@@ -1081,14 +1147,17 @@ impl Node {
                 })
                 .collect();
             let extra = crate::wrapper::extra_filename(&plain);
-            let files = ccache::local_output_files(&spec, &produces, &extra)?;
+            let files = ccache::local_output_files(&spec, &produces, &extra, started)?;
             let mut outputs = Vec::new();
             let mut dep_info = None;
             let mut total = 0u64;
             for f in files {
                 let data = std::fs::read(f.to_local()).ok()?;
                 total += data.len() as u64;
-                if total > ccache::MAX_ENTRY_BYTES {
+                // What a replay could never carry is not stored.
+                if total > ccache::MAX_ENTRY_BYTES
+                    || data.len() as u64 > ccache::MAX_ENTRY_FILE_BYTES
+                {
                     return None;
                 }
                 let hash = BlobHash::of(&data);
@@ -1113,7 +1182,10 @@ impl Node {
                 },
                 ccache::Ccache::now(),
             )?;
-            cc.store(&key, &e).ok()
+            match &proof {
+                Some(id) => cc.store_proven(&key, &e, id).ok(),
+                None => cc.store(&key, &e).ok(),
+            }
         })
         .await
         .ok()
@@ -1147,6 +1219,8 @@ impl Node {
         }
         // The wrapper reads nothing more until it is done with rustc.
         live.stopped.store(true, Ordering::Release);
+        // Files older than this are not outputs of this run.
+        let started = std::time::SystemTime::now();
         let mut capture = None;
         let ok = loop {
             match wrapper.recv().await {
@@ -1166,22 +1240,24 @@ impl Node {
             // The peer failed (or its result was rejected) and this run
             // worked: the crate needs something outside the sandbox. Its
             // proof, if it had one, is void.
-            if let Some(id) = ctx.and_then(|c| c.identity.clone()) {
+            if let Some(id) = ctx.and_then(|c| c.proof.id().map(str::to_string)) {
                 self.hermetic_update(id, false).await;
             }
         }
         if ok && let (Some(c), Some(cap)) = (ctx, capture) {
+            let allowed = match &c.proof {
+                Proof::NotNeeded => true,
+                Proof::Id(id) => lock(&self.hermetic).is_proven(id),
+                Proof::Never => false,
+            };
             if !stores_local_result(reason) {
                 self.count("cache_unproven", 1);
-            } else if c
-                .identity
-                .as_deref()
-                .is_some_and(|id| lock(&self.hermetic).is_proven(id))
-            {
-                self.store_local(c, info, cap).await;
+            } else if allowed {
+                self.store_local(c, info, cap, started).await;
             } else {
-                // A local run may have read files the key does not cover; only
-                // crates that built on a peer are known not to (section 16).
+                // A proc macro ran here and may have read files the key does
+                // not cover; only a crate with these macros that built on a
+                // peer is known not to (section 16).
                 self.count("cache_unproven", 1);
             }
         }
@@ -1265,6 +1341,7 @@ impl Node {
         Ok(Prepared {
             spec,
             files: built.files,
+            macros: built.macros,
         })
     }
 
@@ -1307,7 +1384,7 @@ impl Node {
 
         // Inputs cost disk and CPU; only now that a peer looks better (unless
         // the compile cache collected them already).
-        let Prepared { spec, files } = match prepared {
+        let Prepared { spec, files, .. } = match prepared {
             Some(r) => r?,
             None => self.prepare(spec, info, sensitive).await?,
         };
@@ -1459,19 +1536,23 @@ impl Node {
     }
 
     /// Ask the peers whether one of them holds the cache entry for `key`
-    /// (DESIGN section 16): one short connection per online peer, all at once,
-    /// all within [`CACHE_ASK_DEADLINE`], at most [`CACHE_ASK_PEERS`] peers and
-    /// [`CACHE_ASK_CONCURRENCY`] asks in flight on this node. A peer that did
-    /// not answer in time is not asked again for [`CACHE_SLOW_PAUSE`]. The
-    /// first `CacheHave` wins; its connection is returned, ready for
-    /// `CacheFetch`.
+    /// (DESIGN section 16): `CacheQuery` goes over each online peer's existing
+    /// authenticated control connection (no new connection per question, so
+    /// questions cannot use up the unauthenticated accept slots job connects
+    /// need), at most [`crate::node::CACHE_ASKS_PER_PEER`] in flight to one
+    /// peer, all within [`CACHE_ASK_DEADLINE`], at most [`CACHE_ASK_PEERS`]
+    /// peers and [`CACHE_ASK_CONCURRENCY`] lookups in flight on this node. A
+    /// peer that did not answer in time is not asked again for
+    /// [`CACHE_SLOW_PAUSE`]. The first `CacheHave` wins; only then is a
+    /// connection opened (at most [`CACHE_FETCH_CONCURRENCY`] at once) and
+    /// returned, ready for `CacheFetch`.
     pub(crate) async fn farm_lookup(self: &Arc<Self>, key: &CacheKey) -> Option<Link> {
         let now = Instant::now();
         let peers: Vec<NodeId> = {
             let book = lock(&self.peers);
             let mut ids: Vec<NodeId> = book
                 .iter()
-                .filter(|(_, p)| p.conns > 0 && p.status.is_some())
+                .filter(|(_, p)| p.conns > 0 && p.status.is_some() && !p.ctrl.is_empty())
                 .filter(|(_, p)| p.cache_slow_until.is_none_or(|t| t <= now))
                 .map(|(id, _)| *id)
                 .collect();
@@ -1488,33 +1569,23 @@ impl Node {
         let mut set = tokio::task::JoinSet::new();
         for peer in &peers {
             let (me, peer, key) = (self.clone(), *peer, key.0);
-            set.spawn(async move {
-                let mut race = me.connect_peer(peer, deadline).await?;
-                let (_, conn) = race.next().await?;
-                let mut link = Link::new(conn);
-                link.send(Message::CacheQuery { key }).await.ok()?;
-                match tokio::time::timeout_at(deadline, link.recv()).await {
-                    Ok(Some(Message::CacheHave { .. })) => Some((peer, Some(link))),
-                    Ok(_) => Some((peer, None)),
-                    Err(_) => None,
-                }
-            });
+            set.spawn(async move { (peer, me.cache_ask(peer, key, deadline).await) });
         }
         self.count("cache_farm_asks", peers.len() as u64);
         let mut answered: HashSet<NodeId> = HashSet::new();
-        let mut found: Option<Link> = None;
+        let mut holder: Option<NodeId> = None;
         while let Ok(Some(joined)) = tokio::time::timeout_at(deadline, set.join_next()).await {
-            if let Ok(Some((peer, link))) = joined {
+            if let Ok((peer, Some(have))) = joined {
                 answered.insert(peer);
-                if link.is_some() {
-                    found = link;
+                if have.is_some() {
+                    holder = Some(peer);
                     break;
                 }
             }
         }
         drop(set);
         drop(permit);
-        if found.is_none() {
+        if holder.is_none() {
             let mut book = lock(&self.peers);
             for peer in peers.iter().filter(|p| !answered.contains(p)) {
                 if let Some(p) = book.get_mut(peer) {
@@ -1522,7 +1593,18 @@ impl Node {
                 }
             }
         }
-        found
+        let holder = holder?;
+        // The download needs its own connection. A hit saves a compile, so it
+        // may wait a moment for a place, but never for long.
+        let deadline = tokio::time::Instant::now() + CACHE_FETCH_CONNECT;
+        let _fetch =
+            tokio::time::timeout_at(deadline, self.cache_fetch_sem.clone().acquire_owned())
+                .await
+                .ok()?
+                .ok()?;
+        let mut race = self.connect_peer(holder, deadline).await?;
+        let (_, conn) = race.next().await?;
+        Some(Link::new(conn))
     }
 
     async fn run_remote(

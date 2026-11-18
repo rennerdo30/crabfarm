@@ -1,6 +1,8 @@
-# cargo-deny configuration. crabfarm ships only permissively licensed
-# dependencies; CI enforces this list (job "cargo-deny (licenses)").
-# For "A OR B" expressions one allowed side is enough.
+# cargo-deny configuration. CI runs `cargo deny check licenses advisories
+# sources` (job "cargo-deny"). `bans` is not checked.
+#
+# licenses: crabfarm ships only permissively licensed dependencies. For
+# "A OR B" expressions one allowed side is enough.
 
 [licenses]
 version = 2
@@ -19,3 +21,17 @@ allow = [
 exceptions = [
     { allow = ["MPL-2.0"], crate = "option-ext" },
 ]
+
+# RustSec advisories: a known vulnerability fails the check. Yanked crates are
+# reported (a yanked version in Cargo.lock needs a `cargo update -p`, not a
+# red CI on an unrelated change).
+[advisories]
+version = 2
+yanked = "warn"
+
+# Dependencies come from crates.io only: no other registry, no git sources.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

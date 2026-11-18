@@ -1,0 +1,27 @@
+# Dependabot: version updates once a week. Every update lands in one pull
+# request per ecosystem (grouped), so the review queue stays short.
+# Security updates are not delayed and arrive as soon as an advisory matches.
+version: 2
+
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "deps"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "deps"
+    groups:
+      cargo:
+        patterns: ["*"]

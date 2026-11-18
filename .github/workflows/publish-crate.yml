@@ -2,9 +2,15 @@ name: publish-crate
 
 # Uploads the crate to crates.io. Manual only: the owner starts it from the
 # Actions tab, after the GitHub release for the same tag is published.
-# Needs the repository secret CARGO_REGISTRY_TOKEN (docs/RELEASING.md); the
-# secret is read only by the last step and is scoped to the "crates-io"
-# environment, which can require the owner's approval.
+# Needs the ENVIRONMENT secret CARGO_REGISTRY_TOKEN in the "crates-io"
+# environment (not a repository secret; docs/RELEASING.md), which can require
+# the owner's approval. The token is in the env of the last step only: the
+# package check compiles the crate (build.rs, proc macros of dependencies) in
+# a separate step WITHOUT the token, and the publish step runs with
+# --no-verify so no compiled code ever runs next to the token.
+# crates.io Trusted Publishing (OIDC, no stored token) needs the crate to
+# exist already (Rust blog, 2025-07-11: publish the first release manually);
+# docs/RELEASING.md describes the switch after 0.1.0.
 on:
   workflow_dispatch:
     inputs:
@@ -28,13 +34,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.tag }}
+          ref: refs/tags/${{ inputs.tag }}
           persist-credentials: false
       - name: Tag matches the crate version
         env:
           TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
+          case "$TAG" in v[0-9]*) ;; *) echo "Not a version tag: $TAG" >&2; exit 1 ;; esac
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
           if [ "$TAG" != "v$version" ]; then
             echo "Tag $TAG does not match Cargo.toml version $version" >&2
@@ -42,9 +49,11 @@ jobs:
           fi
       # rust-toolchain.toml pins the toolchain; this installs it.
       - run: rustup show active-toolchain
-      - name: Package check (no upload)
+      # Builds the packaged crate to verify it. No secret in this step's env.
+      - name: Package and verify (no token, no upload)
         run: cargo package --locked
+      # Verified above; --no-verify keeps the token away from compiled code.
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --locked
+        run: cargo publish --locked --no-verify

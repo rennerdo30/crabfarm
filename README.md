@@ -1,8 +1,19 @@
 # crabfarm
 
+[![ci](https://github.com/rennerdo30/crabfarm/actions/workflows/ci.yml/badge.svg)](https://github.com/rennerdo30/crabfarm/actions/workflows/ci.yml)
+
 Distributed `rustc` over a peer-to-peer farm of your own machines: Windows, macOS and Linux, mixed. Your notebook builds with your desktop's cores.
 
+Website: https://crabfarm.renner.dev
+
 > Status: P1 (Windows to Windows, same compiler on every machine). See [docs/DESIGN.md](docs/DESIGN.md).
+
+## Install
+
+- **GitHub Releases:** download the archive for your platform from the [Releases page](https://github.com/rennerdo30/crabfarm/releases) (Windows, Linux and macOS, x86_64 and aarch64), check it against `SHA256SUMS.txt`, unpack it and put `crabfarm` on your `PATH`. The binaries are not code-signed, so Windows SmartScreen or macOS Gatekeeper may warn on the first run. Each archive also has build provenance: `gh attestation verify <archive> --repo rennerdo30/crabfarm`.
+- **From crates.io**, once the first version is published there: `cargo install crabfarm --locked`.
+
+Install it on every machine of the farm.
 
 ## Quick start
 
@@ -35,4 +46,15 @@ The first time `crabfarm node` listens on the network, Windows asks whether to a
 
 ## Trust model
 
-Farm members run each other's proc macros and compile each other's code. Only join machines you own.
+Farm members run each other's proc macros and compile each other's code. Only join machines you own. Details and what is out of scope: [SECURITY.md](SECURITY.md).
+
+## More
+
+- [docs/DESIGN.md](docs/DESIGN.md): how it works
+- [CHANGELOG.md](CHANGELOG.md): what changed
+- [SECURITY.md](SECURITY.md): reporting a vulnerability, trust model
+- [docs/RELEASING.md](docs/RELEASING.md): how releases are made
+
+## License
+
+MIT, see [LICENSE](LICENSE).

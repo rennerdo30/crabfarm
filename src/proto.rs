@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bump on any incompatible change to these types.
-pub const PROTO_VERSION: u16 = 1;
+pub const PROTO_VERSION: u16 = 2;
 /// Maximum encoded frame size in bytes.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// Blob transfer chunk size (plaintext bytes before compression).
@@ -203,11 +203,13 @@ pub enum Message {
     JoinRequest {
         token: [u8; 16],
         node_name: String,
-        node_id: NodeId,
-        /// Ed25519 public key (raw 32 bytes) the CA certifies.
+        /// Ed25519 public key (raw 32 bytes) the CA certifies. The node id is
+        /// chosen by the CA, never by the joiner (protocol 2).
         public_key: Vec<u8>,
     },
     JoinAccepted {
+        /// The node id the CA put into the certificate.
+        node_id: NodeId,
         node_cert_der: Vec<u8>,
         ca_cert_der: Vec<u8>,
         known_peers: Vec<PeerInfo>,

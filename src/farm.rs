@@ -476,22 +476,30 @@ impl Invites {
 /// Returns `JoinAccepted`, or an `Error` message (deliberately uniform for
 /// bad/used/expired tokens so the answer is no oracle).
 pub fn handle_join(id: &Identity, invites: &mut Invites, data_dir: &Path, request: &Message) -> anyhow::Result<Message> {
-    let Message::JoinRequest { token, node_name, node_id, public_key } = request else {
+    let Message::JoinRequest { token, node_name, public_key } = request else {
         return Ok(Message::Error { message: "expected a join request".into() });
     };
     if id.ca_key_der.is_none() {
         return Ok(Message::Error { message: "this node cannot sign certificates".into() });
     }
     // Validate the request shape before burning the single-use token.
-    if validate_node_name(node_name).is_err() || public_key.len() != 32 || *node_id == id.node_id {
+    if validate_node_name(node_name).is_err() || public_key.len() != 32 {
         return Ok(Message::Error { message: "invalid join request".into() });
     }
     if !invites.redeem(data_dir, token)? {
         return Ok(Message::Error { message: "invalid or expired invite".into() });
     }
-    let node_cert_der = sign_node_cert(id, node_name, *node_id, public_key)?;
     let known_peers = crate::discovery::PeerBook::load(data_dir)?.peers;
-    Ok(Message::JoinAccepted { node_cert_der, ca_cert_der: id.ca_cert_der.clone(), known_peers })
+    // The CA picks the id: a joiner must not be able to ask for a certificate
+    // carrying an existing member's id.
+    let node_id = loop {
+        let candidate = NodeId(random_bytes());
+        if candidate != id.node_id && !known_peers.iter().any(|p| p.node_id == candidate) {
+            break candidate;
+        }
+    };
+    let node_cert_der = sign_node_cert(id, node_name, node_id, public_key)?;
+    Ok(Message::JoinAccepted { node_id, node_cert_der, ca_cert_der: id.ca_cert_der.clone(), known_peers })
 }
 
 // ---------------------------------------------------------------- join: joiner
@@ -544,7 +552,6 @@ pub async fn join(data_dir: &Path, node_name: &str, code: &JoinCode) -> anyhow::
     ensure!(!p.node_crt.exists() && !p.ca_crt.exists(), "this machine already has a farm identity in {}", data_dir.display());
 
     let node_kp = KeyPair::generate_for(&PKCS_ED25519)?;
-    let node_id = NodeId(random_bytes());
     let cfg = crate::transport::join_client_config(code.cert_fp)?;
     let connect = async {
         let tcp = tokio::net::TcpStream::connect(&code.addr).await.with_context(|| format!("connect to {}", code.addr))?;
@@ -565,13 +572,14 @@ pub async fn join(data_dir: &Path, node_name: &str, code: &JoinCode) -> anyhow::
     conn.send(&Message::JoinRequest {
         token: code.token,
         node_name: node_name.to_string(),
-        node_id,
         public_key: node_kp.public_key_raw().to_vec(),
     })
     .await?;
     let reply = tokio::time::timeout(Duration::from_secs(10), conn.recv()).await.context("join reply timed out")??;
-    let (node_cert_der, ca_cert_der, mut known_peers) = match reply {
-        Some(Message::JoinAccepted { node_cert_der, ca_cert_der, known_peers }) => (node_cert_der, ca_cert_der, known_peers),
+    let (node_id, node_cert_der, ca_cert_der, mut known_peers) = match reply {
+        Some(Message::JoinAccepted { node_id, node_cert_der, ca_cert_der, known_peers }) => {
+            (node_id, node_cert_der, ca_cert_der, known_peers)
+        }
         Some(Message::Error { message }) => bail!("join refused: {message}"),
         Some(_) => bail!("unexpected reply to join request (this node speaks protocol {PROTO_VERSION})"),
         None => bail!("inviter closed the connection"),
@@ -733,7 +741,6 @@ mod tests {
         let req = |token: [u8; 16], pk: Vec<u8>, name: &str| Message::JoinRequest {
             token,
             node_name: name.into(),
-            node_id: NodeId([9; 16]),
             public_key: pk,
         };
         // Bad key length / name are refused and do not burn the token.
@@ -742,11 +749,12 @@ mod tests {
         }
         // A joined node (no CA key) cannot sign even with a valid token.
         let t = inv.issue(a.path()).unwrap();
-        let Message::JoinAccepted { node_cert_der, ca_cert_der, .. } = handle_join(&ca_node, &mut inv, a.path(), &req(t, pk.clone(), "beta")).unwrap()
+        let Message::JoinAccepted { node_id, node_cert_der, ca_cert_der, .. } =
+            handle_join(&ca_node, &mut inv, a.path(), &req(t, pk.clone(), "beta")).unwrap()
         else {
             panic!("expected JoinAccepted")
         };
-        let joined = install_join_response(b.path(), "beta", NodeId([9; 16]), &kp, node_cert_der, ca_cert_der).unwrap();
+        let joined = install_join_response(b.path(), "beta", node_id, &kp, node_cert_der, ca_cert_der).unwrap();
         let t = inv.issue(b.path()).unwrap();
         let reply = handle_join(&joined, &mut inv, b.path(), &req(t, pk.clone(), "gamma")).unwrap();
         assert!(matches!(reply, Message::Error { .. }));
@@ -755,10 +763,30 @@ mod tests {
         assert!(matches!(ok, Message::JoinAccepted { .. }));
         // Not a join request at all.
         assert!(matches!(handle_join(&ca_node, &mut inv, a.path(), &Message::Started).unwrap(), Message::Error { .. }));
-        // A joiner claiming the inviter's own node id is refused.
-        let t = inv.issue(a.path()).unwrap();
-        let clash = Message::JoinRequest { token: t, node_name: "x".into(), node_id: ca_node.node_id, public_key: pk };
-        assert!(matches!(handle_join(&ca_node, &mut inv, a.path(), &clash).unwrap(), Message::Error { .. }));
+    }
+
+    #[test]
+    fn ca_chooses_the_node_id() {
+        let a = tempfile::tempdir().unwrap();
+        let ca_node = create(a.path(), "ca").unwrap();
+        let mut inv = Invites::default();
+        let kp = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+        let mut seen = Vec::new();
+        for i in 0..3 {
+            let token = inv.issue(a.path()).unwrap();
+            let req = Message::JoinRequest { token, node_name: format!("n{i}"), public_key: kp.public_key_raw().to_vec() };
+            let Message::JoinAccepted { node_id, node_cert_der, .. } = handle_join(&ca_node, &mut inv, a.path(), &req).unwrap() else {
+                panic!("expected JoinAccepted")
+            };
+            // The certificate carries exactly the id the CA reported, and it is
+            // nobody else's: not the CA's, not an earlier joiner's, not a value
+            // a joiner could have predicted (the old requests used [9; 16]).
+            assert_eq!(node_id_from_cert(&node_cert_der).unwrap(), node_id);
+            assert_ne!(node_id, ca_node.node_id);
+            assert_ne!(node_id, NodeId([9; 16]));
+            assert!(!seen.contains(&node_id));
+            seen.push(node_id);
+        }
     }
 
     #[test]

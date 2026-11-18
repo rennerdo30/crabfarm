@@ -46,13 +46,14 @@ impl Rewriter {
     /// A line that contains no sandbox path is returned byte for byte.
     pub fn stderr_line(&self, line: &str) -> String {
         if line.trim_start().starts_with('{')
-            && let Ok(mut v) = serde_json::from_str::<Value>(line) {
-                if self.value(&mut v) {
-                    // Re-serializing cannot fail for a Value; keep the original on the impossible path.
-                    return serde_json::to_string(&v).unwrap_or_else(|_| line.to_string());
-                }
-                return line.to_string();
+            && let Ok(mut v) = serde_json::from_str::<Value>(line)
+        {
+            if self.value(&mut v) {
+                // Re-serializing cannot fail for a Value; keep the original on the impossible path.
+                return serde_json::to_string(&v).unwrap_or_else(|_| line.to_string());
             }
+            return line.to_string();
+        }
         self.text(line)
     }
 

@@ -170,6 +170,16 @@ In `config.toml`: `cache = false` turns it off on this machine, `cache_entries_m
 
 ## 9. If something is wrong
 
+Start with:
+
+```powershell
+crabfarm doctor        # checks this machine and says how to fix each problem
+crabfarm doctor --fix  # also repairs what is safe to repair: starts the node, points autostart at this install
+```
+
+Run it inside a project to also check that project: whether plain `cargo build` uses crabfarm there, and how many of its built libraries crabfarm does not know (those keep the crates that depend on them local, `UnknownDependency` in `status`). `doctor` never changes PATH, environment variables, the firewall or project files; for those it prints what to do.
+
+- **`UnknownDependency` in `local because`**: cargo built some dependencies without crabfarm (before you started using it, or because `RUSTC_WRAPPER` is set in the environment, which wins over every config file: an sccache setup often sets it). `crabfarm doctor` names the cause. Fix the variable if it is set, then build once from scratch through crabfarm: `cargo clean`, then `crabfarm cargo build`.
 - **`the node is not running`**: run `crabfarm service status`. If autostart is off: `crabfarm service install`. Or start it by hand in a terminal with `crabfarm node` and read what it says.
 - **Everything runs locally (`NoPeer`)**: the machines do not see each other. Check the firewall (step 4), that both are on the same network, or add `peers` (step 5).
 - **`status` shows `dial-back` in the JOBS column**: fine. This machine cannot open connections to that peer (typical for a work notebook on a VPN), but the peer can reach this machine, so it opens the job connections. `FAILING` means neither direction works: check the firewall on both machines (step 4) and that one machine can reach the other's address.
@@ -178,7 +188,16 @@ In `config.toml`: `cache = false` turns it off on this machine, `cache_entries_m
 - **The log**: `%APPDATA%\renner\crabfarm\data\logs\node.log`. If the node does not start at all, the reason is the last lines of that file. It holds crate names, sizes and timings, never your code.
 - **Stop the node**: `crabfarm node --stop`.
 
-## 10. Uninstall
+## 10. Update
+
+```powershell
+crabfarm update          # download the newest release from GitHub and install it
+crabfarm update --check  # only say whether there is a newer one
+```
+
+It runs the new setup silently and keeps your choices (PATH entry, autostart); a node that was running is running again afterwards. The download comes only from this project's GitHub releases over HTTPS and is checked against the release's `SHA256SUMS.txt` before it runs. `--pre` takes release candidates too. Update every machine of the farm: machines with different protocol versions cannot work together.
+
+## 11. Uninstall
 
 Settings, then Apps, then crabfarm, then Uninstall (or run `uninstall.exe` in `%LOCALAPPDATA%\Programs\crabfarm`). It stops the node, turns autostart off and removes crabfarm from PATH. Your farm identity and cache stay unless you tick **Also delete my farm identity and cache** on the uninstall page; keeping them lets a reinstall rejoin the same farm.
 

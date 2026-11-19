@@ -70,6 +70,26 @@ enum Cmd {
     Cargo { args: Vec<String> },
     /// Show peers, slots, running jobs and counters.
     Status,
+    /// Check this machine's crabfarm setup and say how to fix what is wrong.
+    Doctor {
+        /// Also repair what is safe to repair here: start the node, point
+        /// autostart at this install. Never edits PATH, the environment or
+        /// project files.
+        #[arg(long)]
+        fix: bool,
+    },
+    /// Download the newest crabfarm release from GitHub and install it.
+    Update {
+        /// Only say whether a newer release exists.
+        #[arg(long)]
+        check: bool,
+        /// Take prereleases (release candidates) too.
+        #[arg(long)]
+        pre: bool,
+        /// Install the newest release even when it is not newer than this one.
+        #[arg(long)]
+        force: bool,
+    },
     /// The compile cache: what it holds, and how to empty it.
     Cache {
         #[command(subcommand)]
@@ -406,6 +426,10 @@ fn real_main() -> anyhow::Result<i32> {
     match cli.cmd {
         Cmd::Cargo { args } => Ok(cargo_cmd::run(&args)),
         Cmd::Status => Ok(status::run()),
+        Cmd::Doctor { fix } => crabfarm::doctor::run(fix),
+        Cmd::Update { check, pre, force } => {
+            crabfarm::update::run(crabfarm::update::Options { check, pre, force })
+        }
         Cmd::Cache { cmd } => Ok(match cmd {
             CacheCmd::Stats => status::cache_stats(),
             CacheCmd::Clear => status::cache_clear(),

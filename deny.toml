@@ -18,8 +18,12 @@ allow = [
 ]
 # option-ext (pulled in by directories -> dirs-sys) is MPL-2.0: file-level
 # copyleft, used unmodified, so it is allowed for that one crate only.
+# webpki-roots (the Mozilla root certificates `crabfarm update` checks
+# github.com against, CF-37) is CDLA-Permissive-2.0, a permissive data
+# licence, allowed for that crate only.
 exceptions = [
     { allow = ["MPL-2.0"], crate = "option-ext" },
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
 ]
 
 # RustSec advisories: a known vulnerability fails the check. Yanked crates are

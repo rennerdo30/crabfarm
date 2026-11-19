@@ -247,21 +247,48 @@ pub fn find_inner_wrapper(
     env: &dyn Fn(&str) -> Option<OsString>,
     me: Option<&Path>,
 ) -> Option<String> {
-    let var = |n: &str| env(n).and_then(|v| v.into_string().ok());
+    effective_wrapper(args, cwd, cargo_home, env)
+        .map(|(w, _)| w)
+        .filter(|w| !w.is_empty() && !is_crabfarm(w, me))
+}
+
+/// Where cargo takes its rustc wrapper from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WrapperSource {
+    /// An environment variable (`RUSTC_WRAPPER`, `CARGO_BUILD_RUSTC_WRAPPER`).
+    Env(&'static str),
+    CommandLine,
+    File(PathBuf),
+}
+
+/// The rustc wrapper cargo uses, crabfarm included, and where it comes from,
+/// in the order of [`find_inner_wrapper`]. `Some(("", _))` is an explicit
+/// "no wrapper".
+pub fn effective_wrapper(
+    args: &[String],
+    cwd: &Path,
+    cargo_home: Option<&Path>,
+    env: &dyn Fn(&str) -> Option<OsString>,
+) -> Option<(String, WrapperSource)> {
+    let var = |n: &'static str| {
+        env(n)
+            .and_then(|v| v.into_string().ok())
+            .map(|v| (v, WrapperSource::Env(n)))
+    };
     // A set but empty RUSTC_WRAPPER switches a configured wrapper off, as in cargo.
-    let found: Option<String> = var("RUSTC_WRAPPER")
-        .or_else(|| wrapper_in_args(args, cwd))
+    var("RUSTC_WRAPPER")
+        .or_else(|| wrapper_in_args(args, cwd).map(|w| (w, WrapperSource::CommandLine)))
         .or_else(|| var("CARGO_BUILD_RUSTC_WRAPPER"))
         .or_else(|| {
             let mut dirs: Vec<PathBuf> = cwd.ancestors().map(|d| d.join(".cargo")).collect();
             dirs.extend(cargo_home.map(Path::to_path_buf));
             dirs.iter().find_map(|d| {
-                ["config.toml", "config"]
-                    .iter()
-                    .find_map(|f| wrapper_in_config(&d.join(f)))
+                ["config.toml", "config"].iter().find_map(|f| {
+                    let file = d.join(f);
+                    wrapper_in_config(&file).map(|w| (w, WrapperSource::File(file)))
+                })
             })
-        });
-    found.filter(|w| !w.is_empty() && !is_crabfarm(w, me))
+        })
 }
 
 /// Ask the node for its status; `None` when it is not running.

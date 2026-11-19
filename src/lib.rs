@@ -43,5 +43,8 @@ pub mod daemon;
 pub mod enable;
 pub mod pathenv;
 pub mod service;
+// CF-37 / CF-38
+pub mod doctor;
+pub mod update;
 #[cfg(windows)]
 pub mod winreg;

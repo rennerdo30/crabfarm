@@ -142,6 +142,16 @@ pub fn format_status(
     if !reasons.is_empty() {
         out.push_str(&format!("local because: {}\n", reasons.join(", ")));
     }
+    let (unrecorded, changed) = (
+        counter(counters, "unknown_dep.not_recorded"),
+        counter(counters, "unknown_dep.changed"),
+    );
+    if unrecorded + changed > 0 {
+        out.push_str(&format!(
+            "  UnknownDependency: {unrecorded} had a dependency cargo built without crabfarm, {changed} one that changed since; \
+             run `crabfarm doctor` in the project\n"
+        ));
+    }
     out.push_str(&format!(
         "pipelining: {} artifact notices relayed before their job ended\n",
         counter(counters, "early_notices"),
@@ -348,6 +358,25 @@ mod tests {
         assert!(t.contains("3.0 MiB up"));
         assert!(t.contains("dial-back"), "{t}");
         assert!(!t.contains("warning: jobs cannot reach"));
+    }
+
+    #[test]
+    fn unknown_dependencies_are_split_by_cause() {
+        let c = |k: &str, v: u64| (k.to_string(), v);
+        let counters = vec![
+            c("local.UnknownDependency", 50),
+            c("unknown_dep.not_recorded", 49),
+            c("unknown_dep.changed", 1),
+        ];
+        let t = format_status(&st("me", 8, 0), &[], &counters, 1000);
+        assert!(
+            t.contains(
+                "49 had a dependency cargo built without crabfarm, 1 one that changed since"
+            ),
+            "{t}"
+        );
+        let t = format_status(&st("me", 8, 0), &[], &[c("local.NoPeer", 2)], 1000);
+        assert!(!t.contains("UnknownDependency:"), "{t}");
     }
 
     #[test]

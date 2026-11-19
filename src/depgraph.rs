@@ -115,6 +115,21 @@ impl DepGraph {
         Ok(())
     }
 
+    /// The files with an entry (`crabfarm doctor`).
+    pub fn paths(&self) -> impl Iterator<Item = &ClientPath> {
+        self.entries.keys()
+    }
+
+    /// `None`: not recorded; `Some(true)`: recorded and unchanged on disk;
+    /// `Some(false)`: changed since it was recorded.
+    pub fn state_of(&self, p: &ClientPath) -> Option<bool> {
+        let e = self.entries.get(p)?;
+        if e.pending_since.is_some() {
+            return Some(true);
+        }
+        Some(stamp(&p.to_local()) == Some((e.size, e.mtime_ns)))
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }

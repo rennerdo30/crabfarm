@@ -615,8 +615,17 @@ fn build_inputs(node: &Node, spec: &JobSpec, info: &SubmitInfo) -> Result<Built,
         }
     })?;
 
-    let closure = lock(&node.depgraph).closure(&info.externs).map_err(|e| {
+    let closure = lock(&node.depgraph).closure(&info.externs);
+    let closure = closure.map_err(|e| {
         tracing::debug!(crate_name = spec.crate_name.as_str(), "{e}");
+        // Which of the two (CF-35): `crabfarm status` and `doctor` explain it.
+        node.count(
+            match e {
+                crate::depgraph::Unknown::NotRecorded(_) => "unknown_dep.not_recorded",
+                crate::depgraph::Unknown::Changed(_) => "unknown_dep.changed",
+            },
+            1,
+        );
         LocalReason::UnknownDependency
     })?;
     let has_proc_macro = closure.iter().any(is_proc_macro_lib);

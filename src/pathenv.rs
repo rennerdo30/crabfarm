@@ -60,11 +60,7 @@ pub fn add(backend: &mut dyn EnvBackend, dir: &str) -> anyhow::Result<Change> {
     };
     refuse_nul(value)?;
     refuse_nul(dir)?;
-    let want = norm(&backend.expand(dir));
-    if value
-        .split(';')
-        .any(|e| norm(e) == norm(dir) || norm(&backend.expand(e)) == want)
-    {
+    if has_entry(&*backend, value, dir) {
         return Ok(Change::Unchanged);
     }
     let new = if value.trim().is_empty() {
@@ -80,6 +76,20 @@ pub fn add(backend: &mut dyn EnvBackend, dir: &str) -> anyhow::Result<Change> {
     backend.write(&PathValue { value: new, expand })?;
     backend.broadcast();
     Ok(Change::Changed)
+}
+
+fn has_entry(backend: &dyn EnvBackend, value: &str, dir: &str) -> bool {
+    let want = norm(&backend.expand(dir));
+    value
+        .split(';')
+        .any(|e| norm(e) == norm(dir) || norm(&backend.expand(e)) == want)
+}
+
+/// Whether the stored PATH has `dir` as an entry (the comparison of [`add`]).
+pub fn contains(backend: &dyn EnvBackend, dir: &str) -> anyhow::Result<bool> {
+    Ok(backend
+        .read()?
+        .is_some_and(|v| has_entry(backend, &v.value, dir)))
 }
 
 /// Remove the entries equal to `dir` and nothing else.

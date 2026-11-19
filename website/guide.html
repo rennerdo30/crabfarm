@@ -87,7 +87,9 @@ crabfarm cache clear    # delete everything the cache holds on this machine</pre
   <p>In <code>config.toml</code>: <code>cache = false</code> turns it off on this machine, <code>cache_entries_max_gb = 10</code> sets its size. Nothing under <code>local_only</code> or <code>sensitive</code> is cached.</p>
 
   <h2>9. If something is wrong</h2>
+  <p>Start with <code>crabfarm doctor</code>: it checks this machine (and the project you run it in) and says how to fix each problem. <code>crabfarm doctor --fix</code> also repairs what is safe to repair, such as starting the node. It never changes PATH, environment variables, the firewall or project files.</p>
   <ul>
+    <li><strong><code>UnknownDependency</code> in <code>local because</code>:</strong> cargo built some dependencies without crabfarm (before you used it, or because <code>RUSTC_WRAPPER</code> is set in the environment, which an sccache setup often does). <code>crabfarm doctor</code> names the cause; then build once from scratch: <code>cargo clean</code>, <code>crabfarm cargo build</code>.</li>
     <li><strong>The node is not running:</strong> <code>crabfarm service status</code>; <code>crabfarm service install</code> to turn autostart on and start it, or <code>crabfarm node</code> in a terminal to see what it says.</li>
     <li><strong>Everything runs locally (<code>NoPeer</code>):</strong> the machines do not see each other. Check the firewall (step 4), the network, or add <code>peers</code> (step 5).</li>
     <li><strong><code>dial-back</code> in the JOBS column of <code>status</code>:</strong> fine. This machine cannot connect to that peer (a work notebook on a VPN, for example), but the peer can reach this machine and opens the job connections. <code>FAILING</code> means neither direction works: check the firewall on both machines and that one can reach the other.</li>
@@ -96,7 +98,10 @@ crabfarm cache clear    # delete everything the cache holds on this machine</pre
     <li><strong>The log:</strong> <code>%APPDATA%\renner\crabfarm\data\logs\node.log</code> holds crate names, sizes and timings, never your code.</li>
   </ul>
 
-  <h2>10. Uninstall</h2>
+  <h2>10. Update</h2>
+  <p><code>crabfarm update</code> downloads the newest release from GitHub and installs it, keeping your PATH and autostart choices; <code>crabfarm update --check</code> only says whether there is one. The download is checked against the release's <code>SHA256SUMS.txt</code>. Update every machine of the farm.</p>
+
+  <h2>11. Uninstall</h2>
   <p>Run <code>crabfarm disable</code> in every project where you used <code>crabfarm enable</code> first (the uninstaller only removes a global entry that points at this install), then Settings, Apps, crabfarm, Uninstall. It stops the node, turns autostart off and removes crabfarm from PATH. Your farm identity and cache stay unless you tick <em>Also delete my farm identity and cache</em>.</p>
 
   <h2>macOS and Linux</h2>

@@ -310,6 +310,27 @@ pub struct Node {
     dialback_sem: Arc<Semaphore>,
 }
 
+/// Close a local connection after its last frame so that frame arrives
+/// (CF-39). Dropping a socket that still has unread input makes Windows send
+/// a reset, and the peer may then lose the frame before reading it. So: end
+/// the write side (FIN after the frame), then read and discard what the peer
+/// already sent, for at most 1 s and 64 KiB, before the socket is dropped.
+async fn close_after_error(mut tcp: tokio::net::TcpStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let _ = tcp.shutdown().await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), async {
+        let mut buf = [0u8; 4096];
+        let mut left = 64 * 1024usize;
+        while left > 0 {
+            match tcp.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => left = left.saturating_sub(n),
+            }
+        }
+    })
+    .await;
+}
+
 pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     // A panic while holding one of these locks leaves plain data behind.
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -1040,6 +1061,7 @@ impl Node {
                                     conn.send(&Message::Error { message }),
                                 )
                                 .await;
+                                close_after_error(conn.stream).await;
                                 return;
                             }
                         }

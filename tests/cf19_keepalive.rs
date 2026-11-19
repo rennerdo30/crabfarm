@@ -161,6 +161,7 @@ async fn a_busy_node_sends_keepalives_while_a_job_waits() {
         .send(&Message::LocalDone {
             code: 0,
             produces: Vec::new(),
+            capture: None,
         })
         .await
         .unwrap();

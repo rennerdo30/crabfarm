@@ -2,6 +2,7 @@
 //! `JobRequest` -> blobs -> rustc -> frames back to the submitter.
 
 use crate::cas::{self, Assembler};
+use crate::ccache::{self, CacheKey, Captured, Entry, EntryOutput};
 use crate::exec::{self, ExecAborted, ExecContext, ExecEvent};
 use crate::link::Link;
 use crate::node::Node;
@@ -130,15 +131,36 @@ impl Node {
         link.set_idle(None);
         let mut peer_gone = false;
         let mut exit_code: Option<i32> = None;
+        // What this job produced, for the farm's compile cache (DESIGN
+        // section 16): never for a job the submitter marked `no_retain` and
+        // never when this node keeps nothing (`retain_blobs = false`).
+        let mut rec = (self.ccache.is_some() && self.cfg.retain_blobs && !spec.no_retain)
+            .then(|| Recorder::new(ccache::cache_key(&spec)));
         loop {
             tokio::select! {
                 ev = erx.recv() => {
                     let Some(ev) = ev else { break };
                     let sent = match ev {
                         ExecEvent::Started => link.send(Message::Started).await,
-                        ExecEvent::Stderr(line) => link.send(Message::Stderr { line }).await,
-                        ExecEvent::Stdout(line) => link.send(Message::Stdout { line }).await,
-                        ExecEvent::Output { path, hash, data } => send_output(link, path, hash, &data).await,
+                        ExecEvent::Stderr(line) => {
+                            if let Some(r) = rec.as_mut() {
+                                r.line(false, &line);
+                            }
+                            link.send(Message::Stderr { line }).await
+                        }
+                        ExecEvent::Stdout(line) => {
+                            if let Some(r) = rec.as_mut() {
+                                r.line(true, &line);
+                            }
+                            link.send(Message::Stdout { line }).await
+                        }
+                        ExecEvent::Output { path, hash, data } => {
+                            let sent = send_output(link, path.clone(), hash, &data).await;
+                            if let Some(r) = rec.as_mut() {
+                                r.output(self, path, hash, data).await;
+                            }
+                            sent
+                        }
                         ExecEvent::Tainted(path) => link.send(Message::Tainted { path }).await,
                         ExecEvent::Exit(code) => {
                             exit_code = Some(code);
@@ -162,6 +184,13 @@ impl Node {
         }
         let outcome = run.await.context("job task panicked")?;
         self.count("served", 1);
+        if let Some(r) = rec
+            && outcome.is_ok()
+            && exit_code == Some(0)
+            && !peer_gone
+        {
+            r.finish(self, &spec).await;
+        }
         match outcome {
             Ok(()) => {
                 tracing::info!(
@@ -258,6 +287,183 @@ async fn receive_blobs_into(
         }
     }
     Ok(())
+}
+
+/// What a job on this node produced, collected as it is sent, to become a
+/// cache entry when the job ends well. Blobs go into the cache store as they
+/// arrive, so nothing but their hashes is kept in memory.
+struct Recorder {
+    key: CacheKey,
+    capture: Captured,
+    line_bytes: usize,
+    ok: bool,
+}
+
+impl Recorder {
+    fn new(key: CacheKey) -> Recorder {
+        Recorder {
+            key,
+            capture: Captured {
+                outputs: Vec::new(),
+                lines: Vec::new(),
+                dep_info: None,
+            },
+            line_bytes: 0,
+            ok: true,
+        }
+    }
+
+    fn line(&mut self, stdout: bool, line: &str) {
+        self.line_bytes += line.len() + 1;
+        if self.line_bytes > ccache::MAX_LINES_BYTES {
+            self.ok = false;
+        } else if self.ok {
+            self.capture.lines.push((stdout, line.to_string()));
+        }
+    }
+
+    async fn output(
+        &mut self,
+        node: &Arc<Node>,
+        path: crate::proto::ClientPath,
+        hash: BlobHash,
+        data: Vec<u8>,
+    ) {
+        if !self.ok {
+            return;
+        }
+        let size = data.len() as u64;
+        let is_dep = path.path.ends_with(".d");
+        let n = node.clone();
+        let kept = tokio::task::spawn_blocking(move || {
+            let put = n
+                .ccache
+                .as_ref()
+                .is_some_and(|c| c.put_blob(&hash, &data).is_ok());
+            (put, is_dep.then(|| String::from_utf8(data).ok()).flatten())
+        })
+        .await;
+        match kept {
+            Ok((true, dep)) => {
+                if dep.is_some() {
+                    self.capture.dep_info = dep;
+                }
+                self.capture.outputs.push(EntryOutput { path, hash, size });
+            }
+            _ => self.ok = false,
+        }
+    }
+
+    async fn finish(self, node: &Arc<Node>, spec: &JobSpec) {
+        if !self.ok {
+            return;
+        }
+        let n = node.clone();
+        let spec = spec.clone();
+        let stored = tokio::task::spawn_blocking(move || {
+            let cc = n.ccache.as_ref()?;
+            let e = ccache::entry_from(&spec, &self.key, self.capture, ccache::Ccache::now())?;
+            cc.store(&self.key, &e).ok()
+        })
+        .await
+        .ok()
+        .flatten();
+        if stored.is_some() {
+            node.count("cache_stored", 1);
+        }
+    }
+}
+
+/// Serve a peer's `CacheFetch` (the first frame of a connection it opened
+/// after a `CacheHave` on the control connection, DESIGN section 16): the
+/// entry is replayed like a finished job. At most [`SERVE_CACHE_LIMIT`] are
+/// served at once, and none when this node keeps no cache (`cache = false` or
+/// `retain_blobs = false`); the answer is then an `Error` and the asker runs
+/// the job normally.
+pub const SERVE_CACHE_LIMIT: usize = 8;
+/// The whole replay of one entry.
+const REPLAY_TOTAL: Duration = Duration::from_secs(600);
+
+impl Node {
+    pub async fn serve_cache(self: &Arc<Self>, link: Link, key: [u8; 32]) {
+        let _permit = self.cache_serve_sem.clone().try_acquire_owned().ok();
+        let ck = CacheKey(key);
+        let node = self.clone();
+        let entry = match (&_permit, self.cache_enabled()) {
+            (Some(_), true) => {
+                tokio::task::spawn_blocking(move || node.ccache.as_ref()?.lookup(&ck))
+                    .await
+                    .ok()
+                    .flatten()
+            }
+            _ => None,
+        };
+        let Some(entry) = entry else {
+            let _ = link
+                .send(Message::Error {
+                    message: "no such cache entry".into(),
+                })
+                .await;
+            link.close().await;
+            return;
+        };
+        let node = self.clone();
+        let e2 = entry.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            let cc = node.ccache.as_ref()?;
+            match cc.load(&e2) {
+                Ok(f) => Some(f),
+                Err(err) => {
+                    // Tampered or half-evicted: the entry goes, the asker runs normally.
+                    tracing::info!("cache entry unusable: {err:#}");
+                    cc.forget(&ck, &e2);
+                    None
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some(files) = loaded else {
+            let _ = link
+                .send(Message::Error {
+                    message: "cache entry unusable".into(),
+                })
+                .await;
+            link.close().await;
+            return;
+        };
+        let sent = tokio::time::timeout(REPLAY_TOTAL, replay_entry(&link, &entry, &files)).await;
+        if matches!(sent, Ok(Ok(()))) {
+            self.count("cache_served", 1);
+        }
+        link.close().await;
+    }
+}
+
+/// Send a cache entry the way an executor sends a finished job: `Started`,
+/// every output file (`Output` + chunks), the recorded lines, `Exit { 0 }`.
+/// The files come first, so the submitter has each one before the line that
+/// announces it.
+pub(crate) async fn replay_entry(
+    link: &Link,
+    entry: &Entry,
+    files: &[Vec<u8>],
+) -> anyhow::Result<()> {
+    link.send(Message::Started).await?;
+    for (o, data) in entry.outputs.iter().zip(files) {
+        send_output(link, o.path.clone(), o.hash, data).await?;
+    }
+    for (stdout, line) in &entry.lines {
+        let line = line.clone();
+        link.send(if *stdout {
+            Message::Stdout { line }
+        } else {
+            Message::Stderr { line }
+        })
+        .await?;
+    }
+    link.send(Message::Exit { code: 0 }).await
 }
 
 /// `Output` followed by its chunks; the submitter writes the file before it

@@ -455,10 +455,25 @@ const PKG_SUFFIXES: [&str; 14] = [
     "README",
 ];
 
+/// The minimum OS version rustc bakes into the objects of an Apple target is
+/// read from these variables (rustc_target `apple::deployment_target`), so the
+/// output depends on them: they travel with a job when the submitter has them
+/// set, are part of the compile-cache key, and a peer's own value never reaches
+/// a job (`exec::is_build_var`). They are harmless numbers; for other targets
+/// rustc ignores them.
+pub const APPLE_DEPLOYMENT_VARS: [&str; 5] = [
+    "MACOSX_DEPLOYMENT_TARGET",
+    "IPHONEOS_DEPLOYMENT_TARGET",
+    "TVOS_DEPLOYMENT_TARGET",
+    "WATCHOS_DEPLOYMENT_TARGET",
+    "XROS_DEPLOYMENT_TARGET",
+];
+
 /// The variables a job gets from the submitter without anybody listing them
 /// (CF-18, DESIGN section 9). Allow-list, matched case-insensitively (Windows
 /// environment names are):
 ///
+/// - the Apple deployment-target variables ([`APPLE_DEPLOYMENT_VARS`]);
 /// - what cargo sets for the crates it compiles ("Environment variables Cargo
 ///   sets for crates", doc.rust-lang.org/cargo/reference/environment-variables.html):
 ///   `CARGO`, `CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_PATH`, `CARGO_MANIFEST_LINKS`,
@@ -479,6 +494,9 @@ const PKG_SUFFIXES: [&str; 14] = [
 /// `CARGO_MAKEFLAGS` is machine-local (jobserver handles) and never sent.
 pub fn design_env(name: &str) -> bool {
     let up = name.to_ascii_uppercase();
+    if APPLE_DEPLOYMENT_VARS.contains(&up.as_str()) {
+        return true;
+    }
     if matches!(
         up.as_str(),
         "CARGO"

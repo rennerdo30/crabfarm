@@ -3,7 +3,7 @@
 use crate::proto::ToolchainId;
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -126,12 +126,18 @@ struct InstallState {
     pid: Option<u32>,
 }
 
+/// Built-in target names by compiler build (release, commit hash).
+type TargetLists = HashMap<(String, String), Arc<HashSet<String>>>;
+
 struct Inner {
     data_dir: PathBuf,
     auto_install: bool,
     /// Most toolchains this node installs on its own (`max_auto_toolchains`).
     max_auto: usize,
     state: Mutex<State>,
+    /// `rustc --print target-list` per compiler build (release, commit hash),
+    /// asked once (CF-28 R2).
+    target_lists: Mutex<TargetLists>,
 }
 
 /// Executing-peer toolchain registry. Thread-safe; installs run in the
@@ -196,6 +202,7 @@ impl Toolchains {
                     auto,
                     ..State::default()
                 }),
+                target_lists: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -224,6 +231,58 @@ impl Toolchains {
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         // A panic while holding the lock leaves plain data behind; keep going.
         self.inner.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether `target` is one of the targets `rustc` ships with: it appears
+    /// in `rustc --print target-list` of the installed toolchain `id` (a JSON
+    /// specification or any custom name does not). False when the toolchain is
+    /// not installed here or the list cannot be read: the compile cache then
+    /// stays out of it (CF-28 R2). Runs rustc once per toolchain, so call it
+    /// off the async threads.
+    pub fn is_builtin_target(&self, id: &ToolchainId, target: &str) -> bool {
+        let key = (id.release.clone(), id.commit_hash.clone());
+        let cached = self
+            .inner
+            .target_lists
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned();
+        let list = match cached {
+            Some(l) => l,
+            None => {
+                let Some(rustc) = self
+                    .lock()
+                    .installed
+                    .iter()
+                    .find(|t| t.id.same_compiler(id))
+                    .map(|t| t.rustc.clone())
+                else {
+                    return false;
+                };
+                let mut cmd = Command::new(rustc);
+                cmd.args(["--print", "target-list"]);
+                let Ok(out) = run_capture(cmd, QUERY_TIMEOUT) else {
+                    return false;
+                };
+                let l: Arc<HashSet<String>> = Arc::new(
+                    out.lines()
+                        .map(|l| l.trim().to_string())
+                        .filter(|l| !l.is_empty())
+                        .collect(),
+                );
+                if l.is_empty() {
+                    return false;
+                }
+                self.inner
+                    .target_lists
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key, l.clone());
+                l
+            }
+        };
+        list.contains(target)
     }
 
     /// Installed toolchains for `Status`.
@@ -1092,6 +1151,14 @@ mod tests {
             hit.targets
         );
         assert!(tc.resolve(&active, &active.host).is_some());
+        // CF-28 R2: only built-in target names may use the compile cache.
+        assert!(tc.is_builtin_target(&active, &active.host));
+        assert!(tc.is_builtin_target(&active, &active.host), "cached ask");
+        assert!(!tc.is_builtin_target(&active, "custom-target.json"));
+        assert!(!tc.is_builtin_target(&active, "my-own-target"));
+        let mut other = active.clone();
+        other.commit_hash = "0".repeat(40);
+        assert!(!tc.is_builtin_target(&other, &active.host), "not installed");
         // Second scan is served from the cache file and agrees.
         assert!(d.path().join("toolchains.toml").is_file());
         let again = Toolchains::scan(d.path(), false).unwrap();

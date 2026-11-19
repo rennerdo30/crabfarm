@@ -116,6 +116,7 @@ pub fn format_status(
         "pipelining: {} artifact notices relayed before their job ended\n",
         counter(counters, "early_notices"),
     ));
+    out.push_str(&cache_line(counters));
     out.push_str(&format!(
         "traffic: {} up, {} down, {} jobs served for peers\n",
         mib(counter(counters, "bytes_up")),
@@ -123,6 +124,77 @@ pub fn format_status(
         counter(counters, "served")
     ));
     out
+}
+
+/// The compile cache line of `crabfarm status` and `crabfarm cache stats`
+/// (DESIGN section 16): hits (this node / the farm), misses, output reused.
+pub fn cache_line(counters: &[(String, u64)]) -> String {
+    if counter(counters, "cache_enabled") == 0 {
+        return "compile cache: off
+"
+        .to_string();
+    }
+    let local = counter(counters, "cache_hit_local");
+    let farm = counter(counters, "cache_hit_farm");
+    format!(
+        "compile cache: {} hits ({} local, {} farm), {} misses, {} of rustc output reused, {} stored, {} served to peers, {} unusable, {} local results not cached: they may depend on more than the key covers
+",
+        local + farm,
+        local,
+        farm,
+        counter(counters, "cache_miss"),
+        mib(counter(counters, "cache_bytes_saved")),
+        counter(counters, "cache_stored"),
+        counter(counters, "cache_served"),
+        counter(counters, "cache_corrupt") + counter(counters, "cache_error"),
+        counter(counters, "cache_local_skipped"),
+    )
+}
+
+/// `crabfarm cache stats`: what is on disk, and the node's counters when it runs.
+pub fn cache_stats() -> i32 {
+    let Ok(data_dir) = config::data_dir() else {
+        eprintln!("crabfarm: cannot find the data directory");
+        return 1;
+    };
+    let cfg = config::Config::load(&data_dir).unwrap_or_default();
+    let u = crate::ccache::disk_usage(&data_dir);
+    println!(
+        "{} entries, {} files, {} on disk (limit {} GB, config `cache = {}`)",
+        u.entries,
+        u.blobs,
+        mib(u.bytes),
+        cfg.cache_entries_max_gb,
+        cfg.cache
+    );
+    match query_status(&data_dir) {
+        Some(Message::FarmStatus { counters, .. }) => print!("{}", cache_line(&counters)),
+        _ => println!("The node is not running, so there are no hit counters."),
+    }
+    0
+}
+
+/// `crabfarm cache clear`: delete every entry and file.
+pub fn cache_clear() -> i32 {
+    let Ok(data_dir) = config::data_dir() else {
+        eprintln!("crabfarm: cannot find the data directory");
+        return 1;
+    };
+    match crate::ccache::clear(&data_dir) {
+        Ok(u) => {
+            println!(
+                "Removed {} entries ({} files, {}).",
+                u.entries,
+                u.blobs,
+                mib(u.bytes)
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("crabfarm: {e:#}");
+            1
+        }
+    }
 }
 
 /// The line shown while wrappers skip the node because one of them found it
@@ -181,6 +253,34 @@ mod tests {
             targets: vec![],
             accepting: true,
         }
+    }
+
+    #[test]
+    fn the_cache_line_shows_hits_misses_and_savings_or_that_it_is_off() {
+        assert_eq!(
+            cache_line(&[]),
+            "compile cache: off
+"
+        );
+        let c = |k: &str, v: u64| (k.to_string(), v);
+        let line = cache_line(&[
+            c("cache_enabled", 1),
+            c("cache_hit_local", 5),
+            c("cache_hit_farm", 2),
+            c("cache_miss", 3),
+            c("cache_bytes_saved", 4 * 1024 * 1024),
+            c("cache_local_skipped", 6),
+        ]);
+        assert!(
+            line.contains("7 hits (5 local, 2 farm), 3 misses, 4.0 MiB"),
+            "{line}"
+        );
+        assert!(
+            line.trim_end().ends_with(
+                "6 local results not cached: they may depend on more than the key covers"
+            ),
+            "{line}"
+        );
     }
 
     #[test]

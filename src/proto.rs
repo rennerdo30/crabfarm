@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bump on any incompatible change to these types.
-pub const PROTO_VERSION: u16 = 5;
+pub const PROTO_VERSION: u16 = 6;
 /// Maximum encoded frame size in bytes.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// Blob transfer chunk size (plaintext bytes before compression).
@@ -228,6 +228,10 @@ pub enum Message {
         node_cert_der: Vec<u8>,
         ca_cert_der: Vec<u8>,
         known_peers: Vec<PeerInfo>,
+        /// Added in protocol 6 (CF-28): the farm's compile-cache secret,
+        /// generated once at `farm create`. Every member derives the key that
+        /// encrypts cache entries from it (DESIGN section 16).
+        cache_key: [u8; 32],
     },
 
     // ---- control connection between peers ----
@@ -290,6 +294,10 @@ pub enum Message {
     // ---- IPC (wrapper <-> local node) ----
     IpcAuth {
         token: [u8; 32],
+        /// [`PROTO_VERSION`] of the wrapper or command (added in protocol 6,
+        /// CF-28): the node refuses another version with a clear error
+        /// instead of misreading its frames.
+        proto: u16,
     },
     /// Wrapper -> node: a classified invocation. The node fills in inputs
     /// from `spec.args` and decides where it runs.
@@ -322,6 +330,10 @@ pub enum Message {
     LocalDone {
         code: i32,
         produces: Vec<ClientPath>,
+        /// Added in protocol 6 (CF-28): what the wrapper saw rustc print, sent
+        /// only when this run may enter the compile cache (exit 0, nothing
+        /// outside the key was read, output complete and valid text).
+        capture: Option<LocalCapture>,
     },
     /// Wrapper -> node: request `Status` of all peers (crabfarm status).
     QueryStatus,
@@ -356,6 +368,36 @@ pub enum Message {
     /// encoding of every earlier variant is unchanged): shut down cleanly.
     /// `crabfarm node --stop` sends it; the node ignores it from any peer.
     Shutdown,
+
+    // ---- compile cache (protocol 6, CF-28) ----
+    /// Peer -> peer on the authenticated CONTROL connection (a few may be in
+    /// flight at once; answers are matched by `key`): does the receiver hold
+    /// a cache entry for `key`? Answered with `CacheHave` or `CacheMiss`.
+    CacheQuery {
+        key: [u8; 32],
+    },
+    CacheHave {
+        key: [u8; 32],
+        /// Total size of the entry's output files.
+        bytes: u64,
+    },
+    CacheMiss {
+        key: [u8; 32],
+    },
+    /// Asker -> holder, first frame of a fresh connection opened after a
+    /// `CacheHave`: send the entry. The holder answers like an executor:
+    /// `Started`, `Output` + `BlobChunk`s and the recorded `Stderr`/`Stdout`
+    /// lines, then `Exit { code: 0 }`; or `Error`.
+    CacheFetch {
+        key: [u8; 32],
+    },
+}
+
+/// The output of a local rustc run, for the compile cache: lines in the order
+/// rustc printed them (`true` = stdout).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
+pub struct LocalCapture {
+    pub lines: Vec<(bool, String)>,
 }
 
 /// Escape and truncate (200 characters) a string that came from a peer before
@@ -447,12 +489,14 @@ impl std::fmt::Debug for Message {
                 node_cert_der,
                 ca_cert_der,
                 known_peers,
+                cache_key: _,
             } => f
                 .debug_struct("JoinAccepted")
                 .field("node_id", node_id)
                 .field("node_cert_der", &Len(node_cert_der.len()))
                 .field("ca_cert_der", &Len(ca_cert_der.len()))
                 .field("known_peers", &known_peers.len())
+                .field("cache_key", &Redacted)
                 .finish(),
             Message::PeerList { peers } => f
                 .debug_struct("PeerList")
@@ -507,7 +551,11 @@ impl std::fmt::Debug for Message {
             Message::Tainted { path } => f.debug_struct("Tainted").field("path", path).finish(),
             Message::Keepalive => f.write_str("Keepalive"),
             Message::Shutdown => f.write_str("Shutdown"),
-            Message::IpcAuth { .. } => f.debug_struct("IpcAuth").field("token", &Redacted).finish(),
+            Message::IpcAuth { proto, .. } => f
+                .debug_struct("IpcAuth")
+                .field("token", &Redacted)
+                .field("proto", proto)
+                .finish(),
             Message::Submit {
                 spec,
                 rustc,
@@ -531,11 +579,22 @@ impl std::fmt::Debug for Message {
             Message::RunLocal { reason } => {
                 f.debug_struct("RunLocal").field("reason", reason).finish()
             }
-            Message::LocalDone { code, produces } => f
+            Message::LocalDone {
+                code,
+                produces,
+                capture,
+            } => f
                 .debug_struct("LocalDone")
                 .field("code", code)
                 .field("produces", &produces.len())
+                .field("capture", &capture.as_ref().map(|c| c.lines.len()))
                 .finish(),
+            Message::CacheQuery { .. } => f.write_str("CacheQuery"),
+            Message::CacheHave { bytes, .. } => {
+                f.debug_struct("CacheHave").field("bytes", bytes).finish()
+            }
+            Message::CacheMiss { .. } => f.write_str("CacheMiss"),
+            Message::CacheFetch { .. } => f.write_str("CacheFetch"),
             Message::QueryStatus => f.write_str("QueryStatus"),
             Message::FarmStatus {
                 local,
@@ -571,7 +630,13 @@ mod tests {
         );
         assert!(!join.contains("171") && !join.contains("ab"), "{join}");
         assert!(join.contains("beta") && join.contains("redacted"));
-        let ipc = format!("{:?}", Message::IpcAuth { token: [200; 32] });
+        let ipc = format!(
+            "{:?}",
+            Message::IpcAuth {
+                token: [200; 32],
+                proto: PROTO_VERSION
+            }
+        );
         assert!(!ipc.contains("200"), "{ipc}");
         let mut key = [0u8; 32];
         key[0] = 77;

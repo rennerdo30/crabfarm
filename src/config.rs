@@ -19,6 +19,11 @@ pub struct Config {
     pub sensitive: Vec<String>,
     pub retain_blobs: bool,
     pub cache_max_gb: u64,
+    /// The compile cache (DESIGN section 16, CF-28): store every successful
+    /// eligible rustc result and reuse it here and on peers.
+    pub cache: bool,
+    /// Size limit of the compile cache's own store, in GB (LRU eviction).
+    pub cache_entries_max_gb: u64,
     pub job_timeout_min: u64,
     pub forward_env: Vec<String>,
     /// Variable names this node accepts from submitters beyond cargo's own
@@ -62,6 +67,8 @@ impl Default for Config {
             sensitive: Vec::new(),
             retain_blobs: true,
             cache_max_gb: 20,
+            cache: true,
+            cache_entries_max_gb: 10,
             job_timeout_min: 30,
             forward_env: Vec::new(),
             accept_env: Vec::new(),
@@ -108,6 +115,20 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_compile_cache_is_on_by_default_with_ten_gb() {
+        let c = Config::default();
+        assert!(c.cache);
+        assert_eq!(c.cache_entries_max_gb, 10);
+        let off: Config = toml::from_str(
+            "cache = false
+cache_entries_max_gb = 2",
+        )
+        .unwrap();
+        assert!(!off.cache);
+        assert_eq!(off.cache_entries_max_gb, 2);
+    }
 
     /// CF-25: build-script variables are accepted unless the operator opts out.
     #[test]

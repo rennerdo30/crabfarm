@@ -166,6 +166,7 @@ fn is_build_var(name: &str) -> bool {
         || n.starts_with("RUSTC")
         || n.starts_with("RUSTDOC")
         || n.starts_with("DEP_")
+        || crate::guard::APPLE_DEPLOYMENT_VARS.contains(&n.as_str())
         || matches!(
             n.as_str(),
             "RUSTFLAGS"
@@ -1818,6 +1819,9 @@ fn main() {
             "MAKEFLAGS",
             "MFLAGS",
             "CARGO_MAKEFLAGS",
+            // CF-28: the peer's own deployment target must not reach a job.
+            "MACOSX_DEPLOYMENT_TARGET",
+            "iphoneos_deployment_target",
         ] {
             assert!(is_build_var(n), "{n}");
         }

@@ -38,6 +38,10 @@ pub struct Identity {
     pub ca_key_der: Option<Vec<u8>>,
     /// Submitter blob key (DESIGN section 3, at rest).
     pub blob_key: [u8; 32],
+    /// The farm's compile-cache secret (CF-28): the same on every member, made
+    /// at `farm create` and handed out in `JoinAccepted`. `None` only on a node
+    /// that joined before the cache existed; it then runs without the cache.
+    pub cache_key: Option<[u8; 32]>,
 }
 
 // Hand-written so that keys can never end up in a log through `{:?}`.
@@ -108,6 +112,7 @@ struct IdentityPaths {
     node_crt: PathBuf,
     node_id: PathBuf,
     blob_key: PathBuf,
+    cache_key: PathBuf,
 }
 
 fn paths(data_dir: &Path) -> IdentityPaths {
@@ -118,6 +123,7 @@ fn paths(data_dir: &Path) -> IdentityPaths {
         node_crt: data_dir.join("node.crt"),
         node_id: data_dir.join("node.id"),
         blob_key: data_dir.join("blob.key"),
+        cache_key: data_dir.join("cache.key"),
     }
 }
 
@@ -298,6 +304,9 @@ impl Identity {
         }
         write_private(&p.node_key, &self.node_key_der)?;
         write_private(&p.blob_key, &self.blob_key)?;
+        if let Some(k) = &self.cache_key {
+            write_private(&p.cache_key, k)?;
+        }
         write_private(&p.node_id, self.node_id.to_hex().as_bytes())?;
         // Written last: its presence marks a complete identity (`load`).
         write_private(&p.node_crt, &self.node_cert_der)?;
@@ -326,6 +335,7 @@ pub fn create(data_dir: &Path, node_name: &str) -> anyhow::Result<Identity> {
         ca_cert_der,
         ca_key_der: Some(ca_kp.serialize_der()),
         blob_key: random_bytes(),
+        cache_key: Some(random_bytes()),
     };
     id.node_cert_der = sign_node_cert(&id, node_name, id.node_id, node_kp.public_key_raw())?;
     id.write_files(data_dir)?;
@@ -350,14 +360,30 @@ pub fn load(data_dir: &Path) -> anyhow::Result<Option<Identity>> {
     let blob_key: [u8; 32] = read_req(&p.blob_key)?
         .try_into()
         .map_err(|_| anyhow::anyhow!("blob.key is not 32 bytes"))?;
+    let ca_key_der = read_opt(&p.ca_key)?;
+    let mut cache_key: Option<[u8; 32]> = match read_opt(&p.cache_key)? {
+        Some(b) => Some(
+            b.try_into()
+                .map_err(|_| anyhow::anyhow!("cache.key is not 32 bytes"))?,
+        ),
+        None => None,
+    };
+    // A farm created before the cache existed: its CA node makes the secret
+    // once; other members get it only by joining again.
+    if cache_key.is_none() && ca_key_der.is_some() {
+        let k: [u8; 32] = random_bytes();
+        write_private(&p.cache_key, &k)?;
+        cache_key = Some(k);
+    }
     let id = Identity {
         node_id,
         node_name: node_name_from_cert(&node_cert_der)?,
         node_key_der: read_req(&p.node_key)?,
         node_cert_der,
         ca_cert_der: read_req(&p.ca_crt)?,
-        ca_key_der: read_opt(&p.ca_key)?,
+        ca_key_der,
         blob_key,
+        cache_key,
     };
     ensure!(
         node_id_from_cert(&id.node_cert_der)? == id.node_id,
@@ -649,6 +675,9 @@ pub fn handle_join(
         node_cert_der,
         ca_cert_der: id.ca_cert_der.clone(),
         known_peers,
+        // `load` gives every CA node a key; the all-zero fallback cannot be
+        // reached in practice and is refused by the joiner.
+        cache_key: id.cache_key.unwrap_or([0; 32]),
     })
 }
 
@@ -665,6 +694,7 @@ pub(crate) fn install_join_response(
     node_kp: &KeyPair,
     node_cert_der: Vec<u8>,
     ca_cert_der: Vec<u8>,
+    cache_key: [u8; 32],
 ) -> anyhow::Result<Identity> {
     {
         let (_, ca) = x509_parser::parse_x509_certificate(&ca_cert_der)
@@ -685,6 +715,7 @@ pub(crate) fn install_join_response(
         node_id_from_cert(&node_cert_der)? == node_id,
         "node certificate is for a different node id"
     );
+    ensure!(cache_key != [0; 32], "the inviter sent no cache key");
     let id = Identity {
         node_id,
         node_name: node_name.to_string(),
@@ -693,6 +724,7 @@ pub(crate) fn install_join_response(
         ca_cert_der,
         ca_key_der: None,
         blob_key: random_bytes(),
+        cache_key: Some(cache_key),
     };
     id.write_files(data_dir)?;
     Ok(id)
@@ -751,13 +783,14 @@ pub async fn join(
     let reply = tokio::time::timeout(Duration::from_secs(10), conn.recv())
         .await
         .context("join reply timed out")??;
-    let (node_id, node_cert_der, ca_cert_der, mut known_peers) = match reply {
+    let (node_id, node_cert_der, ca_cert_der, mut known_peers, cache_key) = match reply {
         Some(Message::JoinAccepted {
             node_id,
             node_cert_der,
             ca_cert_der,
             known_peers,
-        }) => (node_id, node_cert_der, ca_cert_der, known_peers),
+            cache_key,
+        }) => (node_id, node_cert_der, ca_cert_der, known_peers, cache_key),
         Some(Message::Error { message }) => {
             bail!("join refused: {}", crate::proto::log_safe(&message))
         }
@@ -773,6 +806,7 @@ pub async fn join(
         &node_kp,
         node_cert_der,
         ca_cert_der,
+        cache_key,
     )?;
     known_peers.retain(|p| p.node_id != inviter_id && p.node_id != id.node_id);
     known_peers.push(PeerInfo {
@@ -1071,14 +1105,26 @@ mod tests {
             node_id,
             node_cert_der,
             ca_cert_der,
+            cache_key,
             ..
         } = handle_join(&ca_node, &mut inv, a.path(), &req(t, pk.clone(), "beta")).unwrap()
         else {
             panic!("expected JoinAccepted")
         };
-        let joined =
-            install_join_response(b.path(), "beta", node_id, &kp, node_cert_der, ca_cert_der)
-                .unwrap();
+        // CF-28: the joiner gets the farm's cache secret, the same as the CA's.
+        assert_eq!(Some(cache_key), ca_node.cache_key);
+        let joined = install_join_response(
+            b.path(),
+            "beta",
+            node_id,
+            &kp,
+            node_cert_der,
+            ca_cert_der,
+            cache_key,
+        )
+        .unwrap();
+        assert_eq!(joined.cache_key, Some(cache_key));
+        assert_eq!(load(b.path()).unwrap().unwrap().cache_key, Some(cache_key));
         let t = inv.issue(b.path()).unwrap();
         let reply = handle_join(&joined, &mut inv, b.path(), &req(t, pk.clone(), "gamma")).unwrap();
         assert!(matches!(reply, Message::Error { .. }));
@@ -1141,7 +1187,7 @@ mod tests {
         let ok_cert = sign_node_cert(&ca_node, "me", nid, mine.public_key_raw()).unwrap();
         let try_install = |cert: Vec<u8>, ca: Vec<u8>, nid: NodeId, kp: &KeyPair| {
             let d = tempfile::tempdir().unwrap();
-            let r = install_join_response(d.path(), "me", nid, kp, cert, ca);
+            let r = install_join_response(d.path(), "me", nid, kp, cert, ca, [7; 32]);
             (r.is_ok(), load(d.path()).unwrap().is_some())
         };
         assert_eq!(

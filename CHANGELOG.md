@@ -4,7 +4,7 @@
 
 First release, 1.0.0 (Windows to Windows farms).
 
-- **Binaries:** `crabfarm` (`node`, `farm create|invite|join`, `cargo <args>`, `status`, and the rustc wrapper mode that cargo calls), `crabfarmd` (the node without a console window) and `cargo-crabfarm` (`cargo crabfarm build` = `crabfarm cargo build`).
+- **Binaries:** `crabfarm` (`node`, `farm create|invite|join|leave`, `cargo <args>`, `status`, and the rustc wrapper mode that cargo calls), `crabfarmd` (the node without a console window) and `cargo-crabfarm` (`cargo crabfarm build` = `crabfarm cargo build`).
 - **Farm identity:** a farm CA created on the first machine; machines join with a one-time join code (valid 10 minutes, single use) and get their own certificate.
 - **Transport:** mutually authenticated TLS 1.3 between farm members only; no plaintext or anonymous mode. The local wrapper talks to the node over loopback with a per-start random token.
 - **Distribution:** library crates compile on whichever machine has free capacity; linking, build scripts and anything unusual stay local, so the output matches a local build.

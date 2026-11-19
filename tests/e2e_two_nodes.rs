@@ -132,13 +132,17 @@ fn write_config(
     home: &Path,
     name: &str,
     port: u16,
-    peer_port: u16,
+    peer_port: Option<u16>,
     local_slots: u32,
     prefer_remote: bool,
 ) {
     std::fs::create_dir_all(home).expect("home");
+    let peers = match peer_port {
+        Some(p) => format!("[\"127.0.0.1:{p}\"]"),
+        None => "[]".to_string(),
+    };
     let text = format!(
-        "node_name = \"{name}\"\nlisten = \"127.0.0.1:{port}\"\npeers = [\"127.0.0.1:{peer_port}\"]\nmdns = false\nslots = 4\nlocal_slots = {local_slots}\nprefer_remote = {prefer_remote}\nauto_install = false\n"
+        "node_name = \"{name}\"\nlisten = \"127.0.0.1:{port}\"\npeers = {peers}\nmdns = false\nslots = 4\nlocal_slots = {local_slots}\nprefer_remote = {prefer_remote}\nauto_install = false\n"
     );
     std::fs::write(home.join("config.toml"), text).expect("config");
 }
@@ -232,8 +236,8 @@ fn two_nodes_build_the_fixture_remotely() {
     );
 
     let (p1, p2) = (free_port(), free_port());
-    write_config(&home1, "node-one", p1, p2, 1, true);
-    write_config(&home2, "node-two", p2, p1, 2, false);
+    write_config(&home1, "node-one", p1, Some(p2), 1, true);
+    write_config(&home2, "node-two", p2, Some(p1), 2, false);
 
     // Farm on node one, node two joins with an invite.
     let mut c = crabfarm(&home1);
@@ -453,4 +457,87 @@ fn two_nodes_build_the_fixture_remotely() {
         "the failing crate should have been judged by a local rerun:\n{}",
         st.stdout
     );
+}
+
+/// CF-34: node one cannot open any connection to node two (it has no usable
+/// address for it: no static peer, and gossiped loopback addresses are not
+/// taken), while node two connects to node one. That is the notebook-on-a-VPN
+/// case. Jobs must still run on node two: node one asks it over the control
+/// connection to dial back.
+#[test]
+fn one_way_reachability_runs_jobs_over_dial_back() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home1 = tmp.path().join("home1");
+    let home2 = tmp.path().join("home2");
+    let work = tmp.path().join("work");
+    let target = tmp.path().join("target");
+    copy_dir(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixture"),
+        &work,
+    );
+
+    let (p1, p2) = (free_port(), free_port());
+    write_config(&home1, "node-one", p1, None, 1, true);
+    write_config(&home2, "node-two", p2, Some(p1), 2, false);
+
+    let mut c = crabfarm(&home1);
+    c.args(["farm", "create", "--name", "node-one"]);
+    assert!(run(c, 60).ok, "farm create failed");
+    let _node1 = start_node(&home1);
+    let mut c = crabfarm(&home1);
+    c.args(["farm", "invite", "--addr"])
+        .arg(format!("127.0.0.1:{p1}"));
+    let invite = run(c, 30);
+    assert!(invite.ok, "farm invite failed: {}", invite.stderr);
+    let code = invite.stdout.trim().to_string();
+    let mut c = crabfarm(&home2);
+    c.args(["farm", "join", &code, "--name", "node-two"]);
+    assert!(run(c, 60).ok, "farm join failed");
+    let _node2 = start_node(&home2);
+
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let mut c = crabfarm(&home1);
+        c.arg("status");
+        let st = run(c, 20);
+        if st.stdout.contains("1 of 1 peers online") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "peers never connected:\n{}\nnode one log:\n{}\nnode two log:\n{}",
+            st.stdout,
+            node_log(&home1),
+            node_log(&home2)
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    let b = cargo_build(&home1, &work, &target);
+    let mut c = crabfarm(&home1);
+    c.arg("status");
+    let st = run(c, 20);
+    let dump = format!(
+        "status:\n{}\nstderr:\n{}\nnode one log:\n{}\nnode two log:\n{}",
+        st.stdout,
+        b.stderr,
+        node_log(&home1),
+        node_log(&home2)
+    );
+    assert!(b.ok, "build failed\n{dump}");
+    let remote_ok = counter(&st.stdout, "remote ok");
+    assert!(
+        remote_ok >= 3,
+        "jobs did not run on the peer that only connects one way ({remote_ok})\n{dump}"
+    );
+    let row = st
+        .stdout
+        .lines()
+        .find(|l| l.starts_with("node-two"))
+        .unwrap_or_else(|| panic!("no row for node-two\n{dump}"));
+    assert!(row.contains("dial-back"), "JOBS column: {row}\n{dump}");
+    let run_app = run(Command::new(app_binary(&target)), 30);
+    assert!(run_app.ok, "app failed to run");
 }

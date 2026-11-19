@@ -7,6 +7,7 @@ First release, 1.0.0 (Windows to Windows farms).
 - **Binaries:** `crabfarm` (`node`, `farm create|invite|join|leave`, `cargo <args>`, `status`, and the rustc wrapper mode that cargo calls), `crabfarmd` (the node without a console window) and `cargo-crabfarm` (`cargo crabfarm build` = `crabfarm cargo build`).
 - **Farm identity:** a farm CA created on the first machine; machines join with a one-time join code (valid 10 minutes, single use) and get their own certificate.
 - **Transport:** mutually authenticated TLS 1.3 between farm members only; no plaintext or anonymous mode. The local wrapper talks to the node over loopback with a per-start random token.
+- **One-way networks (CF-34):** when this machine cannot connect to a peer (a notebook on a work VPN, NAT) but the peer can connect here, job and cache connections are opened by the peer on request (dial-back over the existing control connection). `crabfarm status` shows per peer how jobs reach it (`direct`, `dial-back`, `FAILING`) and warns when neither works. Protocol 7.
 - **Distribution:** library crates compile on whichever machine has free capacity; linking, build scripts and anything unusual stay local, so the output matches a local build.
 - **Cached inputs:** blobs kept on other machines are encrypted with the submitting machine's key; job sandboxes are deleted when the job ends.
 - **Cargo pipelining:** metadata and dep-info results are relayed as soon as they exist, so cargo can start dependent crates before the full build finishes.

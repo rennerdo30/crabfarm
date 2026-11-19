@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bump on any incompatible change to these types.
-pub const PROTO_VERSION: u16 = 6;
+pub const PROTO_VERSION: u16 = 7;
 /// Maximum encoded frame size in bytes.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// Blob transfer chunk size (plaintext bytes before compression).
@@ -391,6 +391,21 @@ pub enum Message {
     CacheFetch {
         key: [u8; 32],
     },
+
+    // ---- dial-back (protocol 7, CF-34) ----
+    /// Peer -> peer on the authenticated CONTROL connection: "a connection
+    /// from me to you does not get through; open one to me". The receiver
+    /// connects to the sender's own known addresses (the message carries
+    /// none), proves it is the expected farm member with mutual TLS as usual
+    /// and sends `Dialed { token }` first. The sender then uses that
+    /// connection as if it had opened it: `Reserve` or `CacheFetch` next.
+    DialBack {
+        token: [u8; 16],
+    },
+    /// First frame on a connection opened because of a `DialBack`.
+    Dialed {
+        token: [u8; 16],
+    },
 }
 
 /// The output of a local rustc run, for the compile cache: lines in the order
@@ -595,6 +610,11 @@ impl std::fmt::Debug for Message {
             }
             Message::CacheMiss { .. } => f.write_str("CacheMiss"),
             Message::CacheFetch { .. } => f.write_str("CacheFetch"),
+            Message::DialBack { .. } => f
+                .debug_struct("DialBack")
+                .field("token", &Redacted)
+                .finish(),
+            Message::Dialed { .. } => f.debug_struct("Dialed").field("token", &Redacted).finish(),
             Message::QueryStatus => f.write_str("QueryStatus"),
             Message::FarmStatus {
                 local,

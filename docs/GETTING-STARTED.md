@@ -172,8 +172,9 @@ In `config.toml`: `cache = false` turns it off on this machine, `cache_entries_m
 
 - **`the node is not running`**: run `crabfarm service status`. If autostart is off: `crabfarm service install`. Or start it by hand in a terminal with `crabfarm node` and read what it says.
 - **Everything runs locally (`NoPeer`)**: the machines do not see each other. Check the firewall (step 4), that both are on the same network, or add `peers` (step 5).
+- **`status` shows `dial-back` in the JOBS column**: fine. This machine cannot open connections to that peer (typical for a work notebook on a VPN), but the peer can reach this machine, so it opens the job connections. `FAILING` means neither direction works: check the firewall on both machines (step 4) and that one machine can reach the other's address.
 - **First build is slow**: the first time, the desktop may have to install the Rust version your project needs (via `rustup`). That can take a few minutes once.
-- **Version mismatch**: an error like `peer speaks protocol 5, this node speaks 6` means two machines run different crabfarm versions. Install the same version on both.
+- **Version mismatch**: an error like `peer speaks protocol 6, this node speaks 7` means two machines run different crabfarm versions. Install the same version on both.
 - **The log**: `%APPDATA%\renner\crabfarm\data\logs\node.log`. If the node does not start at all, the reason is the last lines of that file. It holds crate names, sizes and timings, never your code.
 - **Stop the node**: `crabfarm node --stop`.
 

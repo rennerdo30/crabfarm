@@ -8,7 +8,7 @@ use crate::ccache::{self, CacheKey, Captured, EntryOutput};
 use crate::depgraph::is_proc_macro_lib;
 use crate::inputs::{self, CollectError};
 use crate::link::Link;
-use crate::node::{Node, lock};
+use crate::node::{DIALBACK_WAIT, Node, PendingDial, Reach, lock};
 use crate::proto::{
     BlobHash, ClientPath, EnvValue, InputFile, JobId, JobSpec, LocalReason, Message, NodeId,
 };
@@ -37,6 +37,32 @@ const CACHE_FETCH_CONNECT: Duration = Duration::from_secs(3);
 const CACHE_SLOW_PAUSE: Duration = Duration::from_secs(30);
 /// The address that worked last time gets this head start over the others.
 const ADDR_HEAD_START: Duration = Duration::from_millis(300);
+/// Direct connects get at most this long when a dial-back can follow (CF-34).
+const DIRECT_BUDGET: Duration = Duration::from_secs(4);
+/// After no address of a peer answered, dial-backs come first for this long.
+const DIRECT_RETRY_AFTER: Duration = Duration::from_secs(300);
+/// A peer that could not be reached either way gets no jobs for this long.
+const UNREACHABLE_PAUSE: Duration = Duration::from_secs(60);
+
+/// The answer to `Reserve` on a fresh job connection.
+enum Reservation {
+    Ok(Link),
+    Busy,
+    Failed,
+}
+
+/// Removes a dial-back this node waits on when the waiter ends (answered,
+/// timed out or cancelled), so tokens cannot pile up.
+struct DialCleanup<'a> {
+    node: &'a Node,
+    token: [u8; 16],
+}
+
+impl Drop for DialCleanup<'_> {
+    fn drop(&mut self) {
+        lock(&self.node.dialbacks).remove(&self.token);
+    }
+}
 
 /// Connects to several addresses at once and hands out the successes in the
 /// order they finish. Dropping it cancels the connects that are still running.
@@ -1222,9 +1248,14 @@ impl Node {
         };
         let mut any = false;
         let mut views = Vec::new();
+        let now = Instant::now();
         for (id, p) in lock(&self.peers).iter() {
             let Some(st) = &p.status else { continue };
             if p.conns == 0 || !scheduler::eligible(st, &needs) {
+                continue;
+            }
+            // Jobs could not reach it either way a moment ago (CF-34).
+            if p.unreachable_until.is_some_and(|t| t > now) {
                 continue;
             }
             any = true;
@@ -1446,8 +1477,139 @@ impl Node {
         ))
     }
 
+    /// Whether a direct connection to `peer` is worth trying now, and whether
+    /// a dial-back can follow (a live control connection exists).
+    fn direct_and_dial_back(&self, peer: NodeId) -> Option<(bool, bool)> {
+        let now = Instant::now();
+        let peers = lock(&self.peers);
+        let p = peers.get(&peer)?;
+        Some((
+            p.direct_failed_until.is_none_or(|t| t <= now),
+            !p.ctrl.is_empty(),
+        ))
+    }
+
+    /// The deadline for direct attempts: with a dial-back still possible they
+    /// get part of the time only, so the dial-back has time too.
+    fn direct_deadline(
+        deadline: tokio::time::Instant,
+        can_dial_back: bool,
+    ) -> tokio::time::Instant {
+        if !can_dial_back {
+            return deadline;
+        }
+        let now = tokio::time::Instant::now();
+        let half = deadline.saturating_duration_since(now) / 2;
+        deadline.min(now + DIRECT_BUDGET.min(half))
+    }
+
+    /// Remember how `peer` was (or was not) reached (CF-34).
+    fn note_reach(&self, peer: NodeId, reach: Reach) {
+        let now = Instant::now();
+        let mut peers = lock(&self.peers);
+        let Some(p) = peers.get_mut(&peer) else {
+            return;
+        };
+        if p.reach != reach {
+            tracing::info!(
+                peer = crate::proto::log_safe(&p.info.node_name).as_str(),
+                "job connections: {reach:?}"
+            );
+        }
+        p.reach = reach;
+        match reach {
+            Reach::Direct => {
+                p.direct_failed_until = None;
+                p.unreachable_until = None;
+            }
+            Reach::DialBack => p.unreachable_until = None,
+            Reach::Failing => p.unreachable_until = Some(now + UNREACHABLE_PAUSE),
+            Reach::Untried => {}
+        }
+    }
+
+    fn note_direct_failed(&self, peer: NodeId) {
+        if let Some(p) = lock(&self.peers).get_mut(&peer) {
+            p.direct_failed_until = Some(Instant::now() + DIRECT_RETRY_AFTER);
+        }
+    }
+
+    /// Ask `peer` over its control connection to open a connection to this
+    /// node (CF-34) and wait for it until `deadline`.
+    pub(crate) async fn dial_back_link(
+        self: &Arc<Self>,
+        peer: NodeId,
+        deadline: tokio::time::Instant,
+    ) -> Option<Link> {
+        let ctrl = lock(&self.peers).get(&peer)?.ctrl.first()?.1.clone();
+        let token: [u8; 16] = rand::random();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        lock(&self.dialbacks).insert(token, PendingDial { peer, tx });
+        let _cleanup = DialCleanup { node: self, token };
+        let wait = deadline.min(tokio::time::Instant::now() + DIALBACK_WAIT);
+        tokio::time::timeout_at(wait, ctrl.send(Message::DialBack { token }))
+            .await
+            .ok()?
+            .ok()?;
+        let link = tokio::time::timeout_at(wait, rx).await.ok()?.ok()?;
+        self.count("dialbacks", 1);
+        Some(link)
+    }
+
+    /// A connection to `peer` for one request, direct or dialed back, before
+    /// `deadline` (the compile cache's downloads).
+    pub(crate) async fn open_conn(
+        self: &Arc<Self>,
+        peer: NodeId,
+        deadline: tokio::time::Instant,
+    ) -> Option<Link> {
+        let (direct_ok, can_dial_back) = self.direct_and_dial_back(peer)?;
+        if direct_ok {
+            let d = Self::direct_deadline(deadline, can_dial_back);
+            if let Some(mut race) = self.connect_peer(peer, d).await
+                && let Some((_, conn)) = race.next().await
+            {
+                return Some(Link::new(conn));
+            }
+            self.note_direct_failed(peer);
+        }
+        if !can_dial_back {
+            return None;
+        }
+        self.dial_back_link(peer, deadline).await
+    }
+
+    /// Send `Reserve` on a fresh job connection and wait for the answer.
+    async fn reserve(
+        &self,
+        mut link: Link,
+        job_id: JobId,
+        live: &Liveness,
+        deadline: tokio::time::Instant,
+    ) -> Reservation {
+        if let Err(e) = link.send(Message::Reserve { job_id }).await {
+            tracing::info!("could not send Reserve: {e:#}");
+            return Reservation::Failed;
+        }
+        let wait = deadline.min(tokio::time::Instant::now() + RESERVE_WAIT);
+        match tokio::time::timeout_at(wait, link.recv()).await {
+            Ok(Some(Message::Reserved { .. })) => {
+                // Real progress: a frame from the peer.
+                live.touch();
+                Reservation::Ok(link)
+            }
+            Ok(Some(Message::Busy { .. })) => Reservation::Busy,
+            _ => {
+                tracing::info!("no Reserved from the peer (closed, too slow or another frame)");
+                Reservation::Failed
+            }
+        }
+    }
+
     /// Open the job connection to `peer` and reserve a slot, all before
-    /// `deadline`.
+    /// `deadline`. Direct first (its addresses race, CF-27); when no address
+    /// answers, the peer is asked over the control connection to dial back
+    /// (CF-34), and for [`DIRECT_RETRY_AFTER`] that comes first.
     async fn open_job_link(
         self: &Arc<Self>,
         peer: NodeId,
@@ -1455,31 +1617,49 @@ impl Node {
         live: &Liveness,
         deadline: tokio::time::Instant,
     ) -> Option<Link> {
-        let mut race = self.connect_peer(peer, deadline).await?;
-        while let Some((addr, conn)) = race.next().await {
-            let mut link = Link::new(conn);
-            if let Err(e) = link.send(Message::Reserve { job_id }).await {
-                tracing::info!("could not send Reserve: {e:#}");
-                continue;
-            }
-            let wait = deadline.min(tokio::time::Instant::now() + RESERVE_WAIT);
-            match tokio::time::timeout_at(wait, link.recv()).await {
-                Ok(Some(Message::Reserved { .. })) => {
-                    // Real progress: a frame from the peer.
-                    live.touch();
-                    if let Some(p) = lock(&self.peers).get_mut(&peer) {
-                        p.good_addr = Some(addr);
+        let (direct_ok, can_dial_back) = self.direct_and_dial_back(peer)?;
+        if direct_ok {
+            let d = Self::direct_deadline(deadline, can_dial_back);
+            let mut answered = false;
+            if let Some(mut race) = self.connect_peer(peer, d).await {
+                while let Some((addr, conn)) = race.next().await {
+                    answered = true;
+                    match self.reserve(Link::new(conn), job_id, live, deadline).await {
+                        Reservation::Ok(link) => {
+                            if let Some(p) = lock(&self.peers).get_mut(&peer) {
+                                p.good_addr = Some(addr);
+                            }
+                            self.note_reach(peer, Reach::Direct);
+                            return Some(link);
+                        }
+                        Reservation::Busy => return None,
+                        Reservation::Failed => continue,
                     }
-                    return Some(link);
-                }
-                Ok(Some(Message::Busy { .. })) => return None,
-                _ => {
-                    tracing::info!("no Reserved from the peer (closed, too slow or another frame)");
-                    continue;
                 }
             }
+            // The peer answered but did not take the job: a connection the
+            // other way round would not change that.
+            if answered {
+                return None;
+            }
+            self.note_direct_failed(peer);
         }
-        None
+        let link = if can_dial_back {
+            self.dial_back_link(peer, deadline).await
+        } else {
+            None
+        };
+        let Some(link) = link else {
+            self.note_reach(peer, Reach::Failing);
+            return None;
+        };
+        match self.reserve(link, job_id, live, deadline).await {
+            Reservation::Ok(link) => {
+                self.note_reach(peer, Reach::DialBack);
+                Some(link)
+            }
+            _ => None,
+        }
     }
 
     /// Ask the peers whether one of them holds the cache entry for `key`
@@ -1549,9 +1729,7 @@ impl Node {
                 .await
                 .ok()?
                 .ok()?;
-        let mut race = self.connect_peer(holder, deadline).await?;
-        let (_, conn) = race.next().await?;
-        Some(Link::new(conn))
+        self.open_conn(holder, deadline).await
     }
 
     async fn run_remote(

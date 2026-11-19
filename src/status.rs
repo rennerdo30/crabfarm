@@ -137,7 +137,7 @@ pub fn cache_line(counters: &[(String, u64)]) -> String {
     let local = counter(counters, "cache_hit_local");
     let farm = counter(counters, "cache_hit_farm");
     format!(
-        "compile cache: {} hits ({} local, {} farm), {} misses, {} of rustc output reused, {} stored, {} served to peers, {} unusable, {} local results not cached: not yet proven hermetic
+        "compile cache: {} hits ({} local, {} farm), {} misses, {} of rustc output reused, {} stored, {} served to peers, {} unusable, {} local results not cached: they may depend on more than the key covers
 ",
         local + farm,
         local,
@@ -147,7 +147,7 @@ pub fn cache_line(counters: &[(String, u64)]) -> String {
         counter(counters, "cache_stored"),
         counter(counters, "cache_served"),
         counter(counters, "cache_corrupt") + counter(counters, "cache_error"),
-        counter(counters, "cache_unproven"),
+        counter(counters, "cache_local_skipped"),
     )
 }
 
@@ -269,15 +269,16 @@ mod tests {
             c("cache_hit_farm", 2),
             c("cache_miss", 3),
             c("cache_bytes_saved", 4 * 1024 * 1024),
-            c("cache_unproven", 6),
+            c("cache_local_skipped", 6),
         ]);
         assert!(
             line.contains("7 hits (5 local, 2 farm), 3 misses, 4.0 MiB"),
             "{line}"
         );
         assert!(
-            line.trim_end()
-                .ends_with("6 local results not cached: not yet proven hermetic"),
+            line.trim_end().ends_with(
+                "6 local results not cached: they may depend on more than the key covers"
+            ),
             "{line}"
         );
     }

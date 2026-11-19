@@ -3,7 +3,7 @@
 //! the token in `ipc.token` (both in the data dir, rewritten at every node
 //! start). The first frame must be `IpcAuth`.
 
-use crate::proto::Message;
+use crate::proto::{Message, PROTO_VERSION};
 use crate::transport::FramedConn;
 use anyhow::Context;
 use std::path::{Path, PathBuf};
@@ -19,7 +19,7 @@ pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// A wrapper that heard nothing from the node for this long runs rustc itself
 /// (a node that is hung or gone must not hang the build).
 pub const NODE_SILENCE_LIMIT: Duration = Duration::from_secs(30);
-/// `IpcAuth` is 33 bytes; nothing bigger is accepted before authentication.
+/// `IpcAuth` is 34 bytes; nothing bigger is accepted before authentication.
 const AUTH_MAX_FRAME: usize = 256;
 
 pub fn port_path(data_dir: &Path) -> PathBuf {
@@ -104,12 +104,66 @@ pub fn unpublish(data_dir: &Path) {
     let _ = std::fs::remove_file(port_path(data_dir));
 }
 
-/// Server side: the first frame must be `IpcAuth` with the right token.
-pub async fn authenticate(conn: &mut FramedConn<TcpStream>, token: &[u8; 32]) -> bool {
-    let first = tokio::time::timeout(AUTH_TIMEOUT, conn.recv_max(AUTH_MAX_FRAME)).await;
-    match first {
-        Ok(Ok(Some(Message::IpcAuth { token: got }))) => bool::from(got.ct_eq(token)),
-        _ => false,
+/// What the first frame of a local IPC connection said.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Auth {
+    /// The right token and the node's protocol version.
+    Accepted,
+    /// Not a valid `IpcAuth`, or the wrong token.
+    Refused,
+    /// The right token, spoken by a wrapper of another protocol version:
+    /// `Some(version)`, or `None` for the frame older versions sent (no
+    /// version in it). The node answers with an error and closes.
+    OtherVersion(Option<u16>),
+}
+
+/// The text the node sends a wrapper of another protocol version.
+pub fn version_error(theirs: Option<u16>) -> String {
+    let them = theirs.map_or("an older protocol".to_string(), |v| format!("protocol {v}"));
+    format!(
+        "this node speaks protocol {PROTO_VERSION}, the wrapper speaks {them}: \
+         update crabfarm so that the node and the wrapper are the same version"
+    )
+}
+
+/// Server side: the first frame must be `IpcAuth` with the right token and
+/// this node's protocol version. The token is checked first, so a process
+/// that does not know it learns nothing, not even the version.
+pub async fn authenticate(conn: &mut FramedConn<TcpStream>, token: &[u8; 32]) -> Auth {
+    let first = tokio::time::timeout(AUTH_TIMEOUT, conn.recv_raw(AUTH_MAX_FRAME)).await;
+    let Ok(Ok(Some(raw))) = first else {
+        return Auth::Refused;
+    };
+    classify(&raw, token)
+}
+
+fn classify(raw: &[u8], token: &[u8; 32]) -> Auth {
+    if let Ok(Message::IpcAuth { token: got, proto }) = postcard::from_bytes::<Message>(raw) {
+        return if !bool::from(got.ct_eq(token)) {
+            Auth::Refused
+        } else if proto == PROTO_VERSION {
+            Auth::Accepted
+        } else {
+            Auth::OtherVersion(Some(proto))
+        };
+    }
+    // The frame of the versions before 6: the variant tag and the token, no
+    // version. Its token is checked like any other.
+    let tag = postcard::to_stdvec(&Message::IpcAuth {
+        token: [0; 32],
+        proto: 0,
+    })
+    .ok()
+    .and_then(|b| b.first().copied());
+    match (raw.split_first(), tag) {
+        (Some((t, rest)), Some(tag)) if *t == tag && rest.len() == 32 => {
+            if bool::from(rest.ct_eq(token)) {
+                Auth::OtherVersion(None)
+            } else {
+                Auth::Refused
+            }
+        }
+        _ => Auth::Refused,
     }
 }
 
@@ -142,7 +196,11 @@ pub async fn connect(data_dir: &Path) -> anyhow::Result<FramedConn<TcpStream>> {
         .context("IPC connect refused")?;
     tcp.set_nodelay(true).ok();
     let mut conn = FramedConn::new(tcp);
-    conn.send(&Message::IpcAuth { token }).await?;
+    conn.send(&Message::IpcAuth {
+        token,
+        proto: PROTO_VERSION,
+    })
+    .await?;
     Ok(conn)
 }
 
@@ -172,10 +230,13 @@ mod tests {
             .parse()
             .unwrap();
         let mut bad = FramedConn::new(TcpStream::connect(("127.0.0.1", port)).await.unwrap());
-        bad.send(&Message::IpcAuth { token: [0; 32] })
-            .await
-            .unwrap();
-        assert_eq!(server.await.unwrap(), vec![true, false]);
+        bad.send(&Message::IpcAuth {
+            token: [0; 32],
+            proto: PROTO_VERSION,
+        })
+        .await
+        .unwrap();
+        assert_eq!(server.await.unwrap(), vec![Auth::Accepted, Auth::Refused]);
     }
 
     #[tokio::test]
@@ -189,7 +250,36 @@ mod tests {
         });
         let mut c = FramedConn::new(TcpStream::connect(("127.0.0.1", port)).await.unwrap());
         c.send(&Message::QueryStatus).await.unwrap();
-        assert!(!server.await.unwrap());
+        assert_eq!(server.await.unwrap(), Auth::Refused);
+    }
+
+    /// CF-28: a wrapper of another protocol version is told so, whether it
+    /// sends a version (5) or the old frame without one, and never mistaken
+    /// for a valid or an invalid token. A wrong token stays a plain refusal.
+    #[test]
+    fn a_wrapper_of_another_version_is_recognised_not_misread() {
+        let token = [7u8; 32];
+        let enc = |t: [u8; 32], proto: u16| {
+            postcard::to_stdvec(&Message::IpcAuth { token: t, proto }).unwrap()
+        };
+        assert_eq!(classify(&enc(token, PROTO_VERSION), &token), Auth::Accepted);
+        assert_eq!(
+            classify(&enc(token, 5), &token),
+            Auth::OtherVersion(Some(5))
+        );
+        assert_eq!(classify(&enc([8; 32], 5), &token), Auth::Refused);
+        // The frame of protocol 5: tag + token, nothing else.
+        let mut old = enc(token, 0);
+        old.pop();
+        assert_eq!(old.len(), 33);
+        assert_eq!(classify(&old, &token), Auth::OtherVersion(None));
+        old[1] ^= 1;
+        assert_eq!(classify(&old, &token), Auth::Refused, "wrong token");
+        for junk in [&[][..], &[1u8][..], &[0xFF; 40][..], &old[..20]] {
+            assert_eq!(classify(junk, &token), Auth::Refused);
+        }
+        assert!(version_error(None).contains("update crabfarm"));
+        assert!(version_error(Some(5)).contains("protocol 5"));
     }
 
     /// CF-25: the marker is short-lived, rejects implausible content, and goes

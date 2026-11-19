@@ -182,3 +182,27 @@ async fn a_name_in_forward_env_is_forwarded_and_does_not_block_the_crate() {
         subs[0].spec.extra_env
     );
 }
+
+/// CF-28: a node of another protocol version answers the wrapper's `Submit`
+/// with an error and closes. The wrapper builds the crate itself, promptly
+/// (no 30 s wait for a silent node) and without a stack of retries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_of_another_protocol_version_means_a_local_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = make_crate(tmp.path(), "pub fn f() {}\n");
+    let node = FakeNode::start(&home, vec![Behavior::RefuseVersion]).await;
+    let ran = run_wrapper(&home, &work, &[], 120);
+    assert_eq!(ran.code, Some(0), "{}", ran.stderr);
+    assert_eq!(node.submitted(), 1, "the job reached the node");
+    assert!(
+        ran.elapsed < std::time::Duration::from_secs(25),
+        "the wrapper waited for a node that had answered: {:?}",
+        ran.elapsed
+    );
+    let produced = std::fs::read_dir(work.join("out"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy().ends_with(".rlib"));
+    assert!(produced, "the local rustc built the crate");
+}

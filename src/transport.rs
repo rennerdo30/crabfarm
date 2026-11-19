@@ -78,6 +78,15 @@ impl<S: AsyncRead + Unpin + Send> FramedConn<S> {
 
     /// Like `recv` with a tighter size cap (used before the peer is trusted).
     pub async fn recv_max(&mut self, max: usize) -> anyhow::Result<Option<Message>> {
+        match self.recv_raw(max).await? {
+            Some(body) => Ok(Some(postcard::from_bytes(&body).context("decode frame")?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The body of the next frame, not decoded (the local IPC handshake must
+    /// recognise a frame of another protocol version before it can decode it).
+    pub async fn recv_raw(&mut self, max: usize) -> anyhow::Result<Option<Vec<u8>>> {
         let mut hdr = [0u8; 4];
         let mut got = 0;
         while got < 4 {
@@ -109,7 +118,7 @@ impl<S: AsyncRead + Unpin + Send> FramedConn<S> {
         if read != len {
             bail!("connection closed inside a frame ({read} of {len} bytes)");
         }
-        Ok(Some(postcard::from_bytes(&body).context("decode frame")?))
+        Ok(Some(body))
     }
 }
 

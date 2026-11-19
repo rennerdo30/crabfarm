@@ -5,7 +5,7 @@
 
 #![allow(dead_code)]
 
-use crabfarm::proto::{JobSpec, LocalReason, Message};
+use crabfarm::proto::{JobSpec, LocalReason, Message, PROTO_VERSION};
 use crabfarm::transport::FramedConn;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -31,6 +31,9 @@ pub enum Behavior {
     /// Pretend a peer failed to compile: send `stderr_line` as a diagnostic and
     /// `Exit { code: 1 }`, and serve a `RetryLocal` with `RunLocal`.
     PeerCompileError { stderr_line: String },
+    /// A node of another protocol version: answer the `Submit` with the error
+    /// a real node sends, then close.
+    RefuseVersion,
     /// Accept the `Submit` and never say anything again.
     Silent,
     /// Like `Silent`, and note whether `watch` already existed when the wrapper
@@ -85,7 +88,8 @@ impl FakeNode {
                 };
                 let mut conn = FramedConn::new(tcp);
                 match conn.recv().await {
-                    Ok(Some(Message::IpcAuth { token: got })) if got == token => {}
+                    Ok(Some(Message::IpcAuth { token: got, proto }))
+                        if got == token && proto == PROTO_VERSION => {}
                     _ => continue,
                 }
                 let Ok(Some(Message::Submit {
@@ -140,6 +144,13 @@ impl FakeNode {
                                 .await;
                             drain(&mut conn).await;
                         }
+                    }
+                    Behavior::RefuseVersion => {
+                        let _ = conn
+                            .send(&Message::Error {
+                                message: crabfarm::ipc::version_error(Some(PROTO_VERSION + 1)),
+                            })
+                            .await;
                     }
                     Behavior::Silent => held.push(conn),
                     Behavior::SilentWatching { watch } => {

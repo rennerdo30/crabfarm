@@ -124,6 +124,10 @@ async fn ask_over_control(
     deadline: tokio::time::Instant,
 ) -> Option<Option<u64>> {
     let sem = lock(peers).get(&peer)?.cache_ask.clone();
+    // Declared before the channel: when this future ends for any reason
+    // (answer, timeout, send failure, abort by its caller) the receiver is
+    // dropped first and the guard then removes the dead waiter (R5).
+    let _cleanup = WaiterCleanup { peers, peer, key };
     // Held until the answer (or the deadline): this is what bounds the
     // questions in flight to one peer.
     let _permit = tokio::time::timeout_at(deadline, sem.acquire_owned())
@@ -142,6 +146,27 @@ async fn ask_over_control(
     };
     ctrl.try_send(Message::CacheQuery { key }).ok()?;
     tokio::time::timeout_at(deadline, rx).await.ok()?.ok()
+}
+
+/// Removes the waiters of a question whose asker is gone, and the key's entry
+/// when none is left, so unanswered questions cannot pile up in the peer table.
+struct WaiterCleanup<'a> {
+    peers: &'a Mutex<HashMap<NodeId, PeerState>>,
+    peer: NodeId,
+    key: [u8; 32],
+}
+
+impl Drop for WaiterCleanup<'_> {
+    fn drop(&mut self) {
+        if let Some(p) = lock(self.peers).get_mut(&self.peer)
+            && let Some(w) = p.cache_waiters.get_mut(&self.key)
+        {
+            w.retain(|w| !w.is_closed());
+            if w.is_empty() {
+                p.cache_waiters.remove(&self.key);
+            }
+        }
+    }
 }
 
 /// Hand a `CacheHave` (`Some`) or `CacheMiss` (`None`) from `peer` to the
@@ -190,9 +215,6 @@ pub struct Node {
     /// The compile cache (DESIGN section 16); `None` when off or without the
     /// farm's cache key.
     pub ccache: Option<Ccache>,
-    /// Crates that built successfully on a peer: only their local results may
-    /// enter the compile cache (DESIGN section 16).
-    pub hermetic: Mutex<crate::hermetic::Hermetic>,
     /// Cache questions this node has in flight / cache entries it serves at once.
     pub cache_ask_sem: Arc<Semaphore>,
     pub cache_serve_sem: Arc<Semaphore>,
@@ -652,29 +674,36 @@ impl Node {
         key: [u8; 32],
         reply: &tokio::sync::mpsc::Sender<Message>,
     ) {
-        let permit = self.cache_probe_sem.clone().try_acquire_owned().ok();
+        // No permit: nothing is spawned at all, the answer is a miss right
+        // here (a burst of questions cannot make unbounded tasks, R5).
+        let permit = if self.cache_enabled() {
+            self.cache_probe_sem.clone().try_acquire_owned().ok()
+        } else {
+            None
+        };
+        let Some(permit) = permit else {
+            let _ = reply.try_send(Message::CacheMiss { key });
+            return;
+        };
         let (node, reply) = (self.clone(), reply.clone());
         tokio::spawn(async move {
-            let bytes = match permit {
-                Some(_p) if node.cache_enabled() => {
-                    let n = node.clone();
-                    tokio::task::spawn_blocking(move || {
-                        n.ccache
-                            .as_ref()?
-                            .lookup(&crate::ccache::CacheKey(key))
-                            .map(|e| e.total_bytes())
-                    })
-                    .await
-                    .ok()
-                    .flatten()
-                }
-                _ => None,
-            };
+            let _permit = permit;
+            let n = node.clone();
+            let bytes = tokio::task::spawn_blocking(move || {
+                n.ccache
+                    .as_ref()?
+                    .lookup(&crate::ccache::CacheKey(key))
+                    .map(|e| e.total_bytes())
+            })
+            .await
+            .ok()
+            .flatten();
             let m = match bytes {
                 Some(bytes) => Message::CacheHave { key, bytes },
                 None => Message::CacheMiss { key },
             };
-            let _ = reply.send(m).await;
+            // A full control channel drops the answer: the asker times out.
+            let _ = reply.try_send(m);
         });
     }
 
@@ -848,12 +877,32 @@ impl Node {
                     let node = self.clone();
                     tokio::spawn(async move {
                         let mut conn = FramedConn::new(tcp);
-                        let authenticated = ipc::authenticate(&mut conn, &token).await;
+                        let auth = ipc::authenticate(&mut conn, &token).await;
                         // The slot is for the wait, not for the life of the connection.
                         drop(auth_slot);
-                        if !authenticated {
-                            tracing::debug!("IPC connection failed authentication");
-                            return;
+                        match auth {
+                            ipc::Auth::Accepted => {}
+                            ipc::Auth::Refused => {
+                                tracing::debug!("IPC connection failed authentication");
+                                return;
+                            }
+                            ipc::Auth::OtherVersion(theirs) => {
+                                // Said once per node start: every crate of a
+                                // build would repeat it. The wrapper is told
+                                // each time and builds the crate itself.
+                                static SAID: std::sync::atomic::AtomicBool =
+                                    std::sync::atomic::AtomicBool::new(false);
+                                let message = ipc::version_error(theirs);
+                                if !SAID.swap(true, Ordering::Relaxed) {
+                                    tracing::warn!("wrapper refused: {message}");
+                                }
+                                let _ = tokio::time::timeout(
+                                    Duration::from_secs(1),
+                                    conn.send(&Message::Error { message }),
+                                )
+                                .await;
+                                return;
+                            }
                         }
                         node.handle_ipc(Link::new(conn)).await;
                     });
@@ -1123,7 +1172,6 @@ pub async fn run(
     };
     let node = Arc::new(Node {
         ccache,
-        hermetic: Mutex::new(crate::hermetic::Hermetic::load(&data_dir)),
         cache_ask_sem: Arc::new(Semaphore::new(crate::submitter::CACHE_ASK_CONCURRENCY)),
         cache_serve_sem: Arc::new(Semaphore::new(crate::executor::SERVE_CACHE_LIMIT)),
         cache_fetch_sem: Arc::new(Semaphore::new(crate::submitter::CACHE_FETCH_CONCURRENCY)),
@@ -1313,6 +1361,7 @@ mod tests {
         let (book, peer, _wire) = book_with_control_link();
         let soon = tokio::time::Instant::now() + Duration::from_millis(100);
         assert_eq!(ask_over_control(&book, peer, [1; 32], soon).await, None);
+        assert!(!waiters(&book, peer), "R5: a timed-out ask left its waiter");
         lock(&book).get_mut(&peer).unwrap().ctrl.clear();
         let far = tokio::time::Instant::now() + Duration::from_secs(30);
         assert_eq!(ask_over_control(&book, peer, [2; 32], far).await, None);
@@ -1321,6 +1370,40 @@ mod tests {
             None,
             "unknown peer"
         );
+    }
+
+    fn waiters(book: &Book, peer: NodeId) -> bool {
+        !lock(book).get(&peer).unwrap().cache_waiters.is_empty()
+    }
+
+    /// R5: a question that could not be sent (the control channel is full) or
+    /// whose asker was dropped leaves no waiter behind.
+    #[tokio::test]
+    async fn a_failed_or_abandoned_cache_ask_leaves_no_waiter() {
+        let id = NodeId([6; 16]);
+        let mut st = PeerState::new(PeerInfo {
+            node_id: id,
+            node_name: "p".into(),
+            addrs: Vec::new(),
+            last_seen: 0,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(Message::Keepalive).unwrap(); // full: the next send fails
+        st.ctrl.push((1, tx));
+        let book: Book = Arc::new(Mutex::new(HashMap::from([(id, st)])));
+        let far = tokio::time::Instant::now() + Duration::from_secs(30);
+        assert_eq!(ask_over_control(&book, id, [1; 32], far).await, None);
+        assert!(!waiters(&book, id), "a send failure left its waiter");
+
+        // An ask that is aborted while it waits (its caller gave up).
+        let (book, peer, _wire) = book_with_control_link();
+        let b2 = book.clone();
+        let task = tokio::spawn(async move { ask_over_control(&b2, peer, [3; 32], far).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(waiters(&book, peer), "the ask is waiting");
+        task.abort();
+        let _ = task.await;
+        assert!(!waiters(&book, peer), "an aborted ask left its waiter");
     }
 
     #[test]

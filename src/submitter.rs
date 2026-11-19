@@ -270,8 +270,6 @@ struct DoneInfo {
     capture: Option<Captured>,
     /// Output bytes that were applied.
     bytes: u64,
-    /// The job ended with exit code 0 (what proves a remote run hermetic).
-    ok: bool,
 }
 
 /// Where the frames of a run come from.
@@ -294,41 +292,14 @@ enum Origin {
 struct CacheCtx {
     key: CacheKey,
     spec: JobSpec,
-    /// What may be stored from a local run of this crate.
-    proof: Proof,
-}
-
-/// Whether a LOCAL run's result of a crate may enter the cache (DESIGN
-/// section 16).
-#[derive(Clone, PartialEq, Eq, Debug)]
-enum Proof {
-    /// No proc macro runs while the crate compiles: rustc reads only the
-    /// files the dep-info lists (checked before storing) and the variables it
-    /// reports (checked by the wrapper), so the key covers everything and no
-    /// proof is needed.
-    NotNeeded,
-    /// A proc macro runs inside rustc and may read anything: stored only
-    /// while this proof id (the crate identity and the macro builds) has a
-    /// remote success on record.
-    Id(String),
-    /// A proc macro runs and the job lacks what an identity needs: never stored.
-    Never,
-}
-
-impl Proof {
-    fn of(spec: &JobSpec, macros: &[BlobHash]) -> Proof {
-        if macros.is_empty() {
-            return Proof::NotNeeded;
-        }
-        ccache::proof_id(spec, macros).map_or(Proof::Never, Proof::Id)
-    }
-
-    fn id(&self) -> Option<&str> {
-        match self {
-            Proof::Id(id) => Some(id),
-            _ => None,
-        }
-    }
+    /// A LOCAL run's result of this crate may be stored (DESIGN section 16).
+    /// True only when no proc macro is in the crate's `--extern` closure:
+    /// rustc then reads only what the key covers (the dep-info is checked
+    /// before storing, the variables by the wrapper). A proc macro is native
+    /// code that can read any file, so with one in the closure only a REMOTE
+    /// result is kept, because the peer's sandbox held nothing but the
+    /// shipped inputs.
+    local_ok: bool,
 }
 
 enum RemoteEnd {
@@ -815,8 +786,8 @@ impl Node {
         // file is never cached): everything else is prepared by `plan`, and
         // only when a peer looks better than a free local slot.
         if self.cache_enabled()
-            && !ccache::target_is_file(&spec.target)
             && !self.paths_forbid_cache(&spec, &info)
+            && self.target_cacheable(&spec).await
         {
             let r = self.prepare(spec.clone(), &info, false).await;
             if let Ok(p) = &r
@@ -825,7 +796,7 @@ impl Node {
             {
                 ctx = Some(Arc::new(CacheCtx {
                     key: ccache::cache_key(&p.spec),
-                    proof: Proof::of(&p.spec, &p.macros),
+                    local_ok: p.macros.is_empty(),
                     spec: p.spec.clone(),
                 }));
             }
@@ -844,7 +815,10 @@ impl Node {
                 return;
             }
         };
-        match self.run_remote(wrapper, &plan, &info, live).await {
+        match self
+            .run_remote(wrapper, &plan, &info, ctx.is_some(), live)
+            .await
+        {
             RemoteEnd::Done(done) => {
                 self.after_done(wrapper, &info, live, ctx.as_deref(), done, None)
                     .await;
@@ -911,6 +885,19 @@ impl Node {
                 if hit.is_some() {
                     self.count("cache_rejected", 1);
                 }
+                // The wrapper found the replayed result unfit (a variable the
+                // crate reads): this node's entry must not serve it again.
+                if hit == Some(Origin::Local)
+                    && let Some(c) = ctx
+                {
+                    let (node, key) = (self.clone(), c.key);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if node.ccache.as_ref().is_some_and(|cc| cc.remove(&key)) {
+                            node.count("cache_rejected_removed", 1);
+                        }
+                    })
+                    .await;
+                }
                 self.local_phase(wrapper, reason, info, live, ctx).await;
             }
             Ok(None) => {
@@ -921,15 +908,6 @@ impl Node {
                 }
                 if hit.is_some() {
                     self.count("cache_bytes_saved", done.bytes);
-                }
-                // A job that ran on a peer and ended well is hermetic by
-                // construction: that crate's local results may be cached from
-                // now on. A farm hit proves nothing about this node's crate.
-                if hit.is_none()
-                    && done.ok
-                    && let Some(id) = ctx.and_then(|c| c.proof.id().map(str::to_string))
-                {
-                    self.hermetic_update(id, true).await;
                 }
                 // A local hit is stored already; everything else is new here.
                 if hit != Some(Origin::Local)
@@ -946,6 +924,16 @@ impl Node {
 
     pub(crate) fn cache_enabled(&self) -> bool {
         self.ccache.is_some() && self.cfg.retain_blobs
+    }
+
+    /// Only a built-in target is cached: a target specification file (or any
+    /// custom name) has content the key does not see (CF-28 R2). Asks the
+    /// job's toolchain once for `--print target-list`.
+    async fn target_cacheable(self: &Arc<Self>, spec: &JobSpec) -> bool {
+        let (node, id, target) = (self.clone(), spec.toolchain.clone(), spec.target.clone());
+        tokio::task::spawn_blocking(move || node.toolchains.is_builtin_target(&id, &target))
+            .await
+            .unwrap_or(false)
     }
 
     /// `local_only` and `sensitive` paths never enter the cache, in either
@@ -1073,30 +1061,6 @@ impl Node {
         }
     }
 
-    /// Record (`prove`) or withdraw a crate's hermetic proof, off the async
-    /// threads (the file is rewritten). Withdrawing also removes the local
-    /// results that were stored under the proof: they may be stale.
-    async fn hermetic_update(self: &Arc<Self>, id: String, prove: bool) {
-        let node = self.clone();
-        let done = tokio::task::spawn_blocking(move || {
-            let mut h = lock(&node.hermetic);
-            if prove {
-                h.prove(&id, ccache::Ccache::now())
-            } else {
-                let r = h.revoke(&id);
-                let removed = node.ccache.as_ref().map_or(0, |c| c.revoke_proof(&id));
-                if removed > 0 {
-                    node.count("cache_revoked", removed as u64);
-                }
-                r
-            }
-        })
-        .await;
-        if let Ok(Err(err)) = done {
-            tracing::warn!("hermetic proofs not saved: {err:#}");
-        }
-    }
-
     /// Keep a result that came from a peer (or from a farm hit) as a local entry.
     async fn store_capture(self: &Arc<Self>, ctx: &CacheCtx, cap: Captured) {
         let node = self.clone();
@@ -1129,7 +1093,6 @@ impl Node {
         let key = ctx.key;
         let spec = ctx.spec.clone();
         let produces = info.produces.clone();
-        let proof = ctx.proof.id().map(str::to_string);
         let stored = tokio::task::spawn_blocking(move || {
             let cc = node.ccache.as_ref()?;
             for i in &spec.inputs {
@@ -1151,15 +1114,17 @@ impl Node {
             let mut outputs = Vec::new();
             let mut dep_info = None;
             let mut total = 0u64;
+            if files.len() > ccache::MAX_ENTRY_FILES {
+                return None;
+            }
             for f in files {
-                let data = std::fs::read(f.to_local()).ok()?;
+                // What a replay could never carry is refused by its size,
+                // before a byte of it is read into memory (R7).
+                let room = ccache::MAX_ENTRY_BYTES
+                    .saturating_sub(total)
+                    .min(ccache::MAX_ENTRY_FILE_BYTES);
+                let data = ccache::read_capped(&f.to_local(), room)?;
                 total += data.len() as u64;
-                // What a replay could never carry is not stored.
-                if total > ccache::MAX_ENTRY_BYTES
-                    || data.len() as u64 > ccache::MAX_ENTRY_FILE_BYTES
-                {
-                    return None;
-                }
                 let hash = BlobHash::of(&data);
                 cc.put_blob(&hash, &data).ok()?;
                 let size = data.len() as u64;
@@ -1182,10 +1147,7 @@ impl Node {
                 },
                 ccache::Ccache::now(),
             )?;
-            match &proof {
-                Some(id) => cc.store_proven(&key, &e, id).ok(),
-                None => cc.store(&key, &e).ok(),
-            }
+            cc.store(&key, &e).ok()
         })
         .await
         .ok()
@@ -1236,29 +1198,14 @@ impl Node {
         };
         lock(&self.depgraph).finish(&info.produces, ok);
         drop(permit);
-        if ok && !stores_local_result(reason) {
-            // The peer failed (or its result was rejected) and this run
-            // worked: the crate needs something outside the sandbox. Its
-            // proof, if it had one, is void.
-            if let Some(id) = ctx.and_then(|c| c.proof.id().map(str::to_string)) {
-                self.hermetic_update(id, false).await;
-            }
-        }
         if ok && let (Some(c), Some(cap)) = (ctx, capture) {
-            let allowed = match &c.proof {
-                Proof::NotNeeded => true,
-                Proof::Id(id) => lock(&self.hermetic).is_proven(id),
-                Proof::Never => false,
-            };
-            if !stores_local_result(reason) {
-                self.count("cache_unproven", 1);
-            } else if allowed {
+            if c.local_ok && stores_local_result(reason) {
                 self.store_local(c, info, cap, started).await;
             } else {
-                // A proc macro ran here and may have read files the key does
-                // not cover; only a crate with these macros that built on a
-                // peer is known not to (section 16).
-                self.count("cache_unproven", 1);
+                // Either a proc macro ran here and may have read files the key
+                // does not cover (only a remote result is kept, section 16),
+                // or the crate needed something the job did not carry.
+                self.count("cache_local_skipped", 1);
             }
         }
     }
@@ -1612,6 +1559,7 @@ impl Node {
         wrapper: &mut Link,
         plan: &Plan,
         info: &SubmitInfo,
+        record: bool,
         live: &Liveness,
     ) -> RemoteEnd {
         let _running = RunningGuard::new(self, true);
@@ -1638,7 +1586,9 @@ impl Node {
                         plan,
                         target: *target,
                     },
-                    self.cache_enabled(),
+                    // Only a job the cache may hold (`ctx` exists): a
+                    // sensitive or local-only job leaves nothing in the store.
+                    record,
                     live,
                 )
                 .await;
@@ -1938,7 +1888,6 @@ impl Node {
                     return Ok(RemoteEnd::Done(DoneInfo {
                         capture: (record && code == 0).then_some(capture),
                         bytes: applied,
-                        ok: code == 0,
                     }));
                 }
                 Message::Error { message } => {

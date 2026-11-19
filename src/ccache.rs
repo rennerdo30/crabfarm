@@ -152,63 +152,6 @@ pub fn target_is_file(target: &str) -> bool {
     target.ends_with(".json") || target.contains('/') || target.contains('\\')
 }
 
-/// The id a hermetic proof is recorded under ([`crate::hermetic`]): the
-/// identity of the crate (package name and version `CARGO_PKG_NAME`,
-/// `CARGO_PKG_VERSION`, the client manifest dir, the target and the crate
-/// types) together with the content hashes of the proc-macro libraries in its
-/// `--extern` closure (`macros`). The macros are part of the id because a
-/// proc macro runs inside rustc while the crate compiles and can read
-/// anything: another macro build is another proof to earn, whereas a source
-/// edit of the crate itself keeps the proof (the macros that run are the same
-/// ones). `None` when the job does not carry the identity fields; such a crate
-/// can never be proven.
-pub fn proof_id(spec: &JobSpec, macros: &[BlobHash]) -> Option<String> {
-    let var = |name: &str| spec.env.iter().find(|(k, _)| k == name).map(|(_, v)| v);
-    let (Some(EnvValue::Plain(name)), Some(EnvValue::Plain(version)), Some(EnvValue::Path(dir))) = (
-        var("CARGO_PKG_NAME"),
-        var("CARGO_PKG_VERSION"),
-        var("CARGO_MANIFEST_DIR"),
-    ) else {
-        return None;
-    };
-    let mut types: Vec<&str> = Vec::new();
-    let mut args = spec.args.iter();
-    while let Some(a) = args.next() {
-        let Arg::Plain(a) = a else { continue };
-        if a == "--crate-type" {
-            if let Some(Arg::Plain(v)) = args.next() {
-                types.extend(v.split(','));
-            }
-        } else if let Some(v) = a.strip_prefix("--crate-type=") {
-            types.extend(v.split(','));
-        }
-    }
-    types.sort_unstable();
-    types.dedup();
-    if types.is_empty() {
-        return None;
-    }
-    let mut e = Enc(blake3::Hasher::new_derive_key(
-        "crabfarm hermetic crate identity",
-    ));
-    e.str(1, name);
-    e.str(2, version);
-    e.path(3, dir);
-    e.str(4, &spec.target);
-    e.num(5, types.len() as u64);
-    for t in types {
-        e.str(6, t);
-    }
-    let mut macros: Vec<&BlobHash> = macros.iter().collect();
-    macros.sort_by_key(|h| h.0);
-    macros.dedup();
-    e.num(7, macros.len() as u64);
-    for m in macros {
-        e.bytes(8, &m.0);
-    }
-    Some(data_encoding::HEXLOWER.encode(e.0.finalize().as_bytes()))
-}
-
 // ----------------------------------------------------------- dep-info check
 
 /// The files a dep-info (`.d`) lists as read: its `path:` lines without
@@ -312,6 +255,25 @@ pub fn entry_from(spec: &JobSpec, key: &CacheKey, c: Captured, now: u64) -> Opti
     })
 }
 
+/// Read an output file for the cache, refusing one larger than `max` bytes
+/// by its size, before any of it is read into memory (a local rustc run can
+/// leave an arbitrarily large file). A file that grows while it is read, or
+/// is not what its size said, is refused too.
+pub fn read_capped(path: &Path, max: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let len = std::fs::metadata(path).ok()?.len();
+    if len > max {
+        return None;
+    }
+    let mut data = Vec::with_capacity(len as usize);
+    std::fs::File::open(path)
+        .ok()?
+        .take(len + 1)
+        .read_to_end(&mut data)
+        .ok()?;
+    (data.len() as u64 == len).then_some(data)
+}
+
 /// The key under which entries and blobs are encrypted, derived from the
 /// farm secret the CA handed out.
 pub fn storage_key(farm_secret: &[u8; 32]) -> [u8; 32] {
@@ -365,7 +327,7 @@ pub fn disk_usage(data_dir: &Path) -> DiskUsage {
 pub fn clear(data_dir: &Path) -> anyhow::Result<DiskUsage> {
     let before = disk_usage(data_dir);
     let root = root_dir(data_dir);
-    for sub in ["entries", "blobs", "proofs"] {
+    for sub in ["entries", "blobs"] {
         let d = root.join(sub);
         match std::fs::remove_dir_all(&d) {
             Ok(()) => {}
@@ -404,78 +366,11 @@ impl Ccache {
         self.blobs.put(FARM_OWNER, &self.key, hash, data)
     }
 
-    fn proof_dir(&self, proof: &str) -> PathBuf {
-        self.root.join("proofs").join(proof)
-    }
-
-    /// Store a result of a LOCAL run that is allowed only because its crate was
-    /// proven hermetic under `proof` (DESIGN section 16): a marker records
-    /// that this key was stored under the proof, so that revoking the proof
-    /// can remove the entry again ([`Ccache::revoke_proof`]).
-    pub fn store_proven(&self, key: &CacheKey, entry: &Entry, proof: &str) -> anyhow::Result<()> {
-        if proof.len() != 64 || !proof.bytes().all(|b| b.is_ascii_hexdigit()) {
-            bail!("malformed proof id");
-        }
-        let dir = self.proof_dir(proof);
-        std::fs::create_dir_all(&dir).context("create proof marker directory")?;
-        std::fs::write(dir.join(key.to_hex()), b"").context("write proof marker")?;
-        self.store(key, entry)
-    }
-
-    /// Remove every entry that was stored under `proof` by a local run, and
-    /// the markers. Returns how many entries were removed. Entries other
-    /// nodes hold are not touched (they were produced by remote runs or by
-    /// their own proofs).
-    pub fn revoke_proof(&self, proof: &str) -> usize {
-        if proof.len() != 64 || !proof.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return 0;
-        }
-        let dir = self.proof_dir(proof);
-        let mut removed = 0;
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for f in rd.flatten() {
-                let name = f.file_name();
-                let Some(hex) = name.to_str().filter(|n| n.len() == 64) else {
-                    continue;
-                };
-                let Ok(bytes) = data_encoding::HEXLOWER.decode(hex.as_bytes()) else {
-                    continue;
-                };
-                let Ok(k) = <[u8; 32]>::try_from(bytes.as_slice()) else {
-                    continue;
-                };
-                if std::fs::remove_file(self.entry_path(&CacheKey(k))).is_ok() {
-                    removed += 1;
-                }
-            }
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-        removed
-    }
-
-    /// Markers whose entry is gone (evicted) are dropped, and empty proof
-    /// directories with them.
-    fn prune_proof_markers(&self) {
-        let Ok(rd) = std::fs::read_dir(self.root.join("proofs")) else {
-            return;
-        };
-        for d in rd.flatten() {
-            if let Ok(files) = std::fs::read_dir(d.path()) {
-                for f in files.flatten() {
-                    let name = f.file_name();
-                    let gone = name
-                        .to_str()
-                        .and_then(|h| data_encoding::HEXLOWER.decode(h.as_bytes()).ok())
-                        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
-                        .is_none_or(|k| !self.entry_path(&CacheKey(k)).exists());
-                    if gone {
-                        let _ = std::fs::remove_file(f.path());
-                    }
-                }
-            }
-            // Fails (and is left) while markers remain.
-            let _ = std::fs::remove_dir(d.path());
-        }
+    /// Delete the entry under `key` (its blobs stay for other entries and age
+    /// out). Used when the wrapper refused a replay of it: whatever made the
+    /// result unfit then (a variable the crate reads) must not serve it again.
+    pub fn remove(&self, key: &CacheKey) -> bool {
+        std::fs::remove_file(self.entry_path(key)).is_ok()
     }
 
     /// Write the entry index atomically.
@@ -589,7 +484,6 @@ impl Ccache {
     /// index.
     pub fn evict(&self) -> anyhow::Result<u64> {
         let freed = self.blobs.evict()?;
-        self.prune_proof_markers();
         let mut files: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
         let mut total = 0u64;
         for f in walkdir::WalkDir::new(self.root.join("entries"))
@@ -777,87 +671,6 @@ mod tests {
             no_retain: false,
             needs_host: false,
         }
-    }
-
-    /// The identity is the package, its version, where it lives, the target and
-    /// the crate types, and nothing a source edit changes.
-    #[test]
-    fn the_proof_id_is_identity_plus_the_proc_macro_builds() {
-        let mut base = spec();
-        base.env
-            .push(("CARGO_PKG_VERSION".into(), EnvValue::Plain("1.2.3".into())));
-        base.args.push(Arg::Plain("--crate-type".into()));
-        base.args.push(Arg::Plain("lib".into()));
-        let id = proof_id(&base, &[]).expect("identity");
-        assert_eq!(id.len(), 64);
-        let with = |f: &dyn Fn(&mut JobSpec)| {
-            let mut s = base.clone();
-            f(&mut s);
-            proof_id(&s, &[])
-        };
-        assert_eq!(
-            with(&|s| s.inputs[0].hash = BlobHash::of(b"edited")).as_deref(),
-            Some(id.as_str()),
-            "a source edit is the same crate"
-        );
-        assert_eq!(
-            with(&|s| {
-                s.args.pop();
-                s.args.pop();
-                s.args.push(Arg::Plain("--crate-type=lib".into()));
-            })
-            .as_deref(),
-            Some(id.as_str()),
-            "both spellings of the crate type"
-        );
-        for (what, other) in [
-            (
-                "name",
-                with(&|s| s.env[0].1 = EnvValue::Plain("bar".into())),
-            ),
-            (
-                "version",
-                with(&|s| s.env[2].1 = EnvValue::Plain("1.2.4".into())),
-            ),
-            ("dir", with(&|s| s.env[1].1 = EnvValue::Path(cp(r"C:\q")))),
-            (
-                "target",
-                with(&|s| s.target = "aarch64-apple-darwin".into()),
-            ),
-            (
-                "types",
-                with(&|s| {
-                    s.args.pop();
-                    s.args.push(Arg::Plain("rlib".into()));
-                }),
-            ),
-        ] {
-            assert_ne!(other.as_deref(), Some(id.as_str()), "{what} must matter");
-        }
-        assert_eq!(
-            with(&|s| {
-                s.env.remove(2);
-            }),
-            None,
-            "without a version there is no identity"
-        );
-        // The proc macros that run while the crate compiles are part of it
-        // (CF-30 P1): a changed macro build needs a new proof, the order and
-        // repetition of the macros do not matter.
-        let (m1, m2) = (BlobHash::of(b"macro one"), BlobHash::of(b"macro two"));
-        let one = proof_id(&base, &[m1]).expect("id");
-        assert_ne!(one, id, "a macro in the closure is another proof");
-        assert_ne!(
-            proof_id(&base, &[BlobHash::of(b"macro one, edited")]).as_deref(),
-            Some(one.as_str()),
-            "an edited macro is another proof"
-        );
-        assert_eq!(
-            proof_id(&base, &[m1, m2]),
-            proof_id(&base, &[m2, m1, m2]),
-            "order and repetition"
-        );
-        assert_ne!(proof_id(&base, &[m1, m2]).as_deref(), Some(one.as_str()));
     }
 
     /// Every component of the key matters (CF-28): changing any one of them
@@ -1232,27 +1045,33 @@ mod tests {
         const { assert!(MAX_ENTRY_FILE_BYTES <= crate::cas::MAX_BLOB_BYTES) };
     }
 
-    /// CF-30 P3: revoking a proof removes the local results stored under it
-    /// and nothing else.
+    /// R7: a file over the limit is refused by its size, an exact fit is read.
     #[test]
-    fn revoking_a_proof_removes_the_entries_stored_under_it() {
+    fn read_capped_refuses_by_size() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("out.rlib");
+        std::fs::write(&f, b"0123456789").unwrap();
+        assert_eq!(read_capped(&f, 10).as_deref(), Some(&b"0123456789"[..]));
+        assert_eq!(read_capped(&f, 9), None, "one byte over");
+        assert_eq!(read_capped(&f, 0), None);
+        assert_eq!(read_capped(&d.path().join("missing"), 10), None);
+        assert_eq!(read_capped(d.path(), 10), None, "a directory is no output");
+    }
+
+    /// R6: the wrapper refused a replay; that entry is deleted, others stay.
+    #[test]
+    fn remove_deletes_one_entry_only() {
         let d = tempfile::tempdir().unwrap();
         let c = store(d.path());
-        let proof = "ab".repeat(32);
-        let (k1, e1) = put(&c, &spec(), &[("foo-1.rlib", b"one")]);
+        let (k1, _) = put(&c, &spec(), &[("foo-1.rlib", b"one")]);
         let mut s2 = spec();
         s2.crate_name = "bar".into();
         s2.args.push(Arg::Plain("--cfg=bar".into()));
-        let (k2, e2) = put(&c, &s2, &[("bar-1.rlib", b"two")]);
-        // `put` stored both plainly; store e1 again under the proof.
-        c.store_proven(&k1, &e1, &proof).unwrap();
-        assert!(c.lookup(&k1).is_some() && c.lookup(&k2).is_some());
-        assert!(c.store_proven(&k1, &e1, "not hex").is_err());
-        assert_eq!(c.revoke_proof(&proof), 1);
-        assert!(c.lookup(&k1).is_none(), "stored under the proof: gone");
+        let (k2, _) = put(&c, &s2, &[("bar-1.rlib", b"two")]);
+        assert!(c.remove(&k1));
+        assert!(c.lookup(&k1).is_none(), "removed");
         assert!(c.lookup(&k2).is_some(), "another entry stays");
-        assert_eq!(c.revoke_proof(&proof), 0, "nothing left to remove");
-        let _ = e2;
+        assert!(!c.remove(&k1), "nothing left to remove");
     }
 
     /// CF-30 P3: deleting a broken entry must not delete one that a

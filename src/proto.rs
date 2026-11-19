@@ -294,6 +294,10 @@ pub enum Message {
     // ---- IPC (wrapper <-> local node) ----
     IpcAuth {
         token: [u8; 32],
+        /// [`PROTO_VERSION`] of the wrapper or command (added in protocol 6,
+        /// CF-28): the node refuses another version with a clear error
+        /// instead of misreading its frames.
+        proto: u16,
     },
     /// Wrapper -> node: a classified invocation. The node fills in inputs
     /// from `spec.args` and decides where it runs.
@@ -547,7 +551,11 @@ impl std::fmt::Debug for Message {
             Message::Tainted { path } => f.debug_struct("Tainted").field("path", path).finish(),
             Message::Keepalive => f.write_str("Keepalive"),
             Message::Shutdown => f.write_str("Shutdown"),
-            Message::IpcAuth { .. } => f.debug_struct("IpcAuth").field("token", &Redacted).finish(),
+            Message::IpcAuth { proto, .. } => f
+                .debug_struct("IpcAuth")
+                .field("token", &Redacted)
+                .field("proto", proto)
+                .finish(),
             Message::Submit {
                 spec,
                 rustc,
@@ -622,7 +630,13 @@ mod tests {
         );
         assert!(!join.contains("171") && !join.contains("ab"), "{join}");
         assert!(join.contains("beta") && join.contains("redacted"));
-        let ipc = format!("{:?}", Message::IpcAuth { token: [200; 32] });
+        let ipc = format!(
+            "{:?}",
+            Message::IpcAuth {
+                token: [200; 32],
+                proto: PROTO_VERSION
+            }
+        );
         assert!(!ipc.contains("200"), "{ipc}");
         let mut key = [0u8; 32];
         key[0] = 77;

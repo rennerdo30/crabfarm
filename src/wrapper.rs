@@ -663,6 +663,15 @@ fn submit(
                 }
                 break Verdict::Exit(code);
             }
+            // The node refused this wrapper (another protocol version): the
+            // build goes on without it. Said only when logging is on, since
+            // every crate of the build would repeat it.
+            Message::Error { message } => {
+                if std::env::var_os("CRABFARM_LOG").is_some() {
+                    eprintln!("crabfarm: {message}");
+                }
+                break Verdict::Local { reason: None };
+            }
             // A node that answers with anything else is not one to rely on.
             _ => {
                 break Verdict::Local { reason: None };

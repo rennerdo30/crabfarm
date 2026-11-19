@@ -2,6 +2,7 @@
 
 use crate::cargo_cmd::query_status;
 use crate::config;
+use crate::node::Reach;
 use crate::proto::{Message, PeerInfo, Status};
 
 fn counter(counters: &[(String, u64)], name: &str) -> u64 {
@@ -18,6 +19,20 @@ fn ago(now: u64, then: u64) -> String {
         0..=59 => format!("{s}s ago"),
         60..=3599 => format!("{}m ago", s / 60),
         _ => format!("{}h ago", s / 3600),
+    }
+}
+
+/// How job connections reach `p` (CF-34), from the node's `reach.<id>` counter.
+fn reach_of(counters: &[(String, u64)], p: &PeerInfo) -> Reach {
+    Reach::from_code(counter(counters, &format!("reach.{}", p.node_id.to_hex())))
+}
+
+fn reach_text(r: Reach) -> &'static str {
+    match r {
+        Reach::Untried => "-",
+        Reach::Direct => "direct",
+        Reach::DialBack => "dial-back",
+        Reach::Failing => "FAILING",
     }
 }
 
@@ -64,34 +79,49 @@ pub fn format_status(
             .unwrap_or(4)
             .max(4);
         out.push_str(&format!(
-            "{:<w$}  {:<28}  {:<7}  {}\n",
+            "{:<w$}  {:<28}  {:<7}  {:<9}  {}\n",
             "PEER",
             "HOST",
             "SLOTS",
+            "JOBS",
             "LAST SEEN",
             w = w
         ));
+        let mut failing = Vec::new();
         for (p, s) in peers {
+            let reach = reach_of(counters, p);
+            if s.is_some() && reach == Reach::Failing {
+                failing.push(p.node_name.as_str());
+            }
             match s {
                 Some(s) => out.push_str(&format!(
-                    "{:<w$}  {:<28}  {:<7}  {}\n",
+                    "{:<w$}  {:<28}  {:<7}  {:<9}  {}\n",
                     p.node_name,
                     s.host_triple,
                     format!("{}/{}", s.slots_busy, s.slots_total),
+                    reach_text(reach),
                     ago(now, p.last_seen),
                     w = w
                 )),
                 None => out.push_str(&format!(
-                    "{:<w$}  {:<28}  {:<7}  {}\n",
+                    "{:<w$}  {:<28}  {:<7}  {:<9}  {}\n",
                     p.node_name,
                     "-",
                     "offline",
+                    "-",
                     ago(now, p.last_seen),
                     w = w
                 )),
             }
         }
         out.push('\n');
+        if !failing.is_empty() {
+            out.push_str(&format!(
+                "warning: jobs cannot reach {} in either direction (status gets through, job connections do not); \
+                 check that the machines can open TCP connections to each other's node port (default 47070)\n\n",
+                failing.join(", "),
+            ));
+        }
     }
     let local_total: u64 = counters
         .iter()
@@ -304,6 +334,7 @@ mod tests {
             (info("laptop", 100), None),
         ];
         let counters = vec![
+            (format!("reach.{}", NodeId([2; 16]).to_hex()), 2),
             ("remote_ok".to_string(), 12),
             ("local.NoPeer".to_string(), 3),
             ("bytes_up".to_string(), 3 * 1024 * 1024),
@@ -315,5 +346,26 @@ mod tests {
         assert!(t.contains("laptop") && t.contains("offline"));
         assert!(t.contains("12 remote ok") && t.contains("3 local") && t.contains("NoPeer 3"));
         assert!(t.contains("3.0 MiB up"));
+        assert!(t.contains("dial-back"), "{t}");
+        assert!(!t.contains("warning: jobs cannot reach"));
+    }
+
+    #[test]
+    fn a_peer_jobs_cannot_reach_is_named() {
+        let p = PeerInfo {
+            node_id: NodeId([3; 16]),
+            node_name: "desktop".into(),
+            addrs: vec![],
+            last_seen: 999,
+        };
+        let counters = vec![(format!("reach.{}", NodeId([3; 16]).to_hex()), 3)];
+        let t = format_status(
+            &st("me", 8, 0),
+            &[(p, Some(st("desktop", 16, 0)))],
+            &counters,
+            1000,
+        );
+        assert!(t.contains("FAILING"), "{t}");
+        assert!(t.contains("warning: jobs cannot reach desktop"), "{t}");
     }
 }

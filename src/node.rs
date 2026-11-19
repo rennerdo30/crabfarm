@@ -44,6 +44,54 @@ const FIRST_MESSAGE: Duration = Duration::from_secs(10);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Cap for the per-peer set of blobs known to be on the peer.
 pub const MAX_SENT_HASHES: usize = 200_000;
+/// Connections this node opens at once because peers asked for a dial-back
+/// (CF-34); further requests are ignored and the asker falls back.
+const MAX_DIALBACKS: usize = 16;
+/// How long a dial-back may take from the request to the `Dialed` frame.
+pub const DIALBACK_WAIT: Duration = Duration::from_secs(6);
+
+/// How job and cache connections to a peer get through (CF-34), shown by
+/// `crabfarm status`. A peer behind a VPN or NAT is often reachable only one
+/// way; the control connection may come from the other side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Reach {
+    /// No job connection tried yet.
+    #[default]
+    Untried,
+    /// This node connects to the peer.
+    Direct,
+    /// Only the peer connects to this node: it dials back on request.
+    DialBack,
+    /// Neither way worked the last time.
+    Failing,
+}
+
+impl Reach {
+    /// The value in the status counters (`reach.<node id>`).
+    pub fn code(self) -> u64 {
+        match self {
+            Reach::Untried => 0,
+            Reach::Direct => 1,
+            Reach::DialBack => 2,
+            Reach::Failing => 3,
+        }
+    }
+
+    pub fn from_code(c: u64) -> Reach {
+        match c {
+            1 => Reach::Direct,
+            2 => Reach::DialBack,
+            3 => Reach::Failing,
+            _ => Reach::Untried,
+        }
+    }
+}
+
+/// A dial-back this node asked for and waits on.
+pub struct PendingDial {
+    pub peer: NodeId,
+    pub tx: tokio::sync::oneshot::Sender<Link>,
+}
 
 /// Caps on inbound connections, so a flood of connects (or of slow handshakes)
 /// cannot exhaust tasks and memory. Excess connections are dropped at accept.
@@ -108,6 +156,12 @@ pub struct PeerState {
     pub cache_waiters: HashMap<[u8; 32], Vec<tokio::sync::oneshot::Sender<Option<u64>>>>,
     /// At most [`CACHE_ASKS_PER_PEER`] questions to this peer at once.
     pub cache_ask: Arc<Semaphore>,
+    /// How job connections to this peer got through last (CF-34).
+    pub reach: Reach,
+    /// A direct connection failed: until then, ask for a dial-back at once.
+    pub direct_failed_until: Option<Instant>,
+    /// Neither way worked: until then the peer gets no jobs.
+    pub unreachable_until: Option<Instant>,
 }
 
 /// Cache questions in flight to one peer, at most.
@@ -201,6 +255,9 @@ impl PeerState {
             ctrl: Vec::new(),
             cache_waiters: HashMap::new(),
             cache_ask: Arc::new(Semaphore::new(CACHE_ASKS_PER_PEER)),
+            reach: Reach::Untried,
+            direct_failed_until: None,
+            unreachable_until: None,
         }
     }
 }
@@ -247,6 +304,10 @@ pub struct Node {
     /// A configured static peer is on this machine, so gossiped loopback
     /// addresses are meant (CF-19).
     allow_loopback_gossip: bool,
+    /// Dial-backs this node asked peers for, by token (CF-34).
+    pub dialbacks: Mutex<HashMap<[u8; 16], PendingDial>>,
+    /// Dial-backs this node makes for peers at once.
+    dialback_sem: Arc<Semaphore>,
 }
 
 pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -305,6 +366,9 @@ impl Node {
             "running_remote".into(),
             self.running_remote.load(Ordering::Relaxed) as u64,
         ));
+        for (id, p) in lock(&self.peers).iter() {
+            v.push((format!("reach.{}", id.to_hex()), p.reach.code()));
+        }
         v
     }
 
@@ -764,6 +828,7 @@ impl Node {
     ) {
         match m {
             Message::CacheQuery { key } => self.answer_cache_query(key, reply),
+            Message::DialBack { token } => self.dial_back(peer, token),
             Message::CacheHave { key, bytes } => self.cache_answered(peer, key, Some(bytes)),
             Message::CacheMiss { key } => self.cache_answered(peer, key, None),
             Message::PeerList { peers } => {
@@ -839,24 +904,98 @@ impl Node {
                     .await
                     .context("peer sent nothing after Hello")?;
                 match first {
-                    Some(Message::Reserve { job_id }) => {
-                        self.serve_job(node_id, link, job_id).await;
-                        Ok(())
-                    }
-                    Some(Message::CacheFetch { key }) => {
-                        self.serve_cache(link, key).await;
-                        Ok(())
-                    }
                     Some(m @ (Message::PeerList { .. } | Message::StatusUpdate(_))) => {
                         link.set_idle(Some(CONTROL_SILENCE));
                         self.run_control(node_id, hello, link, Some(m)).await;
                         Ok(())
                     }
-                    Some(_) => anyhow::bail!("unexpected first message from a peer"),
+                    Some(Message::Dialed { token }) => {
+                        self.dialed_in(node_id, token, link);
+                        Ok(())
+                    }
+                    Some(m) => self.serve_request(node_id, link, m).await,
                     None => Ok(()),
                 }
             }
         }
+    }
+
+    /// Serve the request that opens a job or cache connection, whichever side
+    /// opened it (inbound, or dialed back for the peer).
+    async fn serve_request(
+        self: &Arc<Self>,
+        peer: NodeId,
+        link: Link,
+        first: Message,
+    ) -> anyhow::Result<()> {
+        match first {
+            Message::Reserve { job_id } => {
+                self.serve_job(peer, link, job_id).await;
+                Ok(())
+            }
+            Message::CacheFetch { key } => {
+                self.serve_cache(link, key).await;
+                Ok(())
+            }
+            _ => anyhow::bail!("unexpected first message from a peer"),
+        }
+    }
+
+    /// A connection that `peer` opened because this node asked for it: hand
+    /// it to the waiting job. A token this node did not hand to exactly that
+    /// peer (or one that expired) closes the connection.
+    fn dialed_in(&self, peer: NodeId, token: [u8; 16], link: Link) {
+        // From here on it is this node's own job or cache connection, which
+        // has no idle limit when this node opens it either.
+        link.set_idle(None);
+        let pending = {
+            let mut d = lock(&self.dialbacks);
+            match d.get(&token) {
+                Some(p) if p.peer == peer => d.remove(&token),
+                _ => None,
+            }
+        };
+        match pending {
+            Some(p) => {
+                // A waiter that gave up drops the link, which closes it.
+                let _ = p.tx.send(link);
+            }
+            None => tracing::debug!("dial-back connection with an unknown token closed"),
+        }
+    }
+
+    /// `peer` cannot connect to this node: open the connection to it (CF-34).
+    /// Only the peer's own known addresses are dialed; a peer asking for more
+    /// at once than [`MAX_DIALBACKS`] is ignored and falls back on its side.
+    fn dial_back(self: &Arc<Self>, peer: NodeId, token: [u8; 16]) {
+        let Ok(permit) = self.dialback_sem.clone().try_acquire_owned() else {
+            tracing::debug!("dial-back request ignored: too many at once");
+            return;
+        };
+        let node = self.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let deadline = tokio::time::Instant::now() + DIALBACK_WAIT;
+            let Some(mut race) = node.connect_peer(peer, deadline).await else {
+                return;
+            };
+            let Some((_, conn)) = race.next().await else {
+                tracing::info!("dial-back to a peer failed: no address answered");
+                return;
+            };
+            drop(race);
+            let mut link = Link::new_with_idle(conn, Some(JOB_IDLE));
+            if link.send(Message::Dialed { token }).await.is_err() {
+                return;
+            }
+            let first = match tokio::time::timeout(FIRST_MESSAGE, link.recv()).await {
+                Ok(Some(m)) => m,
+                _ => return,
+            };
+            if let Err(e) = node.serve_request(peer, link, first).await {
+                tracing::debug!("dial-back connection: {e:#}");
+            }
+        });
     }
 
     async fn ipc_listener(self: Arc<Self>, listener: tokio::net::TcpListener, token: [u8; 32]) {
@@ -1202,6 +1341,8 @@ pub async fn run(
             .peers
             .iter()
             .any(|p| crate::discovery::is_loopback_peer(p)),
+        dialbacks: Mutex::new(HashMap::new()),
+        dialback_sem: Arc::new(Semaphore::new(MAX_DIALBACKS)),
         host_triple,
         tls,
         id,

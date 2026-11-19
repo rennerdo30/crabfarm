@@ -90,8 +90,9 @@ crabfarm cache clear    # delete everything the cache holds on this machine</pre
   <ul>
     <li><strong>The node is not running:</strong> <code>crabfarm service status</code>; <code>crabfarm service install</code> to turn autostart on and start it, or <code>crabfarm node</code> in a terminal to see what it says.</li>
     <li><strong>Everything runs locally (<code>NoPeer</code>):</strong> the machines do not see each other. Check the firewall (step 4), the network, or add <code>peers</code> (step 5).</li>
+    <li><strong><code>dial-back</code> in the JOBS column of <code>status</code>:</strong> fine. This machine cannot connect to that peer (a work notebook on a VPN, for example), but the peer can reach this machine and opens the job connections. <code>FAILING</code> means neither direction works: check the firewall on both machines and that one can reach the other.</li>
     <li><strong>The first build is slow:</strong> the desktop may have to install the Rust version your project needs, once.</li>
-    <li><strong>Version mismatch</strong> (<code>peer speaks protocol 5, this node speaks 6</code>): install the same crabfarm version on both machines.</li>
+    <li><strong>Version mismatch</strong> (<code>peer speaks protocol 6, this node speaks 7</code>): install the same crabfarm version on both machines.</li>
     <li><strong>The log:</strong> <code>%APPDATA%\renner\crabfarm\data\logs\node.log</code> holds crate names, sizes and timings, never your code.</li>
   </ul>
 

@@ -1,6 +1,6 @@
 [package]
 name = "crabfarm"
-version = "1.0.0"
+version = "1.0.0-rc.6"
 edition = "2024"
 rust-version = "1.100"
 description = "Distributed rustc over a peer-to-peer farm of Windows, macOS and Linux machines"

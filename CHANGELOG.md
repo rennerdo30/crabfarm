@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.0.0-rc.6
+
 First release, 1.0.0 (Windows to Windows farms).
 
 - **Binaries:** `crabfarm` (`node`, `farm create|invite|join|leave`, `cargo <args>`, `status`, and the rustc wrapper mode that cargo calls), `crabfarmd` (the node without a console window) and `cargo-crabfarm` (`cargo crabfarm build` = `crabfarm cargo build`).

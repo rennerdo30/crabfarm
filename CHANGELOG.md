@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.0.0-rc.7
+
 - Release candidate to test `crabfarm update` from 1.0.0-rc.6 (no other changes).
 
 ## 1.0.0-rc.6

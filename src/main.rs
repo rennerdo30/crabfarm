@@ -46,6 +46,10 @@ enum Cmd {
         /// `build.jobs` to write (default: local slots plus free remote slots).
         #[arg(long)]
         jobs: Option<u32>,
+        /// Write into the project's `.cargo/config.toml` even when git tracks
+        /// it (it then holds this machine's crabfarm path; do not commit it).
+        #[arg(long)]
+        force: bool,
     },
     /// Undo `crabfarm enable`.
     Disable {
@@ -270,10 +274,29 @@ fn cargo_home() -> Option<std::path::PathBuf> {
         .or_else(|| directories::BaseDirs::new().map(|b| b.home_dir().join(".cargo")))
 }
 
-fn enable_cmd(global: bool, jobs: Option<u32>) -> anyhow::Result<i32> {
-    use crabfarm::enable;
+fn enable_cmd(global: bool, jobs: Option<u32>, force: bool) -> anyhow::Result<i32> {
+    use crabfarm::enable::{self, GitState};
     let cwd = std::env::current_dir().context("cannot read the current directory")?;
     let file = enable::target_config(global, &cwd, cargo_home().as_deref())?;
+    // CF-32: the project file gets this machine's crabfarm path and job count;
+    // in a tracked file one commit carries them to every other machine and CI.
+    let git = if global {
+        GitState::NoRepo
+    } else {
+        enable::git_state(&file)
+    };
+    if git == GitState::Tracked && !force {
+        eprintln!(
+            "{} is tracked by git. `crabfarm enable` would write this machine's crabfarm path and job count into it, \
+             and a commit would carry them to every other machine and CI. Nothing was changed.\n\
+             Instead:\n  \
+             crabfarm cargo build ...    uses the farm for one command and changes no file (an sccache set as\n                              RUSTC_WRAPPER keeps working for local compiles)\n  \
+             crabfarm enable --global    writes your user's cargo config instead of the project's\n  \
+             crabfarm enable --force     writes the project file anyway; then do not commit it",
+            file.display()
+        );
+        return Ok(1);
+    }
     let exe = std::env::current_exe().context("cannot find my own executable")?;
     let data_dir = config::data_dir()?;
     let cfg = Config::load(&data_dir).unwrap_or_default();
@@ -321,10 +344,28 @@ fn enable_cmd(global: bool, jobs: Option<u32>) -> anyhow::Result<i32> {
         ),
         None => {}
     }
+    match git {
+        GitState::Tracked => eprintln!(
+            "WARNING: {} is tracked by git and now holds this machine's crabfarm path: do not commit it \
+             (`crabfarm disable` undoes the change).",
+            file.display()
+        ),
+        GitState::Untracked => eprintln!(
+            "NOTE: git does not ignore {}. It holds this machine's crabfarm path, so do not commit it; \
+             to keep it out of `git status`, add `/.cargo/config.toml` to .git/info/exclude.",
+            file.display()
+        ),
+        GitState::Unknown => eprintln!(
+            "NOTE: could not ask git whether {} is tracked. It holds this machine's crabfarm path, so do not commit it.",
+            file.display()
+        ),
+        GitState::Ignored | GitState::NoRepo => {}
+    }
     if let Some(name) = enable::env_wrapper_override(&|n| std::env::var_os(n)) {
         eprintln!(
             "WARNING: {name} is set in your environment. Cargo lets it override the config file, \
-             so crabfarm is NOT used until you unset {name} (a file cannot change that)."
+             so crabfarm is NOT used by plain `cargo build` while it is set (a file cannot change that). \
+             `crabfarm cargo build` works anyway: it keeps that wrapper for local compiles."
         );
     }
     println!(
@@ -376,7 +417,11 @@ fn real_main() -> anyhow::Result<i32> {
         }
         Cmd::Service { cmd } => service_cmd(cmd),
         Cmd::Path { cmd } => path_cmd(cmd),
-        Cmd::Enable { global, jobs } => enable_cmd(global, jobs),
+        Cmd::Enable {
+            global,
+            jobs,
+            force,
+        } => enable_cmd(global, jobs, force),
         Cmd::Disable {
             global,
             this_install_only,

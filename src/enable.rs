@@ -22,19 +22,22 @@ const LOCATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Directory of the workspace that contains `start`, as cargo itself sees it
 /// (`cargo locate-project --workspace`). `None` when cargo is missing, fails
 /// or does not answer within the timeout.
-fn locate_with_cargo(start: &Path) -> Option<PathBuf> {
+/// Run `cmd` (stdin closed, stderr dropped) and return its exit status and
+/// stdout. `None` when it cannot start or does not finish within `timeout`.
+/// Only small outputs are expected: stdout is read after the child exits.
+fn run_quiet(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> Option<(std::process::ExitStatus, String)> {
     use std::io::Read;
-    use std::process::{Command, Stdio};
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let mut child = Command::new(cargo)
-        .args(["locate-project", "--workspace", "--message-format", "plain"])
-        .current_dir(start)
+    use std::process::Stdio;
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let deadline = std::time::Instant::now() + LOCATE_TIMEOUT;
+    let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(s)) => break s,
@@ -49,11 +52,22 @@ fn locate_with_cargo(start: &Path) -> Option<PathBuf> {
             }
         }
     };
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    Some((status, out))
+}
+
+fn locate_with_cargo(start: &Path) -> Option<PathBuf> {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let (status, out) = run_quiet(
+        std::process::Command::new(cargo)
+            .args(["locate-project", "--workspace", "--message-format", "plain"])
+            .current_dir(start),
+        LOCATE_TIMEOUT,
+    )?;
     if !status.success() {
         return None;
     }
-    let mut out = String::new();
-    child.stdout.take()?.read_to_string(&mut out).ok()?;
     let manifest = PathBuf::from(out.trim());
     let dir = manifest.parent()?;
     // Only a manifest at or above `start` is a root for it.
@@ -84,6 +98,85 @@ pub fn find_project_root_fallback(start: &Path) -> Option<PathBuf> {
         .filter(|d| manifest_has_workspace(&d.join("Cargo.toml")))
         .last();
     Some(top_workspace.unwrap_or(nearest).to_path_buf())
+}
+
+/// How git sees the config file `enable` would write (CF-32): a tracked file
+/// must not get this machine's crabfarm path and job count, since one commit
+/// carries them to every other machine and CI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitState {
+    /// Committed (or staged): `enable` refuses without `--force`.
+    Tracked,
+    /// In a work tree, neither tracked nor ignored: shows up in `git status`.
+    Untracked,
+    /// Ignored by `.gitignore` or `.git/info/exclude`.
+    Ignored,
+    /// Not inside a git work tree.
+    NoRepo,
+    /// git is missing, failed or did not answer in time.
+    Unknown,
+}
+
+const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn git_in(dir: &Path) -> std::process::Command {
+    let mut c = std::process::Command::new("git");
+    c.current_dir(dir);
+    // Variables that would point git at another repository (set inside hooks
+    // or `git bisect run`).
+    for v in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+    ] {
+        c.env_remove(v);
+    }
+    c
+}
+
+/// Ask git about `file` (which need not exist yet; its folder may not either).
+pub fn git_state(file: &Path) -> GitState {
+    let Some(dir) = file.ancestors().skip(1).find(|d| d.is_dir()) else {
+        return GitState::Unknown;
+    };
+    let inside = run_quiet(
+        git_in(dir).args(["rev-parse", "--is-inside-work-tree"]),
+        GIT_TIMEOUT,
+    );
+    match inside {
+        Some((s, out)) if s.success() && out.trim() == "true" => {}
+        Some((s, _)) if !s.success() => return GitState::NoRepo,
+        Some(_) => return GitState::NoRepo,
+        // git missing: only a `.git` above says there may be a repository.
+        None => {
+            return if dir.ancestors().any(|d| d.join(".git").exists()) {
+                GitState::Unknown
+            } else {
+                GitState::NoRepo
+            };
+        }
+    }
+    let path = file.as_os_str();
+    match run_quiet(
+        git_in(dir)
+            .args(["ls-files", "--error-unmatch", "--"])
+            .arg(path),
+        GIT_TIMEOUT,
+    ) {
+        Some((s, _)) if s.success() => return GitState::Tracked,
+        Some((s, _)) if s.code() == Some(1) => {}
+        _ => return GitState::Unknown,
+    }
+    match run_quiet(
+        git_in(dir).args(["check-ignore", "-q", "--"]).arg(path),
+        GIT_TIMEOUT,
+    ) {
+        Some((s, _)) if s.success() => GitState::Ignored,
+        Some((s, _)) if s.code() == Some(1) => GitState::Untracked,
+        _ => GitState::Unknown,
+    }
 }
 
 /// The directory `enable` writes `.cargo/config.toml` in: the WORKSPACE root,
@@ -272,6 +365,123 @@ fn env_item_for(wrapper: &str) -> Item {
     }
 }
 
+/// What a table header has in front of it when its decor is unset: `toml_edit`
+/// puts one newline (an empty line) before every table but the first.
+const DEFAULT_TABLE_PREFIX: &str = "\n";
+
+fn table_prefix(t: &Table) -> String {
+    match t.decor().prefix() {
+        Some(p) => p.as_str().unwrap_or_default().to_string(),
+        None => DEFAULT_TABLE_PREFIX.to_string(),
+    }
+}
+
+/// The comment lines of a prefix, ending in exactly one newline (the empty
+/// lines that only separated them from the header dropped); `None` when the
+/// prefix is only whitespace.
+fn comment_part(prefix: &str) -> Option<String> {
+    (!prefix.trim().is_empty()).then(|| format!("{}\n", prefix.trim_end_matches(['\n', '\r'])))
+}
+
+/// CF-33: `toml_edit` keeps comments after the file's last key as document
+/// trailing, and a new table renders BEFORE them, splitting them from the
+/// section they close. Move them in front of the new table instead.
+fn move_trailing_before(doc: &mut DocumentMut, new_table: &str) {
+    let Some(comments) = doc.trailing().as_str().and_then(comment_part) else {
+        return;
+    };
+    let Some(t) = doc.get_mut(new_table).and_then(Item::as_table_mut) else {
+        return;
+    };
+    let own = table_prefix(t);
+    t.decor_mut().set_prefix(format!("{comments}{own}"));
+    doc.set_trailing("");
+}
+
+/// Where a table sits in the document, as keys and array indexes from the top.
+#[derive(Debug, Clone)]
+enum Seg {
+    Key(String),
+    Index(usize),
+}
+
+fn collect_tables(table: &Table, path: &mut Vec<Seg>, out: &mut Vec<(isize, Vec<Seg>)>) {
+    for (k, item) in table.iter() {
+        match item {
+            Item::Table(t) => {
+                path.push(Seg::Key(k.to_string()));
+                if let Some(p) = t.position() {
+                    out.push((p, path.clone()));
+                }
+                collect_tables(t, path, out);
+                path.pop();
+            }
+            Item::ArrayOfTables(a) => {
+                for (i, t) in a.iter().enumerate() {
+                    path.push(Seg::Key(k.to_string()));
+                    path.push(Seg::Index(i));
+                    if let Some(p) = t.position() {
+                        out.push((p, path.clone()));
+                    }
+                    collect_tables(t, path, out);
+                    path.pop();
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn table_at<'a>(doc: &'a mut DocumentMut, path: &[Seg]) -> Option<&'a mut Table> {
+    let mut t: &mut Table = doc.as_table_mut();
+    let mut i = 0;
+    while i < path.len() {
+        let Seg::Key(k) = &path[i] else { return None };
+        match (t.get_mut(k)?, path.get(i + 1)) {
+            (Item::ArrayOfTables(a), Some(Seg::Index(n))) => {
+                t = a.get_mut(*n)?;
+                i += 2;
+            }
+            (Item::Table(next), _) => {
+                t = next;
+                i += 1;
+            }
+            _ => return None,
+        }
+    }
+    Some(t)
+}
+
+/// Remove a top-level table without losing the comments in front of its
+/// header: they go to the table that follows it in the file, or to the end of
+/// the file (the inverse of [`move_trailing_before`]).
+fn remove_table_keep_comments(doc: &mut DocumentMut, name: &str) {
+    let Some(removed) = doc.remove(name) else {
+        return;
+    };
+    let Some(t) = removed.as_table() else { return };
+    let Some(comments) = comment_part(&table_prefix(t)) else {
+        return;
+    };
+    let after = t.position();
+    let mut all = Vec::new();
+    collect_tables(doc.as_table(), &mut Vec::new(), &mut all);
+    let next = after.and_then(|pos| {
+        all.into_iter()
+            .filter(|(p, _)| *p > pos)
+            .min_by_key(|(p, _)| *p)
+            .map(|(_, path)| path)
+    });
+    if let Some(next) = next.and_then(|path| table_at(doc, &path)) {
+        let own = table_prefix(next);
+        next.decor_mut().set_prefix(format!("{comments}{own}"));
+        return;
+    }
+    let rest = doc.trailing().as_str().unwrap_or_default().to_string();
+    doc.set_trailing(format!("{comments}{rest}"));
+}
+
 /// Replace a value, keeping the comment that trailed the old one.
 fn set_keep_decor(table: &mut dyn toml_edit::TableLike, key: &str, mut new: Value) {
     if let Some(old) = table.get(key).and_then(Item::as_value) {
@@ -358,6 +568,8 @@ pub fn enable_file(
     let exe_str = exe.to_string_lossy().into_owned();
     let mut doc = read_doc(file)?;
     let mut inner = None;
+    let had_build = doc.contains_key("build");
+    let had_env = doc.contains_key("env");
 
     let existing = {
         let build = table_mut(&mut doc, "build", file)?;
@@ -440,6 +652,14 @@ pub fn enable_file(
         }
     };
 
+    // `build` is always made first, so it comes first when both are new.
+    let first_new = [("build", had_build), ("env", had_env)]
+        .into_iter()
+        .find(|(name, had)| !had && doc.contains_key(name))
+        .map(|(name, _)| name);
+    if let Some(name) = first_new {
+        move_trailing_before(&mut doc, name);
+    }
     write_if_changed(file, &doc)?;
     Ok(EnableReport {
         file: file.to_path_buf(),
@@ -533,7 +753,7 @@ pub fn disable_file_if(file: &Path, only_exe: Option<&Path>) -> anyhow::Result<D
             None => {}
         }
         if build.is_empty() {
-            doc.remove("build");
+            remove_table_keep_comments(&mut doc, "build");
         }
     }
     if stored.is_some()
@@ -541,7 +761,7 @@ pub fn disable_file_if(file: &Path, only_exe: Option<&Path>) -> anyhow::Result<D
     {
         env.remove(INNER_WRAPPER_ENV);
         if env.is_empty() {
-            doc.remove("env");
+            remove_table_keep_comments(&mut doc, "env");
         }
     }
     report.restored = restore.filter(|w| !w.is_empty()).cloned();
@@ -607,6 +827,107 @@ mod tests {
         assert!(during.contains(EXE));
         disable_file(&f).unwrap();
         assert_eq!(std::fs::read_to_string(&f).unwrap(), original);
+    }
+
+    /// CF-33: the comment block that closes the last section stays with it.
+    #[test]
+    fn closing_comments_stay_above_the_new_tables_and_come_back() {
+        let d = tempfile::tempdir().unwrap();
+        let original = "[target.x86_64-unknown-linux-gnu]\nlinker = \"clang\"\n\n# Since Rust 1.90, lld is already the default linker.\n# rustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n";
+        let f = cfg_in(d.path(), original);
+        enable_file(&f, &exe(), Some(8), 0, Some("sccache")).unwrap();
+        let during = std::fs::read_to_string(&f).unwrap();
+        assert!(
+            during.starts_with(original),
+            "the old file must come first, unchanged:\n{during}"
+        );
+        let comment = during.find("# rustflags").unwrap();
+        assert!(comment < during.find("[build]").unwrap());
+        assert!(comment < during.find("[env]").unwrap());
+        assert_eq!(
+            parsed(&f)["env"][INNER_WRAPPER_ENV].as_str(),
+            Some("sccache")
+        );
+        disable_file(&f).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), original);
+    }
+
+    #[test]
+    fn a_new_env_table_also_goes_below_the_closing_comments() {
+        let d = tempfile::tempdir().unwrap();
+        let original =
+            "[build]\nrustc-wrapper = \"sccache\"\n\n[net]\nretry = 2\n# offline = true\n";
+        let f = cfg_in(d.path(), original);
+        enable_file(&f, &exe(), Some(8), 0, None).unwrap();
+        let during = std::fs::read_to_string(&f).unwrap();
+        assert!(
+            during.find("# offline").unwrap() < during.find("[env]").unwrap(),
+            "{during}"
+        );
+        disable_file(&f).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), original);
+    }
+
+    #[test]
+    fn removing_a_table_hands_its_comments_to_the_next_one() {
+        let d = tempfile::tempdir().unwrap();
+        let text = format!(
+            "# about the wrapper\n[build]\nrustc-wrapper = {}\n\n[net]\nretry = 2\n",
+            toml_edit::Value::from(EXE)
+        );
+        let f = cfg_in(d.path(), &text);
+        assert!(disable_file(&f).unwrap().was_enabled);
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "# about the wrapper\n\n[net]\nretry = 2\n"
+        );
+    }
+
+    #[test]
+    fn git_state_tells_tracked_untracked_and_ignored_apart() {
+        let git_ok = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !git_ok {
+            eprintln!("git not found; skipped");
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let git = |args: &[&str]| {
+            let s = git_in(root)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+                .args([
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=.no-hooks",
+                ])
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(s.success(), "git {args:?}");
+        };
+        let f = root.join(".cargo").join("config.toml");
+        assert_eq!(git_state(&f), GitState::NoRepo);
+        git(&["init", "-q"]);
+        assert_eq!(
+            git_state(&f),
+            GitState::Untracked,
+            "missing file and folder"
+        );
+        cfg_in(root, "[net]\nretry = 2\n");
+        assert_eq!(git_state(&f), GitState::Untracked);
+        git(&["add", ".cargo/config.toml"]);
+        assert_eq!(git_state(&f), GitState::Tracked, "staged counts");
+        git(&["commit", "-q", "-m", "c"]);
+        assert_eq!(git_state(&f), GitState::Tracked);
+        git(&["rm", "-q", "--cached", ".cargo/config.toml"]);
+        std::fs::write(root.join(".gitignore"), "/.cargo/config.toml\n").unwrap();
+        assert_eq!(git_state(&f), GitState::Ignored);
     }
 
     #[test]

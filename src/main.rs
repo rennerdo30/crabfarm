@@ -120,6 +120,14 @@ enum FarmCmd {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Take this machine out of its farm, so it can join or create another.
+    /// Stops the node; the old identity is moved aside, not deleted.
+    Leave {
+        /// Needed on the machine that created the farm: machines that joined
+        /// it can then no longer be invited and must join a new farm.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn is_wrapper_invocation(arg1: &str) -> bool {
@@ -440,7 +448,50 @@ fn farm_cmd(cmd: FarmCmd) -> anyhow::Result<i32> {
             );
             Ok(0)
         }
+        FarmCmd::Leave { yes } => leave_cmd(&data_dir, yes),
     }
+}
+
+fn leave_cmd(data_dir: &Path, yes: bool) -> anyhow::Result<i32> {
+    use crabfarm::daemon;
+    if !farm::has_identity(data_dir) {
+        println!("This machine is not in a farm; nothing to leave.");
+        return Ok(0);
+    }
+    let farm_id = farm::load(data_dir)
+        .ok()
+        .flatten()
+        .map(|id| id.short_farm_id());
+    let named = farm_id
+        .as_deref()
+        .map(|f| format!("farm {f}"))
+        .unwrap_or_else(|| "its farm".into());
+    if farm::holds_ca_key(data_dir) && !yes {
+        eprintln!(
+            "This machine created {named}. After leaving, nobody can invite to that farm any more: \
+             every machine that joined it must also run `crabfarm farm leave` and join a new farm.\n\
+             Run `crabfarm farm leave --yes` to go ahead."
+        );
+        return Ok(1);
+    }
+    if daemon::stop_node(data_dir, daemon::STOP_TIMEOUT)? {
+        println!("Stopped the node.");
+    }
+    // Held while the files move, so no node can start on a half-moved identity.
+    let _lock = node::NodeLock::acquire(data_dir)
+        .context("the node is still running; stop it with `crabfarm node --stop` and try again")?;
+    let Some(backup) = farm::leave(data_dir)? else {
+        println!("This machine is not in a farm; nothing to leave.");
+        return Ok(0);
+    };
+    println!(
+        "Left {named}. The old identity is kept in {} (delete it once you are sure).",
+        backup.display()
+    );
+    println!(
+        "Next: `crabfarm farm join <code>` with a code from `crabfarm farm invite` on the farm's first machine, or `crabfarm farm create` for a new farm."
+    );
+    Ok(0)
 }
 
 /// First LAN IPv4 of this machine plus the node's port: the one written by a

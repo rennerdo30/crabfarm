@@ -321,7 +321,7 @@ pub fn create(data_dir: &Path, node_name: &str) -> anyhow::Result<Identity> {
     let p = paths(data_dir);
     ensure!(
         !p.node_crt.exists() && !p.ca_crt.exists() && !p.ca_key.exists(),
-        "a farm identity already exists in {}",
+        "a farm identity already exists in {} (`crabfarm farm leave` takes this machine out of its farm)",
         data_dir.display()
     );
     let ca_kp = KeyPair::generate_for(&PKCS_ED25519)?;
@@ -390,6 +390,77 @@ pub fn load(data_dir: &Path) -> anyhow::Result<Option<Identity>> {
         "node.id does not match the node certificate"
     );
     Ok(Some(id))
+}
+
+// ---------------------------------------------------------------- leave
+
+/// Everything that ties `data_dir` to one farm, `node.crt` first: its absence
+/// is what `load` reads as "not in a farm", so an interrupted leave can only
+/// leave a machine that is out of the farm and can run `leave` again.
+fn farm_entries(data_dir: &Path) -> Vec<PathBuf> {
+    let p = paths(data_dir);
+    vec![
+        p.node_crt,
+        p.node_key,
+        p.node_id,
+        p.blob_key,
+        p.cache_key,
+        data_dir.join("peers.toml"),
+        data_dir.join("farm"),
+    ]
+}
+
+/// Whether any part of a farm identity is in `data_dir` (also a half-written
+/// or half-left one, which `load` and `join` would trip over).
+pub fn has_identity(data_dir: &Path) -> bool {
+    farm_entries(data_dir).iter().any(|p| p.exists())
+}
+
+/// Whether this machine created its farm: it holds the CA key, so it is the
+/// only one that can invite.
+pub fn holds_ca_key(data_dir: &Path) -> bool {
+    paths(data_dir).ca_key.exists()
+}
+
+/// Take this machine out of its farm: move every identity file into a new
+/// folder `data_dir/left-farms/<unix time>` and return it (`Ok(None)` when
+/// there was nothing to move). Nothing is deleted; afterwards `create` and
+/// `join` work again. The caller makes sure no node uses `data_dir`.
+pub fn leave(data_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let present: Vec<PathBuf> = farm_entries(data_dir)
+        .into_iter()
+        .filter(|p| p.exists())
+        .collect();
+    if present.is_empty() {
+        return Ok(None);
+    }
+    let parent = data_dir.join("left-farms");
+    std::fs::create_dir_all(&parent).with_context(|| format!("create {}", parent.display()))?;
+    let stamp = unix_now();
+    let mut backup = None;
+    for n in 0..100u32 {
+        let dir = if n == 0 {
+            parent.join(stamp.to_string())
+        } else {
+            parent.join(format!("{stamp}-{n}"))
+        };
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {
+                backup = Some(dir);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("create {}", dir.display())),
+        }
+    }
+    let backup = backup.context("no free folder name under left-farms")?;
+    for src in present {
+        let name = src.file_name().context("identity path has no file name")?;
+        let dst = backup.join(name);
+        std::fs::rename(&src, &dst)
+            .with_context(|| format!("move {} to {}", src.display(), dst.display()))?;
+    }
+    Ok(Some(backup))
 }
 
 // ---------------------------------------------------------------- join code
@@ -743,7 +814,7 @@ pub async fn join(
     let p = paths(data_dir);
     ensure!(
         !p.node_crt.exists() && !p.ca_crt.exists(),
-        "this machine already has a farm identity in {}",
+        "this machine is already in a farm (identity in {}); run `crabfarm farm leave` first to join another one",
         data_dir.display()
     );
 
@@ -893,6 +964,68 @@ mod tests {
         for s in bad {
             assert!(JoinCode::parse(&s).is_err(), "should reject {s:?}");
         }
+    }
+
+    #[test]
+    fn leave_moves_the_identity_aside_so_create_works_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        assert!(!has_identity(d));
+        assert!(leave(d).unwrap().is_none(), "nothing to leave");
+        assert!(
+            !d.join("left-farms").exists(),
+            "an empty leave creates nothing"
+        );
+
+        let first = create(d, "alpha").unwrap();
+        std::fs::write(d.join("peers.toml"), "").unwrap();
+        std::fs::write(d.join("config.toml"), "node_name = 'alpha'").unwrap();
+        std::fs::create_dir_all(d.join("ccache")).unwrap();
+        assert!(has_identity(d) && holds_ca_key(d));
+
+        let backup = leave(d).unwrap().expect("moved");
+        assert!(backup.starts_with(d.join("left-farms")));
+        assert!(!has_identity(d) && !holds_ca_key(d));
+        assert!(load(d).unwrap().is_none());
+        for kept in [
+            "node.crt",
+            "node.key",
+            "node.id",
+            "blob.key",
+            "cache.key",
+            "peers.toml",
+        ] {
+            assert!(backup.join(kept).is_file(), "{kept} kept in the backup");
+        }
+        assert!(backup.join("farm").join("ca.key").is_file());
+        assert!(
+            d.join("config.toml").is_file() && d.join("ccache").is_dir(),
+            "settings and the compile cache stay"
+        );
+        // The backup is a complete identity of the old farm.
+        assert_eq!(
+            load(&backup).unwrap().unwrap().short_farm_id(),
+            first.short_farm_id()
+        );
+
+        let second = create(d, "alpha").unwrap();
+        assert_ne!(second.short_farm_id(), first.short_farm_id());
+        let again = leave(d).unwrap().expect("moved");
+        assert_ne!(again, backup, "a second leave gets its own folder");
+    }
+
+    #[test]
+    fn leave_finishes_a_half_left_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        create(d, "alpha").unwrap();
+        // As if an earlier leave stopped right after moving node.crt.
+        std::fs::remove_file(d.join("node.crt")).unwrap();
+        assert!(load(d).unwrap().is_none());
+        assert!(has_identity(d), "the rest still blocks join");
+        assert!(leave(d).unwrap().is_some());
+        assert!(!has_identity(d));
+        create(d, "alpha").unwrap();
     }
 
     #[test]

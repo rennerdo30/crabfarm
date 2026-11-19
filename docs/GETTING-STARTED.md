@@ -39,6 +39,8 @@ Run the same setup on the notebook (no admin rights needed, so a managed work no
 crabfarm farm join cf1-PASTE-THE-CODE-HERE --name notebook
 ```
 
+Run only `join` here, never `farm create`: a second `create` makes a separate farm that the desktop cannot see. If that already happened, or `join` says this machine is already in a farm, run `crabfarm farm leave` (add `--yes` if this machine created the farm) and join again. It stops the node and keeps the old identity in `left-farms\` in the data folder; nothing is deleted.
+
 The node starts by itself. Check that both machines see each other:
 
 ```powershell

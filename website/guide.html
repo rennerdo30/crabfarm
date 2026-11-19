@@ -44,6 +44,7 @@ crabfarm farm invite</pre>
 <pre>crabfarm farm join cf1-PASTE-THE-CODE-HERE --name notebook
 crabfarm status</pre>
   <p>The first line of <code>status</code> should say <code>farm: 1 of 1 peers online</code>.</p>
+  <p>Run only <code>join</code> on the notebook, never <code>farm create</code>: a second <code>create</code> makes a separate farm. If that happened, or <code>join</code> says the machine is already in a farm, run <code>crabfarm farm leave</code> (with <code>--yes</code> on a machine that created a farm) and join again. The old identity is kept in <code>left-farms</code> in the data folder.</p>
 
   <h2>4. The Windows Firewall question</h2>
   <p>The first time the node listens on the network Windows asks whether to allow <code>crabfarmd</code>. Tick <em>Private networks</em> only. Answering it needs administrator rights, which a standard user on a managed notebook does not have. If the prompt never appeared, an administrator can add the rule once (admin PowerShell):</p>

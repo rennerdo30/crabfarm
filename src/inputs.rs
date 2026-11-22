@@ -22,6 +22,10 @@ pub struct Collected {
 pub enum CollectError {
     TooLarge,
     MissingNativeLib(String),
+    /// A generated `.rs` file in `OUT_DIR` embeds the submitter's literal
+    /// package or `OUT_DIR` path (CF-43, e.g. `khronos_api`), so rustc on a
+    /// peer would try to open that unmapped path outside its sandbox.
+    EmbeddedLocalPath,
     Io(std::io::Error),
 }
 
@@ -43,6 +47,9 @@ impl std::fmt::Display for CollectError {
             CollectError::TooLarge => write!(f, "job inputs exceed the size cap"),
             CollectError::MissingNativeLib(n) => {
                 write!(f, "native library `{n}` not found in the search dirs")
+            }
+            CollectError::EmbeddedLocalPath => {
+                write!(f, "generated file in OUT_DIR embeds a local path")
             }
             CollectError::Io(e) => write!(f, "reading job inputs: {e}"),
         }
@@ -170,6 +177,81 @@ fn walk(root: &Path, is_package: bool, max_file: u64, acc: &mut Acc) -> Result<(
     Ok(())
 }
 
+/// Spellings under which a local directory path can appear inside a generated
+/// `.rs` file in `OUT_DIR` (raw `\`, forward `/`, backslash `\`, and escaped `\\`).
+fn path_needles(dirs: &[&Path]) -> Vec<String> {
+    let mut out = Vec::new();
+    for dir in dirs {
+        let s = dir.to_string_lossy();
+        let trimmed = s.trim_end_matches(['\\', '/']);
+        if trimmed.len() < 3 {
+            continue;
+        }
+        let mut variants = vec![
+            trimmed.to_string(),
+            trimmed.replace('\\', "/"),
+            trimmed.replace('\\', "\\\\"),
+        ];
+        if cfg!(windows) && trimmed.contains('/') {
+            let bs = trimmed.replace('/', "\\");
+            variants.push(bs.replace('\\', "\\\\"));
+            variants.push(bs);
+        }
+        for v in variants {
+            let v = if cfg!(windows) {
+                v.to_ascii_lowercase()
+            } else {
+                v
+            };
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        }
+    }
+    out
+}
+
+/// True when a generated `.rs` file in `OUT_DIR` contains a non-comment line
+/// mentioning one of the submitter's local directory paths (CF-43, e.g.
+/// `khronos_api` baking `CARGO_MANIFEST_DIR` into `include_bytes!`). Streams
+/// line-by-line and fails closed (`true`) on non-UTF-8 `.rs` files.
+fn rs_embeds_local_path(path: &Path, needles: &[String]) -> std::io::Result<bool> {
+    use std::io::{BufRead, BufReader};
+    if needles.is_empty()
+        || !path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("rs"))
+    {
+        return Ok(false);
+    }
+    let mut reader = BufReader::new(std::fs::File::open(path)?);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        if reader.read_until(b'\n', &mut buf)? == 0 {
+            break;
+        }
+        let Ok(line) = std::str::from_utf8(&buf) else {
+            // Non-UTF-8 `.rs` in OUT_DIR: fail closed and run locally.
+            return Ok(true);
+        };
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if cfg!(windows) {
+            let lower = trimmed.to_ascii_lowercase();
+            if needles.iter().any(|n| lower.contains(n.as_str())) {
+                return Ok(true);
+            }
+        } else if needles.iter().any(|n| trimmed.contains(n.as_str())) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn collect_with_limits(
     package_dir: &Path,
     out_dir_env: Option<&Path>,
@@ -188,6 +270,12 @@ fn collect_with_limits(
     walk(package_dir, true, max_file, &mut acc)?;
     if let Some(out) = out_dir_env {
         walk(out, false, max_file, &mut acc)?;
+        let needles = path_needles(&[package_dir, out]);
+        for (path, _, _) in &acc.files {
+            if path.starts_with(out) && rs_embeds_local_path(path, &needles)? {
+                return Err(CollectError::EmbeddedLocalPath);
+            }
+        }
     }
     for (kind, name) in link_libs {
         // Only static libraries are read at compile time of an rlib.
@@ -561,5 +649,94 @@ mod tests {
         let (h, size) = HashCache::default().hash(&client, &f).expect("hash");
         assert_eq!(h, BlobHash::of(&data));
         assert_eq!(size, 300_000);
+    }
+
+    /// CF-43: a build script that bakes the submitter's literal package path
+    /// into a generated `.rs` file in `OUT_DIR` (like `khronos_api`) cannot
+    /// compile inside a peer's sandbox.
+    #[test]
+    fn out_dir_rs_embedding_package_path_is_refused() {
+        let d = tempfile::tempdir().expect("tmp");
+        let pkg = d.path().join("khronos_api-3.1.0");
+        let out = d.path().join("out");
+        write(
+            &pkg.join("src/lib.rs"),
+            b"include!(concat!(env!(\"OUT_DIR\"), \"/exts.rs\"));",
+        );
+        write(&pkg.join("api_webgl/ext.xml"), b"<xml/>");
+        let embedded = format!(
+            "pub const X: &[u8] = include_bytes!(r\"{}\");\n",
+            pkg.join("api_webgl/ext.xml").display()
+        );
+        write(&out.join("exts.rs"), embedded.as_bytes());
+        assert!(
+            matches!(
+                collect(&pkg, Some(&out), &[], &[], true),
+                Err(CollectError::EmbeddedLocalPath)
+            ),
+            "OUT_DIR .rs file with hardcoded package path must not go remote"
+        );
+        // Escaped backslash and forward-slash forms are caught too.
+        let escaped = format!(
+            "pub const X: &[u8] = include_bytes!(\"{}\");\n",
+            pkg.join("api_webgl/ext.xml")
+                .display()
+                .to_string()
+                .replace('\\', "\\\\")
+        );
+        write(&out.join("exts.rs"), escaped.as_bytes());
+        assert!(matches!(
+            collect(&pkg, Some(&out), &[], &[], true),
+            Err(CollectError::EmbeddedLocalPath)
+        ));
+        let slashed = format!(
+            "pub const X: &[u8] = include_bytes!(\"{}\");\n",
+            pkg.join("api_webgl/ext.xml")
+                .display()
+                .to_string()
+                .replace('\\', "/")
+        );
+        write(&out.join("exts.rs"), slashed.as_bytes());
+        assert!(matches!(
+            collect(&pkg, Some(&out), &[], &[], true),
+            Err(CollectError::EmbeddedLocalPath)
+        ));
+        // A comment mentioning the path, or normal generated code, stays remote-eligible.
+        let comment = format!(
+            "// generated from {}\npub const X: &str = \"ok\";\n",
+            pkg.display()
+        );
+        write(&out.join("exts.rs"), comment.as_bytes());
+        assert!(collect(&pkg, Some(&out), &[], &[], true).is_ok());
+
+        // Embedding OUT_DIR itself is caught too.
+        let out_embed = format!(
+            "pub const DATA: &[u8] = include_bytes!(r\"{}\");\n",
+            out.join("blob.bin").display()
+        );
+        write(&out.join("exts.rs"), out_embed.as_bytes());
+        assert!(matches!(
+            collect(&pkg, Some(&out), &[], &[], true),
+            Err(CollectError::EmbeddedLocalPath)
+        ));
+
+        // Non-UTF-8 generated `.rs` fails closed (runs locally).
+        write(&out.join("exts.rs"), b"\xff\xfeinvalid utf8");
+        assert!(matches!(
+            collect(&pkg, Some(&out), &[], &[], true),
+            Err(CollectError::EmbeddedLocalPath)
+        ));
+
+        // OUT_DIR nested inside package_dir (non-target dir) is still checked.
+        let nested_out = pkg.join("gen_out");
+        let nested_embed = format!(
+            "pub const X: &[u8] = include_bytes!(r\"{}\");\n",
+            pkg.join("api_webgl/ext.xml").display()
+        );
+        write(&nested_out.join("nested.rs"), nested_embed.as_bytes());
+        assert!(matches!(
+            collect(&pkg, Some(&nested_out), &[], &[], true),
+            Err(CollectError::EmbeddedLocalPath)
+        ));
     }
 }

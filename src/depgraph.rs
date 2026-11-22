@@ -84,6 +84,27 @@ pub fn is_proc_macro_lib(p: &ClientPath) -> bool {
     lower.ends_with(".dll") || lower.ends_with(".so") || lower.ends_with(".dylib")
 }
 
+/// Sibling `.rlib` path for an `.rmeta` file, or `None` for any other path.
+fn sibling_rlib(p: &ClientPath) -> Option<ClientPath> {
+    let suffix_len = ".rmeta".len();
+    if p.path.len() <= suffix_len {
+        return None;
+    }
+    let split = p.path.len() - suffix_len;
+    if !p.path.is_char_boundary(split) {
+        return None;
+    }
+    let (stem, ext) = p.path.split_at(split);
+    let is_rmeta = match p.style {
+        crate::proto::PathStyle::Windows => ext.eq_ignore_ascii_case(".rmeta"),
+        crate::proto::PathStyle::Posix => ext == ".rmeta",
+    };
+    is_rmeta.then(|| ClientPath {
+        style: p.style,
+        path: format!("{stem}.rlib"),
+    })
+}
+
 impl DepGraph {
     /// A missing file is an empty graph; a corrupt one too (it is only a cache).
     pub fn load(path: &Path) -> DepGraph {
@@ -190,14 +211,37 @@ impl DepGraph {
     /// The `--extern` files plus everything they were built from, transitively.
     /// Every file on the way must be known and unchanged.
     pub fn closure(&self, externs: &[ClientPath]) -> Result<Vec<ClientPath>, Unknown> {
-        self.closure_at(externs, now_secs())
+        self.closure_for(externs, false)
     }
 
-    fn closure_at(&self, externs: &[ClientPath], now: u64) -> Result<Vec<ClientPath>, Unknown> {
+    /// Like [`closure`], with `need_rlib = true` for linking crates (proc
+    /// macros, CF-41): pipelined intermediate `lib` crates record `.rmeta` for
+    /// their dependencies, whereas a proc macro links and needs the sibling
+    /// `.rlib` of every transitive library dependency in `-L dependency=`.
+    pub fn closure_for(
+        &self,
+        externs: &[ClientPath],
+        need_rlib: bool,
+    ) -> Result<Vec<ClientPath>, Unknown> {
+        self.closure_at(externs, now_secs(), need_rlib)
+    }
+
+    fn closure_at(
+        &self,
+        externs: &[ClientPath],
+        now: u64,
+        need_rlib: bool,
+    ) -> Result<Vec<ClientPath>, Unknown> {
         let mut seen: HashSet<ClientPath> = HashSet::new();
         let mut order: Vec<ClientPath> = Vec::new();
-        let mut stack: Vec<ClientPath> = externs.iter().rev().cloned().collect();
-        while let Some(p) = stack.pop() {
+        let mut stack: Vec<(ClientPath, bool)> =
+            externs.iter().rev().cloned().map(|p| (p, true)).collect();
+        while let Some((raw, is_direct)) = stack.pop() {
+            let p = if need_rlib && !is_direct {
+                sibling_rlib(&raw).unwrap_or(raw)
+            } else {
+                raw
+            };
             if !seen.insert(p.clone()) {
                 continue;
             }
@@ -215,7 +259,7 @@ impl DepGraph {
                 }
             }
             for x in e.externs.iter().rev() {
-                stack.push(x.clone());
+                stack.push((x.clone(), false));
             }
             order.push(p);
         }
@@ -300,9 +344,9 @@ mod tests {
         let a = make(d.path(), "liba.rmeta", "a");
         let mut g = DepGraph::default();
         g.begin_at(std::slice::from_ref(&a), &[], 1000);
-        assert!(g.closure_at(std::slice::from_ref(&a), 1100).is_ok());
+        assert!(g.closure_at(std::slice::from_ref(&a), 1100, false).is_ok());
         assert_eq!(
-            g.closure_at(std::slice::from_ref(&a), 1000 + PENDING_TTL_SECS + 1),
+            g.closure_at(std::slice::from_ref(&a), 1000 + PENDING_TTL_SECS + 1, false),
             Err(Unknown::NotRecorded(a))
         );
     }
@@ -342,5 +386,62 @@ mod tests {
         assert!(is_proc_macro_lib(&p("/t/deps/libderive_mac-1.so")));
         assert!(!is_proc_macro_lib(&p("/t/deps/libcore_lib-1.rlib")));
         assert!(!is_proc_macro_lib(&p("/t/deps/libcore_lib-1.rmeta")));
+    }
+
+    /// CF-41: a pipelined intermediate `lib` crate records `.rmeta` for its
+    /// dependency; when a proc macro links against that intermediate `.rlib`,
+    /// the transitive closure must ship the dependency's `.rlib` too.
+    #[test]
+    fn proc_macro_closure_includes_transitive_rlib_when_intermediate_was_pipelined() {
+        let d = tempfile::tempdir().unwrap();
+        let a_rmeta = make(d.path(), "libunicode_ident-1.rmeta", "meta");
+        let a_rlib = make(d.path(), "libunicode_ident-1.rlib", "rlib");
+        let b_rmeta = make(d.path(), "libproc_macro2-2.rmeta", "meta2");
+        let b_rlib = make(d.path(), "libproc_macro2-2.rlib", "rlib2");
+        let mut g = DepGraph::default();
+        g.record(&[a_rmeta.clone(), a_rlib.clone()], &[]);
+        // Pipelining: proc_macro2 was compiled against unicode_ident's .rmeta.
+        g.record(
+            &[b_rmeta.clone(), b_rlib.clone()],
+            std::slice::from_ref(&a_rmeta),
+        );
+        // A normal lib crate still gets the `.rmeta` it was pipelined against.
+        let lib_got = g.closure(std::slice::from_ref(&b_rlib)).unwrap();
+        assert!(lib_got.contains(&a_rmeta), "{lib_got:?}");
+        // A proc macro needs the transitive `.rlib` to link.
+        let pm_got = g.closure_for(std::slice::from_ref(&b_rlib), true).unwrap();
+        assert!(
+            pm_got.contains(&a_rlib),
+            "missing transitive rlib {a_rlib:?} in {pm_got:?}"
+        );
+        // If that `.rlib` changed on disk, closure_for notices it too.
+        std::fs::write(a_rlib.to_local(), "rlib-modified").unwrap();
+        assert_eq!(
+            g.closure_for(std::slice::from_ref(&b_rlib), true),
+            Err(Unknown::Changed(a_rlib))
+        );
+        // Missing sibling .rlib fails safe to local with NotRecorded rather
+        // than shipping a transitive .rmeta that rustc cannot link into a proc macro.
+        let orphan_rmeta = make(d.path(), "liborphan-1.rmeta", "meta");
+        let mid_orphan = make(d.path(), "libmid_orphan-1.rlib", "mid");
+        g.begin(std::slice::from_ref(&orphan_rmeta), &[]);
+        g.finish(std::slice::from_ref(&orphan_rmeta), true);
+        g.begin(
+            std::slice::from_ref(&mid_orphan),
+            std::slice::from_ref(&orphan_rmeta),
+        );
+        g.finish(std::slice::from_ref(&mid_orphan), true);
+        let err = g
+            .closure_for(&[mid_orphan], true)
+            .expect_err("missing sibling rlib must fail safe");
+        assert!(matches!(err, Unknown::NotRecorded(ref p) if p.path.ends_with("liborphan-1.rlib")));
+
+        // Windows uppercase .RMETA promotes to sibling .rlib as well.
+        let win_upper =
+            ClientPath::parse(crate::proto::PathStyle::Windows, r"C:\deps\LIBFOO-1.RMETA").unwrap();
+        assert_eq!(
+            sibling_rlib(&win_upper).map(|p| p.path),
+            Some(r"C:\deps\LIBFOO-1.rlib".into())
+        );
     }
 }

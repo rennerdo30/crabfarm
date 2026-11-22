@@ -705,6 +705,22 @@ pub fn render_args(args: &[Arg], map: &dyn Fn(&ClientPath) -> String) -> Vec<Str
         .collect()
 }
 
+/// True when an invocation is a build-script probe (CF-42): `OUT_DIR` is set
+/// and either `--out-dir` or the primary input file lies under `OUT_DIR`.
+/// Build scripts (`anyhow`, `thiserror`, `proc_macro2`, `autocfg`, ...) invoke
+/// `rustc` through `RUSTC_WRAPPER` on small compiler-feature probes whose
+/// failure on stable is expected; keeping them local avoids wasted round trips
+/// and false remote-failure counts.
+pub fn is_build_script_probe(cand: &RemoteCandidate, out_dir_env: Option<&str>) -> bool {
+    let Some(env_out) = out_dir_env.filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let Some(env_cp) = ClientPath::parse(cand.out_dir.style, env_out) else {
+        return false;
+    };
+    cand.out_dir.starts_with(&env_cp) || cand.input.starts_with(&env_cp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1525,5 +1541,46 @@ mod tests {
         for (got, want) in rendered.iter().zip(&with_target) {
             assert_eq!(norm(got), norm(want));
         }
+    }
+
+    /// CF-42: build scripts (`anyhow`, `thiserror`, `proc_macro2`, `autocfg`)
+    /// probe the compiler with `--out-dir` or the source file inside `OUT_DIR`.
+    /// Real crates with a build script have `--out-dir` outside `OUT_DIR`.
+    #[test]
+    fn build_script_probes_inside_out_dir_are_detected() {
+        let o = opts(true);
+        let out_dir = r"E:\w\tgt\debug\build\anyhow-123456\out";
+        // anyhow / thiserror style: package probe source, --out-dir = OUT_DIR.
+        let anyhow_probe = remote(
+            &v(
+                "--crate-name anyhow --edition=2018 build/probe.rs --crate-type lib --emit=dep-info,metadata --out-dir E:/w/tgt/debug/build/anyhow-123456/out",
+            ),
+            &o,
+        );
+        assert!(is_build_script_probe(&anyhow_probe, Some(out_dir)));
+        assert!(!is_build_script_probe(&anyhow_probe, None));
+
+        // autocfg style: source file inside OUT_DIR too.
+        let autocfg_probe = remote(
+            &v(
+                "--crate-name probe1 E:/w/tgt/debug/build/anyhow-123456/out/probe1.rs --crate-type lib --out-dir E:/w/tgt/debug/deps",
+            ),
+            &o,
+        );
+        assert!(is_build_script_probe(&autocfg_probe, Some(out_dir)));
+
+        // Normal crate with a build script: --out-dir is deps (or another unit's out dir).
+        let normal = remote(&v(BASE), &o);
+        assert!(!is_build_script_probe(&normal, Some(out_dir)));
+        let cargo1100 = remote(
+            &v(
+                "--crate-name util src/lib.rs --crate-type lib --emit=dep-info,metadata,link --out-dir E:/w/tgt/debug/build/util/libhash/out",
+            ),
+            &o,
+        );
+        assert!(!is_build_script_probe(
+            &cargo1100,
+            Some(r"E:\w\tgt\debug\build\util\bshash\out")
+        ));
     }
 }

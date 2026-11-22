@@ -224,7 +224,7 @@ const JOB_SLACK: Duration = Duration::from_secs(120);
 /// What the node knows about the liveness of the work behind one `Submit`.
 /// The keepalive to the wrapper is sent only while this says the job is alive,
 /// so a wrapper never mistakes "the node is up" for "my job is progressing".
-struct Liveness {
+pub(crate) struct Liveness {
     base: Instant,
     last_ms: AtomicU64,
     /// A remote attempt is in flight (waiting on a peer).
@@ -234,7 +234,7 @@ struct Liveness {
 }
 
 impl Liveness {
-    fn new() -> Arc<Liveness> {
+    pub(crate) fn new() -> Arc<Liveness> {
         Arc::new(Liveness {
             base: Instant::now(),
             last_ms: AtomicU64::new(0),
@@ -584,12 +584,47 @@ struct Built {
     macros: Vec<BlobHash>,
 }
 
+/// Why preparing a job's inputs failed. Kept richer than `LocalReason` so
+/// `unknown_dep.*` counters are incremented only when a job actually falls
+/// back for `UnknownDependency`, not when `plan` picks `NoPeer`/`LocalSlotFree`
+/// (CF-44).
+enum PrepError {
+    Local(LocalReason),
+    UnknownDep(crate::depgraph::Unknown),
+}
+
+/// True when `spec.args` compiles a `proc-macro` crate (which links and needs
+/// transitive `.rlib` files rather than `.rmeta`, CF-41).
+fn is_proc_macro_crate(spec: &JobSpec) -> bool {
+    let mut i = 0;
+    while i < spec.args.len() {
+        if let crate::proto::Arg::Plain(a) = &spec.args[i] {
+            let val = if a == "--crate-type" {
+                i += 1;
+                match spec.args.get(i) {
+                    Some(crate::proto::Arg::Plain(v)) => Some(v.as_str()),
+                    _ => None,
+                }
+            } else {
+                a.strip_prefix("--crate-type=")
+            };
+            if let Some(v) = val
+                && v.split(',').any(|t| t.trim() == "proc-macro")
+            {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Collect and hash everything the job needs (DESIGN section 8).
-fn build_inputs(node: &Node, spec: &JobSpec, info: &SubmitInfo) -> Result<Built, LocalReason> {
+fn build_inputs(node: &Node, spec: &JobSpec, info: &SubmitInfo) -> Result<Built, PrepError> {
     let pkg = env_path(spec, "CARGO_MANIFEST_DIR")
         .map(|p| p.to_local())
         .or_else(|| info.input.to_local().parent().map(PathBuf::from))
-        .ok_or(LocalReason::NotEligible)?;
+        .ok_or(PrepError::Local(LocalReason::NotEligible))?;
     let out_dir_env = env_path(spec, "OUT_DIR").map(|p| p.to_local());
     let search: Vec<(String, PathBuf)> = info
         .search_dirs
@@ -604,30 +639,35 @@ fn build_inputs(node: &Node, spec: &JobSpec, info: &SubmitInfo) -> Result<Built,
         &info.link_libs,
         spec.target.contains("msvc"),
     )
-    .map_err(|e| {
-        tracing::debug!(
-            crate_name = spec.crate_name.as_str(),
-            "input collection: {e}"
-        );
-        match e {
-            CollectError::TooLarge => LocalReason::TooLarge,
-            _ => LocalReason::NotEligible,
+    .map_err(|e| match e {
+        CollectError::TooLarge => {
+            tracing::info!(
+                crate_name = spec.crate_name.as_str(),
+                "running locally: {e} (limit {} MiB)",
+                inputs::MAX_TOTAL / (1024 * 1024)
+            );
+            PrepError::Local(LocalReason::TooLarge)
+        }
+        CollectError::EmbeddedLocalPath => {
+            tracing::info!(
+                crate_name = spec.crate_name.as_str(),
+                "running locally: {e}"
+            );
+            PrepError::Local(LocalReason::NotEligible)
+        }
+        other => {
+            tracing::debug!(
+                crate_name = spec.crate_name.as_str(),
+                "input collection: {other}"
+            );
+            PrepError::Local(LocalReason::NotEligible)
         }
     })?;
 
-    let closure = lock(&node.depgraph).closure(&info.externs);
-    let closure = closure.map_err(|e| {
-        tracing::debug!(crate_name = spec.crate_name.as_str(), "{e}");
-        // Which of the two (CF-35): `crabfarm status` and `doctor` explain it.
-        node.count(
-            match e {
-                crate::depgraph::Unknown::NotRecorded(_) => "unknown_dep.not_recorded",
-                crate::depgraph::Unknown::Changed(_) => "unknown_dep.changed",
-            },
-            1,
-        );
-        LocalReason::UnknownDependency
-    })?;
+    let need_rlib = is_proc_macro_crate(spec);
+    let closure = lock(&node.depgraph)
+        .closure_for(&info.externs, need_rlib)
+        .map_err(PrepError::UnknownDep)?;
     let has_proc_macro = closure.iter().any(is_proc_macro_lib);
     let macro_paths: Vec<ClientPath> = closure
         .iter()
@@ -639,15 +679,15 @@ fn build_inputs(node: &Node, spec: &JobSpec, info: &SubmitInfo) -> Result<Built,
     let mut inputs_out: Vec<InputFile> = Vec::new();
     let mut files: HashMap<BlobHash, PathBuf> = HashMap::new();
     let mut total = collected.total;
-    let mut add = |path: PathBuf, executable: bool| -> Result<(), LocalReason> {
+    let mut add = |path: PathBuf, executable: bool| -> Result<(), PrepError> {
         let client = ClientPath::from_local(&path, std::path::Path::new("."))
-            .ok_or(LocalReason::NotEligible)?;
+            .ok_or(PrepError::Local(LocalReason::NotEligible))?;
         if !seen.insert(client.clone()) {
             return Ok(());
         }
         let (hash, size) = lock(&node.hashes)
             .hash(&client, &path)
-            .map_err(|_| LocalReason::NotEligible)?;
+            .map_err(|_| PrepError::Local(LocalReason::NotEligible))?;
         inputs_out.push(InputFile {
             path: client,
             hash,
@@ -662,13 +702,18 @@ fn build_inputs(node: &Node, spec: &JobSpec, info: &SubmitInfo) -> Result<Built,
     }
     for c in closure {
         let local = c.to_local();
-        total = total.saturating_add(
-            std::fs::metadata(&local)
-                .map(|m| m.len())
-                .map_err(|_| LocalReason::UnknownDependency)?,
-        );
+        total =
+            total.saturating_add(std::fs::metadata(&local).map(|m| m.len()).map_err(|_| {
+                PrepError::UnknownDep(crate::depgraph::Unknown::Changed(c.clone()))
+            })?);
         if total > inputs::MAX_TOTAL {
-            return Err(LocalReason::TooLarge);
+            tracing::info!(
+                crate_name = spec.crate_name.as_str(),
+                mib = total / (1024 * 1024),
+                "running locally: job inputs with dependencies exceed {} MiB cap",
+                inputs::MAX_TOTAL / (1024 * 1024)
+            );
+            return Err(PrepError::Local(LocalReason::TooLarge));
         }
         add(local, false)?;
     }
@@ -725,6 +770,38 @@ struct PeerView {
     free: u32,
     speed: u32,
     bandwidth: u64,
+}
+
+/// Outcome of asking a peer to dial back (CF-40): keeps local queue saturation
+/// distinct from real network/peer failures so a healthy peer is never marked
+/// `Failing` because local jobs queued for a handshake slot.
+pub(crate) enum DialBackOutcome {
+    Connected(Link),
+    QueueTimeout,
+    Failed,
+}
+
+/// Clears `PeerState::probing` when `probe_peer` exits for any reason.
+struct ProbeGuard {
+    node: Arc<Node>,
+    peer: NodeId,
+}
+
+impl Drop for ProbeGuard {
+    fn drop(&mut self) {
+        if let Some(p) = lock(&self.node.peers).get_mut(&self.peer) {
+            p.probing = false;
+        }
+    }
+}
+
+/// Pure transition rule for [`Node::note_job_connect_failed`] (CF-40):
+/// an untried or already-failing peer marks `Failing` on the first failure,
+/// while an already-working peer (`Direct` or `DialBack`) absorbs one
+/// transient failure before being paused.
+fn record_connect_failure(reach: Reach, failures: &mut u32) -> bool {
+    *failures = failures.saturating_add(1);
+    matches!(reach, Reach::Untried | Reach::Failing) || *failures >= 2
 }
 
 impl Node {
@@ -815,7 +892,7 @@ impl Node {
         // Compile cache (DESIGN section 16): the inputs are collected before
         // anything else, because the key needs their hashes, and a hit is the
         // cheapest way to run the job.
-        let mut prepared: Option<Result<Prepared, LocalReason>> = None;
+        let mut prepared: Option<Result<Prepared, PrepError>> = None;
         let mut ctx: Option<Arc<CacheCtx>> = None;
         // Only a job the cache can use is prepared here (a target given as a
         // file is never cached): everything else is prepared by `plan`, and
@@ -1210,12 +1287,14 @@ impl Node {
             return;
         };
         let _running = RunningGuard::new(self, false);
+        // Stop keepalives BEFORE sending `RunLocal` so no keepalive frame can
+        // race onto the socket behind `RunLocal` and cause a Windows TCP reset
+        // when the wrapper closes after `LocalDone` (CF-44).
+        live.stopped.store(true, Ordering::Release);
         if wrapper.send(Message::RunLocal { reason }).await.is_err() {
             lock(&self.depgraph).finish(&info.produces, false);
             return;
         }
-        // The wrapper reads nothing more until it is done with rustc.
-        live.stopped.store(true, Ordering::Release);
         // Files older than this are not outputs of this run.
         let started = std::time::SystemTime::now();
         let mut capture = None;
@@ -1286,6 +1365,34 @@ impl Node {
         (views, any)
     }
 
+    /// Count and log an `UnknownDependency` fallback (CF-35, CF-44, CF-45).
+    /// Each distinct unknown dependency file is logged once at INFO (capped) so
+    /// the cause is visible in `node.log` without flooding it.
+    fn note_unknown_dep(&self, crate_name: &str, u: crate::depgraph::Unknown) {
+        tracing::debug!(crate_name, "{u}");
+        let (counter, kind, path) = match &u {
+            crate::depgraph::Unknown::NotRecorded(p) => {
+                ("unknown_dep.not_recorded", "not built through crabfarm", p)
+            }
+            crate::depgraph::Unknown::Changed(p) => {
+                ("unknown_dep.changed", "changed since it was recorded", p)
+            }
+        };
+        self.count(counter, 1);
+        let first_seen = {
+            let mut logged = lock(&self.logged_unknown_deps);
+            logged.len() < 64 && logged.insert(path.clone())
+        };
+        if first_seen {
+            let file = path.path.rsplit(['\\', '/']).next().unwrap_or(&path.path);
+            tracing::info!(
+                crate_name,
+                dep = file,
+                "running locally: dependency was {kind}"
+            );
+        }
+    }
+
     /// Collect and hash the inputs of a job and complete its spec with them
     /// (DESIGN section 8). Shared by the scheduler and the compile cache, whose
     /// key needs the same hashes.
@@ -1294,13 +1401,13 @@ impl Node {
         mut spec: JobSpec,
         info: &SubmitInfo,
         sensitive: bool,
-    ) -> Result<Prepared, LocalReason> {
+    ) -> Result<Prepared, PrepError> {
         // Inputs cost disk and CPU.
         let _prep = self
             .prep_sem
             .acquire()
             .await
-            .map_err(|_| LocalReason::NotEligible)?;
+            .map_err(|_| PrepError::Local(LocalReason::NotEligible))?;
         let node = self.clone();
         let spec_for_build = spec.clone();
         let info_for_build = SubmitInfo {
@@ -1314,7 +1421,7 @@ impl Node {
             build_inputs(&node, &spec_for_build, &info_for_build)
         })
         .await
-        .map_err(|_| LocalReason::NotEligible)??;
+        .map_err(|_| PrepError::Local(LocalReason::NotEligible))??;
 
         spec.needs_host |= built.has_proc_macro;
         spec.no_retain = !self.cfg.retain_blobs || sensitive;
@@ -1336,7 +1443,7 @@ impl Node {
         self: &Arc<Self>,
         spec: JobSpec,
         info: &SubmitInfo,
-        prepared: Option<Result<Prepared, LocalReason>>,
+        prepared: Option<Result<Prepared, PrepError>>,
     ) -> Result<Plan, LocalReason> {
         // DESIGN section 10: configured prefixes never leave the machine.
         let manifest = env_path(&spec, "CARGO_MANIFEST_DIR");
@@ -1371,9 +1478,18 @@ impl Node {
 
         // Inputs cost disk and CPU; only now that a peer looks better (unless
         // the compile cache collected them already).
-        let Prepared { spec, files, .. } = match prepared {
-            Some(r) => r?,
-            None => self.prepare(spec, info, sensitive).await?,
+        let crate_name = spec.crate_name.clone();
+        let prep = match prepared {
+            Some(r) => r,
+            None => self.prepare(spec, info, sensitive).await,
+        };
+        let Prepared { spec, files, .. } = match prep {
+            Ok(p) => p,
+            Err(PrepError::Local(reason)) => return Err(reason),
+            Err(PrepError::UnknownDep(u)) => {
+                self.note_unknown_dep(&crate_name, u);
+                return Err(LocalReason::UnknownDependency);
+            }
         };
 
         // Second round: the proc-macro closure may have narrowed the peers, and
@@ -1442,10 +1558,14 @@ impl Node {
         peer: NodeId,
         deadline: tokio::time::Instant,
     ) -> Option<Race<crate::transport::FramedConn<crate::transport::ClientStream>>> {
-        let (mut addrs, good) = {
+        let (mut addrs, good, peer_name) = {
             let peers = lock(&self.peers);
             let p = peers.get(&peer)?;
-            (p.info.addrs.clone(), p.good_addr.clone())
+            (
+                p.info.addrs.clone(),
+                p.good_addr.clone(),
+                crate::proto::log_safe(&p.info.node_name),
+            )
         };
         // The address that worked last time starts first; the others join
         // after a short head start, so a healthy peer sees one connection.
@@ -1467,17 +1587,24 @@ impl Node {
             },
             move |a: String| {
                 let me = me.clone();
+                let peer_name = peer_name.clone();
                 async move {
                     let (pid, _hello, conn) =
                         match crate::transport::connect(&me.tls, &me.id, &a).await {
                             Ok(c) => c,
                             Err(e) => {
-                                tracing::info!("link to a peer address failed: {e:#}");
+                                tracing::info!(
+                                    peer = peer_name.as_str(),
+                                    "link to a peer address failed: {e:#}"
+                                );
                                 return None;
                             }
                         };
                     if pid != peer {
-                        tracing::info!("link reached another node than the one asked for");
+                        tracing::info!(
+                            peer = peer_name.as_str(),
+                            "link reached another node than the one asked for"
+                        );
                         return None;
                     }
                     Some(conn)
@@ -1512,7 +1639,7 @@ impl Node {
         deadline.min(now + DIRECT_BUDGET.min(half))
     }
 
-    /// Remember how `peer` was (or was not) reached (CF-34).
+    /// Remember how `peer` was (or was not) reached (CF-34, CF-40).
     fn note_reach(&self, peer: NodeId, reach: Reach) {
         let now = Instant::now();
         let mut peers = lock(&self.peers);
@@ -1528,12 +1655,48 @@ impl Node {
         p.reach = reach;
         match reach {
             Reach::Direct => {
+                p.reach_failures = 0;
                 p.direct_failed_until = None;
                 p.unreachable_until = None;
             }
-            Reach::DialBack => p.unreachable_until = None,
+            Reach::DialBack => {
+                p.reach_failures = 0;
+                p.unreachable_until = None;
+            }
             Reach::Failing => p.unreachable_until = Some(now + UNREACHABLE_PAUSE),
-            Reach::Untried => {}
+            Reach::Untried => {
+                p.reach_failures = 0;
+                p.unreachable_until = None;
+            }
+        }
+    }
+
+    /// Record a failed job connection attempt (direct and dial-back both
+    /// failed). A peer that was already working (`Direct` or `DialBack`) takes
+    /// two consecutive failures before being marked `Failing` for
+    /// [`UNREACHABLE_PAUSE`], so one transient blip does not disable a busy
+    /// farm peer (CF-40).
+    fn note_job_connect_failed(&self, peer: NodeId) {
+        let (should_fail, peer_name, failures) = {
+            let mut peers = lock(&self.peers);
+            let Some(p) = peers.get_mut(&peer) else {
+                return;
+            };
+            let fail = record_connect_failure(p.reach, &mut p.reach_failures);
+            (
+                fail,
+                crate::proto::log_safe(&p.info.node_name),
+                p.reach_failures,
+            )
+        };
+        if should_fail {
+            self.note_reach(peer, Reach::Failing);
+        } else {
+            tracing::info!(
+                peer = peer_name.as_str(),
+                failures,
+                "job connection attempt failed; keeping peer active for retry"
+            );
         }
     }
 
@@ -1544,25 +1707,170 @@ impl Node {
     }
 
     /// Ask `peer` over its control connection to open a connection to this
-    /// node (CF-34) and wait for it until `deadline`.
+    /// node (CF-34) and wait for it until `deadline`. Concurrent outgoing
+    /// dial-back handshakes are bounded below `MAX_UNAUTHENTICATED` (per-peer
+    /// permit acquired before the global permit so one busy peer cannot starve
+    /// another), and a local queue wait timeout returns
+    /// [`DialBackOutcome::QueueTimeout`] without blaming the peer (CF-40).
     pub(crate) async fn dial_back_link(
         self: &Arc<Self>,
         peer: NodeId,
         deadline: tokio::time::Instant,
-    ) -> Option<Link> {
-        let ctrl = lock(&self.peers).get(&peer)?.ctrl.first()?.1.clone();
+    ) -> DialBackOutcome {
+        self.dial_back_link_inner(peer, deadline, true).await
+    }
+
+    async fn dial_back_link_inner(
+        self: &Arc<Self>,
+        peer: NodeId,
+        deadline: tokio::time::Instant,
+        count_stat: bool,
+    ) -> DialBackOutcome {
+        let Some((ctrl, peer_sem, peer_name)) = ({
+            let peers = lock(&self.peers);
+            peers.get(&peer).and_then(|p| {
+                let name = crate::proto::log_safe(&p.info.node_name);
+                let Some((_, ctrl)) = p.ctrl.first() else {
+                    tracing::info!(
+                        peer = name.as_str(),
+                        "dial-back failed: no live control connection"
+                    );
+                    return None;
+                };
+                Some((ctrl.clone(), p.dial_back_sem.clone(), name))
+            })
+        }) else {
+            return DialBackOutcome::Failed;
+        };
+        // Reserve half the remaining budget (up to DIALBACK_WAIT) for the
+        // actual network handshake so queueing cannot starve it and blame a
+        // healthy peer.
+        let now = tokio::time::Instant::now();
+        let remaining = deadline.saturating_duration_since(now);
+        let handshake_reserve = DIALBACK_WAIT.min(remaining / 2);
+        let queue_deadline = deadline
+            .checked_sub(handshake_reserve)
+            .unwrap_or(now)
+            .max(now);
+        // Take the per-peer permit BEFORE the global permit so waiters for one
+        // busy peer never hold global permits and starve another peer.
+        let Ok(Ok(_peer_permit)) =
+            tokio::time::timeout_at(queue_deadline, peer_sem.acquire_owned()).await
+        else {
+            tracing::info!(
+                peer = peer_name.as_str(),
+                "dial-back queued too long: per-peer concurrency slot busy"
+            );
+            return DialBackOutcome::QueueTimeout;
+        };
+        let Ok(Ok(_total_permit)) = tokio::time::timeout_at(
+            queue_deadline,
+            self.dial_back_inflight.clone().acquire_owned(),
+        )
+        .await
+        else {
+            tracing::info!(
+                peer = peer_name.as_str(),
+                "dial-back queued too long: local dial-back concurrency slot busy"
+            );
+            return DialBackOutcome::QueueTimeout;
+        };
         let token: [u8; 16] = rand::random();
         let (tx, rx) = tokio::sync::oneshot::channel();
         lock(&self.dialbacks).insert(token, PendingDial { peer, tx });
         let _cleanup = DialCleanup { node: self, token };
         let wait = deadline.min(tokio::time::Instant::now() + DIALBACK_WAIT);
-        tokio::time::timeout_at(wait, ctrl.send(Message::DialBack { token }))
-            .await
-            .ok()?
-            .ok()?;
-        let link = tokio::time::timeout_at(wait, rx).await.ok()?.ok()?;
-        self.count("dialbacks", 1);
-        Some(link)
+        match tokio::time::timeout_at(wait, ctrl.send(Message::DialBack { token })).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                tracing::info!(
+                    peer = peer_name.as_str(),
+                    "dial-back failed: control connection closed while sending DialBack"
+                );
+                return DialBackOutcome::Failed;
+            }
+            Err(_) => {
+                tracing::info!(
+                    peer = peer_name.as_str(),
+                    "dial-back failed: timed out sending DialBack on control connection"
+                );
+                return DialBackOutcome::Failed;
+            }
+        }
+        match tokio::time::timeout_at(wait, rx).await {
+            Ok(Ok(link)) => {
+                if count_stat {
+                    self.count("dialbacks", 1);
+                }
+                DialBackOutcome::Connected(link)
+            }
+            Ok(Err(_)) => {
+                tracing::info!(
+                    peer = peer_name.as_str(),
+                    "dial-back failed: waiter channel closed"
+                );
+                DialBackOutcome::Failed
+            }
+            Err(_) => {
+                tracing::info!(
+                    peer = peer_name.as_str(),
+                    "dial-back failed: peer did not connect back within {}s",
+                    DIALBACK_WAIT.as_secs()
+                );
+                DialBackOutcome::Failed
+            }
+        }
+    }
+
+    /// Re-check a peer currently marked `Reach::Failing` once its pause has
+    /// expired (CF-40): tests direct (when due) then dial-back, closes the
+    /// probe connection cleanly and updates reachability so `status` and
+    /// `doctor` recover without waiting for another build.
+    pub(crate) async fn probe_peer(self: Arc<Self>, peer: NodeId) {
+        let _guard = ProbeGuard {
+            node: self.clone(),
+            peer,
+        };
+        let Some((direct_ok, can_dial_back)) = self.direct_and_dial_back(peer) else {
+            return;
+        };
+        let peer_name = lock(&self.peers)
+            .get(&peer)
+            .map(|p| crate::proto::log_safe(&p.info.node_name))
+            .unwrap_or_else(|| peer.to_hex());
+        tracing::info!(
+            peer = peer_name.as_str(),
+            direct_ok,
+            can_dial_back,
+            "re-checking job connections"
+        );
+        let deadline = tokio::time::Instant::now() + OPEN_DEADLINE;
+        if direct_ok {
+            let d = Self::direct_deadline(deadline, can_dial_back);
+            if let Some(mut race) = self.connect_peer(peer, d).await
+                && let Some((addr, conn)) = race.next().await
+            {
+                if let Some(p) = lock(&self.peers).get_mut(&peer) {
+                    p.good_addr = Some(addr);
+                }
+                self.note_reach(peer, Reach::Direct);
+                Link::new(conn).close().await;
+                return;
+            }
+            self.note_direct_failed(peer);
+        }
+        if can_dial_back {
+            match self.dial_back_link_inner(peer, deadline, false).await {
+                DialBackOutcome::Connected(link) => {
+                    self.note_reach(peer, Reach::DialBack);
+                    link.close().await;
+                    return;
+                }
+                DialBackOutcome::QueueTimeout => return,
+                DialBackOutcome::Failed => {}
+            }
+        }
+        self.note_reach(peer, Reach::Failing);
     }
 
     /// A connection to `peer` for one request, direct or dialed back, before
@@ -1585,7 +1893,10 @@ impl Node {
         if !can_dial_back {
             return None;
         }
-        self.dial_back_link(peer, deadline).await
+        match self.dial_back_link(peer, deadline).await {
+            DialBackOutcome::Connected(link) => Some(link),
+            DialBackOutcome::QueueTimeout | DialBackOutcome::Failed => None,
+        }
     }
 
     /// Send `Reserve` on a fresh job connection and wait for the answer.
@@ -1619,7 +1930,7 @@ impl Node {
     /// `deadline`. Direct first (its addresses race, CF-27); when no address
     /// answers, the peer is asked over the control connection to dial back
     /// (CF-34), and for [`DIRECT_RETRY_AFTER`] that comes first.
-    async fn open_job_link(
+    pub(crate) async fn open_job_link(
         self: &Arc<Self>,
         peer: NodeId,
         job_id: JobId,
@@ -1654,12 +1965,16 @@ impl Node {
             self.note_direct_failed(peer);
         }
         let link = if can_dial_back {
-            self.dial_back_link(peer, deadline).await
+            match self.dial_back_link(peer, deadline).await {
+                DialBackOutcome::Connected(link) => Some(link),
+                DialBackOutcome::QueueTimeout => return None,
+                DialBackOutcome::Failed => None,
+            }
         } else {
             None
         };
         let Some(link) = link else {
-            self.note_reach(peer, Reach::Failing);
+            self.note_job_connect_failed(peer);
             return None;
         };
         match self.reserve(link, job_id, live, deadline).await {
@@ -2671,5 +2986,157 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names.len(), 1);
+    }
+
+    #[test]
+    fn is_proc_macro_crate_matches_split_and_equals_forms() {
+        let make = |args: &[&str]| JobSpec {
+            job_id: JobId([1; 16]),
+            toolchain: crate::proto::ToolchainId {
+                release: "1.99.0".into(),
+                commit_hash: "0".repeat(40),
+                commit_date: "2026-10-13".into(),
+                host: "x86_64-pc-windows-msvc".into(),
+            },
+            target: "x86_64-pc-windows-msvc".into(),
+            crate_name: "m".into(),
+            args: args
+                .iter()
+                .map(|s| crate::proto::Arg::Plain((*s).into()))
+                .collect(),
+            env: Vec::new(),
+            extra_env: Vec::new(),
+            build_env: Vec::new(),
+            cwd: posix("/p"),
+            out_dir: posix("/p/target/deps"),
+            inputs: Vec::new(),
+            dirs: Vec::new(),
+            no_retain: false,
+            needs_host: false,
+        };
+        assert!(is_proc_macro_crate(&make(&["--crate-type", "proc-macro"])));
+        assert!(is_proc_macro_crate(&make(&["--crate-type=proc-macro"])));
+        assert!(is_proc_macro_crate(&make(&["--crate-type=lib,proc-macro"])));
+        assert!(!is_proc_macro_crate(&make(&["--crate-type", "lib"])));
+        assert!(!is_proc_macro_crate(&make(&["--crate-type=rlib"])));
+    }
+
+    #[test]
+    fn working_peer_tolerates_one_transient_connect_failure() {
+        let mut f = 0;
+        assert!(
+            record_connect_failure(Reach::Untried, &mut f),
+            "untried peer fails on first error"
+        );
+        let mut f = 0;
+        assert!(
+            !record_connect_failure(Reach::DialBack, &mut f),
+            "working DialBack peer survives one blip"
+        );
+        assert_eq!(f, 1);
+        assert!(
+            record_connect_failure(Reach::DialBack, &mut f),
+            "second consecutive failure marks Failing"
+        );
+        assert_eq!(f, 2);
+        let mut f = 0;
+        assert!(
+            !record_connect_failure(Reach::Direct, &mut f),
+            "working Direct peer survives one blip"
+        );
+        assert!(record_connect_failure(Reach::Direct, &mut f));
+    }
+
+    /// CF-44 (M2): `unknown_dep.*` counters must only increment when a job
+    /// actually falls back with `LocalReason::UnknownDependency`, never when
+    /// `plan()` returns `NoPeer` or `LocalSlotFree`.
+    #[tokio::test]
+    async fn unknown_dep_counters_only_increment_on_unknown_dependency_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("node");
+        let id = crate::farm::create(&dir, "sub").unwrap();
+        let node = crate::node::tests::make_test_node(&dir, id, 4);
+        let tc = crate::proto::ToolchainId {
+            release: "1.99.0".into(),
+            commit_hash: "0".repeat(40),
+            commit_date: "2026-10-13".into(),
+            host: "x86_64-pc-windows-msvc".into(),
+        };
+        let spec = JobSpec {
+            job_id: JobId([9; 16]),
+            toolchain: tc.clone(),
+            target: "x86_64-pc-windows-msvc".into(),
+            crate_name: "demo".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            extra_env: Vec::new(),
+            build_env: Vec::new(),
+            cwd: posix("/p"),
+            out_dir: posix("/p/target/deps"),
+            inputs: Vec::new(),
+            dirs: Vec::new(),
+            no_retain: false,
+            needs_host: false,
+        };
+        let info = SubmitInfo {
+            produces: Vec::new(),
+            externs: Vec::new(),
+            input: posix("/p/src/lib.rs"),
+            search_dirs: Vec::new(),
+            link_libs: Vec::new(),
+        };
+        let dep = posix("/p/target/deps/libfoo-1.rlib");
+
+        // 1. No online peer: plan returns NoPeer and leaves unknown_dep.* at 0.
+        let r = node
+            .plan(
+                spec.clone(),
+                &info,
+                Some(Err(PrepError::UnknownDep(
+                    crate::depgraph::Unknown::NotRecorded(dep.clone()),
+                ))),
+            )
+            .await;
+        assert!(matches!(r, Err(LocalReason::NoPeer)));
+        let snap = node.counters_snapshot();
+        assert!(!snap.iter().any(|(k, _)| k.starts_with("unknown_dep.")));
+
+        // 2. Add an online eligible peer with free slots: plan now consumes the
+        // prepared UnknownDep and increments unknown_dep.changed.
+        let peer_id = NodeId([0xaa; 16]);
+        {
+            let mut st = crate::node::PeerState::new_for_test(peer_id, "worker");
+            st.conns = 1;
+            st.status = Some(crate::proto::Status {
+                node_id: peer_id,
+                node_name: "worker".into(),
+                host_triple: "x86_64-pc-windows-msvc".into(),
+                slots_total: 8,
+                slots_busy: 0,
+                queue_len: 0,
+                speed: 100,
+                toolchains: vec![tc],
+                targets: vec![vec!["x86_64-pc-windows-msvc".into()]],
+                accepting: true,
+            });
+            lock(&node.peers).insert(peer_id, st);
+        }
+        let r2 = node
+            .plan(
+                spec,
+                &info,
+                Some(Err(PrepError::UnknownDep(
+                    crate::depgraph::Unknown::Changed(dep),
+                ))),
+            )
+            .await;
+        assert!(matches!(r2, Err(LocalReason::UnknownDependency)));
+        let changed = node
+            .counters_snapshot()
+            .into_iter()
+            .find(|(k, _)| k == "unknown_dep.changed")
+            .map(|(_, v)| v)
+            .unwrap_or(0);
+        assert_eq!(changed, 1);
     }
 }

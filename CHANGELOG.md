@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.0.0-rc.8
+
 - **Dial-back stability & auto-recovery (CF-40):** Release the peer's dial-back handshake permit once the first request frame arrives (instead of holding it across the whole `rustc` job), so large peers (e.g. 32 slots) can serve more than 16 concurrent dialed-back jobs. Bound outgoing dial-back handshakes per peer (4) and overall (6, per-peer permit first) without blaming local queue waits on the peer, require 2 consecutive connection failures before pausing an already-working peer, re-probe online `FAILING` peers automatically after the 60 s pause, and reset `FAILING` on reconnect after being offline.
 - **Proc-macro builds with pipelining (CF-41):** Promote pipelined transitive `.rmeta` dependencies in `depgraph` to their sibling `.rlib` files when compiling `--crate-type proc-macro` crates remotely, avoiding `required to be available in rlib format` failures.
 - **Build-script probes stay local (CF-42):** Classify build-script compiler probes (`--out-dir` or primary input under `OUT_DIR`, e.g. `anyhow`, `thiserror`, `proc-macro2`, `autocfg`) as always local so expected probe errors are not sent to peers or counted as `RemoteCompileErrorRetry`.

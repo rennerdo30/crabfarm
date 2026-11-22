@@ -167,14 +167,35 @@ fn classify(raw: &[u8], token: &[u8; 32]) -> Auth {
     }
 }
 
+/// Outcome of reading the next IPC frame within a silence limit.
+#[derive(Debug)]
+pub enum Recv {
+    Frame(Box<Message>),
+    /// The node closed or reset the connection before sending a frame.
+    Closed,
+    /// No frame arrived within the silence limit (the node appears hung).
+    TimedOut,
+}
+
+/// Client side: the next frame, distinguishing a closed connection from a
+/// silence timeout (CF-44: only an actual timeout marks the node unresponsive).
+/// The connection must not be used again after `Closed` or `TimedOut`.
+pub async fn recv_outcome(conn: &mut FramedConn<TcpStream>, limit: Duration) -> Recv {
+    match tokio::time::timeout(limit, conn.recv()).await {
+        Ok(Ok(Some(m))) => Recv::Frame(Box::new(m)),
+        Ok(_) => Recv::Closed,
+        Err(_) => Recv::TimedOut,
+    }
+}
+
 /// Client side: the next frame, or `None` when the node ended the connection,
 /// broke the framing, or stayed silent for `limit` (a `Keepalive` counts as a
 /// frame: callers skip it and call again). The connection must not be used
 /// again after `None` (a timed-out read is not cancel-safe).
 pub async fn recv_within(conn: &mut FramedConn<TcpStream>, limit: Duration) -> Option<Message> {
-    match tokio::time::timeout(limit, conn.recv()).await {
-        Ok(Ok(Some(m))) => Some(m),
-        _ => None,
+    match recv_outcome(conn, limit).await {
+        Recv::Frame(m) => Some(*m),
+        Recv::Closed | Recv::TimedOut => None,
     }
 }
 
@@ -315,5 +336,32 @@ mod tests {
     async fn connect_fails_fast_without_a_node() {
         let d = tempfile::tempdir().unwrap();
         assert!(connect(d.path()).await.is_err());
+    }
+
+    /// CF-44: an immediately closed IPC connection returns `Recv::Closed`
+    /// rather than `Recv::TimedOut`, so it does not trigger `node-unresponsive`.
+    #[tokio::test]
+    async fn recv_outcome_distinguishes_closed_from_timeout() {
+        let d = tempfile::tempdir().unwrap();
+        let (listener, _token) = bind(d.path()).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            drop(s);
+            let (s2, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(s2);
+        });
+        let mut c1 = FramedConn::new(TcpStream::connect(("127.0.0.1", port)).await.unwrap());
+        assert!(matches!(
+            recv_outcome(&mut c1, Duration::from_secs(2)).await,
+            Recv::Closed
+        ));
+        let mut c2 = FramedConn::new(TcpStream::connect(("127.0.0.1", port)).await.unwrap());
+        assert!(matches!(
+            recv_outcome(&mut c2, Duration::from_millis(80)).await,
+            Recv::TimedOut
+        ));
+        accept.abort();
     }
 }

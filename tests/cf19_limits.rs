@@ -74,7 +74,8 @@ fn ipc_connections_waiting_for_auth_are_capped() {
         .parse()
         .unwrap();
 
-    let mut socks: Vec<TcpStream> = (0..40)
+    let total = crabfarm::node::MAX_IPC_UNAUTHENTICATED + 16;
+    let mut socks: Vec<TcpStream> = (0..total)
         .map(|_| TcpStream::connect(("127.0.0.1", port)).unwrap())
         .collect();
     std::thread::sleep(Duration::from_millis(500));

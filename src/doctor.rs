@@ -102,6 +102,9 @@ pub struct Facts {
     pub env_wrappers: Vec<(String, String)>,
     pub project: Option<Project>,
     pub listen_port: Option<u16>,
+    /// Path to `<data>/logs/node.log`, shown as a note when problems or
+    /// warnings exist (CF-45).
+    pub log_path: Option<PathBuf>,
 }
 
 fn counter(c: &[(String, u64)], name: &str) -> u64 {
@@ -322,6 +325,15 @@ pub fn diagnose(x: &Facts) -> Vec<Finding> {
                 .map(|n| counter(&n.counters, "local.UnknownDependency"))
                 .unwrap_or(0);
             if l.total > 0 && unknown > 0 {
+                let hint = if unknown_jobs > 0 || l.changed > 0 {
+                    "Build once from scratch through crabfarm: `cargo clean`, then `crabfarm cargo build` \
+                     (workspace crates built with incremental compilation under `remote_incremental = \"local\"` \
+                     and `cargo clippy` outputs stay local by design and are not recorded)."
+                } else {
+                    "No job fell back for `UnknownDependency` in this node session: these are usually \
+                     workspace crates built with incremental compilation (`remote_incremental = \"local\"`) \
+                     or `cargo clippy` outputs, which stay local by design."
+                };
                 out.push(
                     f(
                         if unknown_jobs > 0 { Level::Warn } else { Level::Note },
@@ -337,10 +349,7 @@ pub fn diagnose(x: &Facts) -> Vec<Finding> {
                             }
                         ),
                     )
-                    .hint(
-                        "Build once from scratch through crabfarm: `cargo clean`, then `crabfarm cargo build` \
-                         (old files of earlier builds count here too, so the number drops only after the clean).",
-                    ),
+                    .hint(hint),
                 );
             }
         }
@@ -411,6 +420,19 @@ pub fn diagnose(x: &Facts) -> Vec<Finding> {
             }
         }
     }
+    if out.iter().any(|x| x.level >= Level::Warn) {
+        let where_log = x
+            .log_path
+            .as_ref()
+            .map(|p| format!(" ({})", p.display()))
+            .unwrap_or_default();
+        out.push(f(
+            Level::Note,
+            format!(
+                "Node log{where_log}: restart the node with `CRABFARM_LOG=debug` for verbose connection and dependency traces."
+            ),
+        ));
+    }
     out
 }
 
@@ -474,11 +496,14 @@ pub fn scan_libs(target: &Path, graph: &crate::depgraph::DepGraph) -> Libs {
         };
         for e in rd.flatten() {
             let p = e.path();
-            let lib = p
-                .extension()
-                .and_then(|x| x.to_str())
-                .is_some_and(|x| x == "rlib" || x == "rmeta");
+            let ext = p.extension().and_then(|x| x.to_str());
+            let lib = ext.is_some_and(|x| x == "rlib" || x == "rmeta");
             if !lib || !p.is_file() {
+                continue;
+            }
+            // `cargo clippy --all-targets` leaves 0-byte `.rmeta` placeholders
+            // for `--test` targets (CF-44); nothing depends on them.
+            if ext == Some("rmeta") && p.metadata().is_ok_and(|m| m.len() == 0) {
                 continue;
             }
             libs.total += 1;
@@ -590,6 +615,7 @@ pub fn gather(data_dir: &Path) -> anyhow::Result<Facts> {
         env_wrappers,
         project,
         listen_port: cfg.listen.rsplit(':').next().and_then(|p| p.parse().ok()),
+        log_path: Some(data_dir.join("logs").join("node.log")),
         exe,
     })
 }
@@ -853,5 +879,32 @@ mod tests {
         std::fs::write(&chg, b"rebuilt elsewhere").unwrap();
         let l = scan_libs(&d.path().join("target"), &g);
         assert_eq!((l.total, l.unrecorded, l.changed), (3, 1, 1), "{l:?}");
+    }
+
+    /// CF-44: `cargo clippy --all-targets` writes 0-byte `.rmeta` files for
+    /// `--test` targets; `scan_libs` must not count them as real libraries.
+    #[test]
+    fn zero_byte_rmeta_files_from_clippy_tests_are_ignored() {
+        let d = tempfile::tempdir().unwrap();
+        let deps = d.path().join("target/debug/deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        std::fs::write(deps.join("libtest_bin-1.rmeta"), b"").unwrap();
+        let g = crate::depgraph::DepGraph::default();
+        let l = scan_libs(&d.path().join("target"), &g);
+        assert_eq!((l.total, l.unrecorded, l.changed), (0, 0, 0), "{l:?}");
+    }
+
+    /// CF-45: when doctor finds a warning or problem, it tells the user where
+    /// the log lives and how to enable debug logs.
+    #[test]
+    fn doctor_shows_debug_log_hint_on_warning_or_problem() {
+        let mut x = healthy();
+        x.node = None;
+        x.node_running = false;
+        let r = render(&diagnose(&x));
+        assert!(
+            r.contains("CRABFARM_LOG=debug"),
+            "missing debug log hint:\n{r}"
+        );
     }
 }

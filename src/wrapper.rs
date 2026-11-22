@@ -74,7 +74,16 @@ pub fn run(rustc: &str, args: &[String]) -> i32 {
             }
             passthrough(rustc, args)
         }
-        Classified::Remote(cand) => submit(rustc, args, cand, tc, &cfg, &data_dir, &cwd, &expanded),
+        Classified::Remote(cand) => {
+            let out_dir_env = std::env::var("OUT_DIR").ok();
+            if rustc_args::is_build_script_probe(&cand, out_dir_env.as_deref()) {
+                if debug {
+                    eprintln!("crabfarm: local (build-script probe inside OUT_DIR)");
+                }
+                return passthrough(rustc, args);
+            }
+            submit(rustc, args, cand, tc, &cfg, &data_dir, &cwd, &expanded)
+        }
     }
 }
 
@@ -574,11 +583,16 @@ fn submit(
     let verdict = loop {
         // The node sends a keepalive every few seconds while it works; silence
         // means it is hung or gone (CF-19): the farm side failed, build here.
-        let msg = match rt.block_on(ipc::recv_within(&mut conn, ipc::NODE_SILENCE_LIMIT)) {
-            Some(m) => m,
-            None => {
-                // Silence or a lost connection: tell the wrappers that follow.
+        // Only a real silence timeout writes `node-unresponsive` (CF-44): a
+        // dropped connection falls back for this crate without making every
+        // other wrapper bypass the node and depgraph.
+        let msg = match rt.block_on(ipc::recv_outcome(&mut conn, ipc::NODE_SILENCE_LIMIT)) {
+            ipc::Recv::Frame(m) => *m,
+            ipc::Recv::TimedOut => {
                 ipc::mark_unresponsive(data_dir);
+                break Verdict::Local { reason: None };
+            }
+            ipc::Recv::Closed => {
                 break Verdict::Local { reason: None };
             }
         };
@@ -691,7 +705,7 @@ fn submit(
             // a node that was only stalled and resumes sees the closed
             // connection and writes no remote output onto the files this local
             // rustc is about to write.
-            let mut conn = if reason.is_some() {
+            let conn = if reason.is_some() {
                 Some(conn)
             } else {
                 rt.block_on(close_ipc(conn));
@@ -705,13 +719,16 @@ fn submit(
             if code == 0 {
                 cacheable = learn_env_deps(data_dir, &cand.crate_name, &dep_file, &forwarded);
             }
-            if let Some(conn) = conn.as_mut() {
+            if let Some(mut conn) = conn {
                 // Releases the local slot the node reserved for this run.
                 let _ = rt.block_on(conn.send(&Message::LocalDone {
                     code,
                     produces: cand.produces.clone(),
                     capture: (cacheable && cfg.cache).then_some(printed).flatten(),
                 }));
+                // Clean FIN so Windows does not reset the socket and lose
+                // `LocalDone` (CF-44, CF-39).
+                rt.block_on(close_ipc(conn));
             }
             code
         }

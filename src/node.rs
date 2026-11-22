@@ -37,16 +37,24 @@ const JOB_IDLE: Duration = Duration::from_secs(600);
 /// proved to be a farm member (TLS and first frame pending, or a join).
 const MAX_INBOUND: usize = 256;
 const MAX_UNAUTHENTICATED: usize = 8;
-/// IPC connections that may wait for `IpcAuth` at once (CF-19).
-pub const MAX_IPC_UNAUTHENTICATED: usize = 16;
+/// IPC connections that may wait for `IpcAuth` at once (CF-19, CF-44): sized
+/// to cover `cargo_cmd::MAX_JOBS` (128) so a parallel build burst never drops
+/// wrappers at accept.
+pub const MAX_IPC_UNAUTHENTICATED: usize = 128;
 /// How long an inbound connection may take to say what it is.
 const FIRST_MESSAGE: Duration = Duration::from_secs(10);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Cap for the per-peer set of blobs known to be on the peer.
 pub const MAX_SENT_HASHES: usize = 200_000;
-/// Connections this node opens at once because peers asked for a dial-back
-/// (CF-34); further requests are ignored and the asker falls back.
+/// Dial-back handshakes this node opens at once for peers (CF-34, CF-40); the
+/// permit is released as soon as `Dialed` is sent, before serving the job, so
+/// concurrent remote jobs are bounded by `cfg.slots` rather than this cap.
 const MAX_DIALBACKS: usize = 16;
+/// Outgoing dial-back handshakes in flight from this submitter (CF-40): kept
+/// below `MAX_UNAUTHENTICATED` (8) so a parallel build burst never overflows
+/// this node's inbound accept cap.
+pub const MAX_DIALBACK_INFLIGHT_PER_PEER: usize = 4;
+pub const MAX_DIALBACK_INFLIGHT_TOTAL: usize = 6;
 /// How long a dial-back may take from the request to the `Dialed` frame.
 pub const DIALBACK_WAIT: Duration = Duration::from_secs(6);
 
@@ -158,6 +166,10 @@ pub struct PeerState {
     pub cache_ask: Arc<Semaphore>,
     /// How job connections to this peer got through last (CF-34).
     pub reach: Reach,
+    /// Consecutive job-link connection failures since the last success (CF-40).
+    pub reach_failures: u32,
+    /// Outgoing dial-back handshakes in flight to this peer at once (CF-40).
+    pub dial_back_sem: Arc<Semaphore>,
     /// A direct connection failed: until then, ask for a dial-back at once.
     pub direct_failed_until: Option<Instant>,
     /// Neither way worked: until then the peer gets no jobs.
@@ -256,6 +268,8 @@ impl PeerState {
             cache_waiters: HashMap::new(),
             cache_ask: Arc::new(Semaphore::new(CACHE_ASKS_PER_PEER)),
             reach: Reach::Untried,
+            reach_failures: 0,
+            dial_back_sem: Arc::new(Semaphore::new(MAX_DIALBACK_INFLIGHT_PER_PEER)),
             direct_failed_until: None,
             unreachable_until: None,
         }
@@ -306,8 +320,14 @@ pub struct Node {
     allow_loopback_gossip: bool,
     /// Dial-backs this node asked peers for, by token (CF-34).
     pub dialbacks: Mutex<HashMap<[u8; 16], PendingDial>>,
-    /// Dial-backs this node makes for peers at once.
+    /// Dial-back handshakes this node makes for peers at once (released before
+    /// the job runs, CF-40).
     dialback_sem: Arc<Semaphore>,
+    /// Outgoing dial-back handshakes this submitter has in flight across all
+    /// peers (CF-40).
+    pub dial_back_inflight: Arc<Semaphore>,
+    /// Distinct unknown dependency paths already logged at INFO (capped, CF-45).
+    pub logged_unknown_deps: Mutex<HashSet<crate::proto::ClientPath>>,
 }
 
 /// Close a local connection after its last frame so that frame arrives
@@ -527,6 +547,12 @@ impl Node {
         e.info.node_name = name.to_string();
         e.info.last_seen = unix_now();
         e.host_triple = host.to_string();
+        // A fresh control connection means the network may have recovered (CF-40).
+        e.reach_failures = 0;
+        if e.reach == Reach::Failing {
+            e.reach = Reach::Untried;
+            e.unreachable_until = None;
+        }
         tracing::info!(
             peer = crate::proto::log_safe(name).as_str(),
             "peer connected"
@@ -882,7 +908,7 @@ impl Node {
                 acc = listener.accept() => {
                     let Ok((tcp, _)) = acc else { continue };
                     let Some(permit) = self.inbound.admit() else {
-                        tracing::debug!("inbound connection refused: too many connections");
+                        tracing::info!("inbound connection refused: too many connections");
                         continue;
                     };
                     let node = self.clone();
@@ -987,31 +1013,64 @@ impl Node {
 
     /// `peer` cannot connect to this node: open the connection to it (CF-34).
     /// Only the peer's own known addresses are dialed; a peer asking for more
-    /// at once than [`MAX_DIALBACKS`] is ignored and falls back on its side.
+    /// concurrent handshakes than [`MAX_DIALBACKS`] is ignored and falls back
+    /// on its side. The permit covers only the connect + `Dialed` handshake so
+    /// running jobs are bounded by `cfg.slots` instead (CF-40).
     fn dial_back(self: &Arc<Self>, peer: NodeId, token: [u8; 16]) {
+        let peer_name = lock(&self.peers)
+            .get(&peer)
+            .map(|p| crate::proto::log_safe(&p.info.node_name))
+            .unwrap_or_else(|| peer.to_hex());
         let Ok(permit) = self.dialback_sem.clone().try_acquire_owned() else {
-            tracing::debug!("dial-back request ignored: too many at once");
+            tracing::info!(
+                peer = peer_name.as_str(),
+                "dial-back request ignored: too many dial-back handshakes at once"
+            );
             return;
         };
         let node = self.clone();
         tokio::spawn(async move {
-            let _permit = permit;
             let deadline = tokio::time::Instant::now() + DIALBACK_WAIT;
             let Some(mut race) = node.connect_peer(peer, deadline).await else {
+                tracing::info!(
+                    peer = peer_name.as_str(),
+                    "dial-back failed: peer has no known addresses"
+                );
+                drop(permit);
                 return;
             };
             let Some((_, conn)) = race.next().await else {
-                tracing::info!("dial-back to a peer failed: no address answered");
+                tracing::info!(
+                    peer = peer_name.as_str(),
+                    "dial-back failed: no address answered within {}s",
+                    DIALBACK_WAIT.as_secs()
+                );
+                drop(permit);
                 return;
             };
             drop(race);
             let mut link = Link::new_with_idle(conn, Some(JOB_IDLE));
-            if link.send(Message::Dialed { token }).await.is_err() {
+            if let Err(e) = link.send(Message::Dialed { token }).await {
+                tracing::info!(
+                    peer = peer_name.as_str(),
+                    "dial-back failed: could not send Dialed: {e:#}"
+                );
+                drop(permit);
                 return;
             }
+            // Handshake done: release before serving the job so a 32-slot peer
+            // is not capped at MAX_DIALBACKS (16) concurrent jobs (CF-40).
+            drop(permit);
             let first = match tokio::time::timeout(FIRST_MESSAGE, link.recv()).await {
                 Ok(Some(m)) => m,
-                _ => return,
+                Ok(None) => return,
+                Err(_) => {
+                    tracing::info!(
+                        peer = peer_name.as_str(),
+                        "dial-back failed: peer sent no request after Dialed"
+                    );
+                    return;
+                }
             };
             if let Err(e) = node.serve_request(peer, link, first).await {
                 tracing::debug!("dial-back connection: {e:#}");
@@ -1030,7 +1089,7 @@ impl Node {
                 acc = listener.accept() => {
                     let Ok((tcp, _)) = acc else { continue };
                     let Ok(auth_slot) = waiting.clone().try_acquire_owned() else {
-                        tracing::debug!("IPC connection refused: too many waiting for authentication");
+                        tracing::warn!("IPC connection refused: too many waiting for authentication");
                         continue;
                     };
                     tcp.set_nodelay(true).ok();
@@ -1122,6 +1181,24 @@ impl Node {
                 _ = tick.tick() => {}
             }
             n += 1;
+            // Re-probe online peers stuck in `Reach::Failing` once their pause
+            // has elapsed so `status` and `doctor` recover without needing a
+            // new build (CF-40).
+            let to_probe: Vec<NodeId> = {
+                let now = Instant::now();
+                lock(&self.peers)
+                    .iter()
+                    .filter(|(_, p)| {
+                        p.conns > 0
+                            && p.reach == Reach::Failing
+                            && p.unreachable_until.is_none_or(|t| t <= now)
+                    })
+                    .map(|(id, _)| *id)
+                    .collect()
+            };
+            for id in to_probe {
+                tokio::spawn(self.clone().probe_peer(id));
+            }
             let node = self.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 node.persist();
@@ -1365,6 +1442,8 @@ pub async fn run(
             .any(|p| crate::discovery::is_loopback_peer(p)),
         dialbacks: Mutex::new(HashMap::new()),
         dialback_sem: Arc::new(Semaphore::new(MAX_DIALBACKS)),
+        dial_back_inflight: Arc::new(Semaphore::new(MAX_DIALBACK_INFLIGHT_TOTAL)),
+        logged_unknown_deps: Mutex::new(HashSet::new()),
         host_triple,
         tls,
         id,
@@ -1597,5 +1676,16 @@ mod tests {
         assert!(l.admit().is_none(), "total cap reached");
         held.pop();
         assert!(l.admit().is_some());
+    }
+
+    /// CF-44: `crabfarm cargo` spawns up to `MAX_JOBS` wrappers at once; the
+    /// IPC unauthenticated-auth cap must not drop a normal build burst.
+    #[test]
+    fn ipc_unauthenticated_cap_covers_max_jobs() {
+        assert!(
+            MAX_IPC_UNAUTHENTICATED >= crate::cargo_cmd::MAX_JOBS as usize,
+            "MAX_IPC_UNAUTHENTICATED ({MAX_IPC_UNAUTHENTICATED}) < MAX_JOBS ({})",
+            crate::cargo_cmd::MAX_JOBS
+        );
     }
 }

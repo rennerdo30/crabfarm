@@ -326,9 +326,10 @@ pub fn diagnose(x: &Facts) -> Vec<Finding> {
                 .unwrap_or(0);
             if l.total > 0 && unknown > 0 {
                 let hint = if unknown_jobs > 0 || l.changed > 0 {
-                    "Build once from scratch through crabfarm: `cargo clean`, then `crabfarm cargo build` \
-                     (workspace crates built with incremental compilation under `remote_incremental = \"local\"` \
-                     and `cargo clippy` outputs stay local by design and are not recorded)."
+                    "Workspace crates built with incremental compilation (`remote_incremental = \"local\"`) \
+                     and `cargo clippy` outputs stay local by design and are not recorded. Only if registry \
+                     dependencies were built before enabling crabfarm, run `cargo clean` and rebuild once \
+                     through crabfarm."
                 } else {
                     "No job fell back for `UnknownDependency` in this node session: these are usually \
                      workspace crates built with incremental compilation (`remote_incremental = \"local\"`) \

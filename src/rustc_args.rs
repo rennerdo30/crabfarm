@@ -1552,7 +1552,9 @@ mod tests {
         let out_dir = r"E:\w\tgt\debug\build\anyhow-123456\out";
         // anyhow / thiserror style: package probe source, --out-dir = OUT_DIR.
         let anyhow_probe = remote(
-            &v("--crate-name anyhow --edition=2018 build/probe.rs --crate-type lib --emit=dep-info,metadata --out-dir E:/w/tgt/debug/build/anyhow-123456/out"),
+            &v(
+                "--crate-name anyhow --edition=2018 build/probe.rs --crate-type lib --emit=dep-info,metadata --out-dir E:/w/tgt/debug/build/anyhow-123456/out",
+            ),
             &o,
         );
         assert!(is_build_script_probe(&anyhow_probe, Some(out_dir)));
@@ -1560,7 +1562,9 @@ mod tests {
 
         // autocfg style: source file inside OUT_DIR too.
         let autocfg_probe = remote(
-            &v("--crate-name probe1 E:/w/tgt/debug/build/anyhow-123456/out/probe1.rs --crate-type lib --out-dir E:/w/tgt/debug/deps"),
+            &v(
+                "--crate-name probe1 E:/w/tgt/debug/build/anyhow-123456/out/probe1.rs --crate-type lib --out-dir E:/w/tgt/debug/deps",
+            ),
             &o,
         );
         assert!(is_build_script_probe(&autocfg_probe, Some(out_dir)));
@@ -1569,7 +1573,9 @@ mod tests {
         let normal = remote(&v(BASE), &o);
         assert!(!is_build_script_probe(&normal, Some(out_dir)));
         let cargo1100 = remote(
-            &v("--crate-name util src/lib.rs --crate-type lib --emit=dep-info,metadata,link --out-dir E:/w/tgt/debug/build/util/libhash/out"),
+            &v(
+                "--crate-name util src/lib.rs --crate-type lib --emit=dep-info,metadata,link --out-dir E:/w/tgt/debug/build/util/libhash/out",
+            ),
             &o,
         );
         assert!(!is_build_script_probe(

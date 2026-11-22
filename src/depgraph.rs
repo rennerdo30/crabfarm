@@ -234,12 +234,8 @@ impl DepGraph {
     ) -> Result<Vec<ClientPath>, Unknown> {
         let mut seen: HashSet<ClientPath> = HashSet::new();
         let mut order: Vec<ClientPath> = Vec::new();
-        let mut stack: Vec<(ClientPath, bool)> = externs
-            .iter()
-            .rev()
-            .cloned()
-            .map(|p| (p, true))
-            .collect();
+        let mut stack: Vec<(ClientPath, bool)> =
+            externs.iter().rev().cloned().map(|p| (p, true)).collect();
         while let Some((raw, is_direct)) = stack.pop() {
             let p = if need_rlib && !is_direct {
                 sibling_rlib(&raw).unwrap_or(raw)
@@ -261,12 +257,6 @@ impl DepGraph {
                         return Err(Unknown::Changed(p));
                     }
                 }
-            }
-            if need_rlib
-                && is_direct
-                && let Some(rlib) = sibling_rlib(&p)
-            {
-                stack.push((rlib, false));
             }
             for x in e.externs.iter().rev() {
                 stack.push((x.clone(), false));
@@ -429,6 +419,29 @@ mod tests {
         assert_eq!(
             g.closure_for(std::slice::from_ref(&b_rlib), true),
             Err(Unknown::Changed(a_rlib))
+        );
+        // Missing sibling .rlib fails safe to local with NotRecorded rather
+        // than shipping a transitive .rmeta that rustc cannot link into a proc macro.
+        let orphan_rmeta = make(d.path(), "liborphan-1.rmeta", "meta");
+        let mid_orphan = make(d.path(), "libmid_orphan-1.rlib", "mid");
+        g.begin(std::slice::from_ref(&orphan_rmeta), &[]);
+        g.finish(std::slice::from_ref(&orphan_rmeta), true);
+        g.begin(
+            std::slice::from_ref(&mid_orphan),
+            std::slice::from_ref(&orphan_rmeta),
+        );
+        g.finish(std::slice::from_ref(&mid_orphan), true);
+        let err = g
+            .closure_for(&[mid_orphan], true)
+            .expect_err("missing sibling rlib must fail safe");
+        assert!(matches!(err, Unknown::NotRecorded(ref p) if p.path.ends_with("liborphan-1.rlib")));
+
+        // Windows uppercase .RMETA promotes to sibling .rlib as well.
+        let win_upper =
+            ClientPath::parse(crate::proto::PathStyle::Windows, r"C:\deps\LIBFOO-1.RMETA").unwrap();
+        assert_eq!(
+            sibling_rlib(&win_upper).map(|p| p.path),
+            Some(r"C:\deps\LIBFOO-1.rlib".into())
         );
     }
 }

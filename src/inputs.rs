@@ -178,7 +178,7 @@ fn walk(root: &Path, is_package: bool, max_file: u64, acc: &mut Acc) -> Result<(
 }
 
 /// Spellings under which a local directory path can appear inside a generated
-/// `.rs` file in `OUT_DIR` (raw `\`, forward `/`, and Rust-escaped `\\`).
+/// `.rs` file in `OUT_DIR` (raw `\`, forward `/`, backslash `\`, and escaped `\\`).
 fn path_needles(dirs: &[&Path]) -> Vec<String> {
     let mut out = Vec::new();
     for dir in dirs {
@@ -187,11 +187,16 @@ fn path_needles(dirs: &[&Path]) -> Vec<String> {
         if trimmed.len() < 3 {
             continue;
         }
-        let variants = [
+        let mut variants = vec![
             trimmed.to_string(),
             trimmed.replace('\\', "/"),
             trimmed.replace('\\', "\\\\"),
         ];
+        if cfg!(windows) && trimmed.contains('/') {
+            let bs = trimmed.replace('/', "\\");
+            variants.push(bs.replace('\\', "\\\\"));
+            variants.push(bs);
+        }
         for v in variants {
             let v = if cfg!(windows) {
                 v.to_ascii_lowercase()
@@ -208,8 +213,10 @@ fn path_needles(dirs: &[&Path]) -> Vec<String> {
 
 /// True when a generated `.rs` file in `OUT_DIR` contains a non-comment line
 /// mentioning one of the submitter's local directory paths (CF-43, e.g.
-/// `khronos_api` baking `CARGO_MANIFEST_DIR` into `include_bytes!`).
+/// `khronos_api` baking `CARGO_MANIFEST_DIR` into `include_bytes!`). Streams
+/// line-by-line and fails closed (`true`) on non-UTF-8 `.rs` files.
 fn rs_embeds_local_path(path: &Path, needles: &[String]) -> std::io::Result<bool> {
+    use std::io::{BufRead, BufReader};
     if needles.is_empty()
         || !path
             .extension()
@@ -218,11 +225,17 @@ fn rs_embeds_local_path(path: &Path, needles: &[String]) -> std::io::Result<bool
     {
         return Ok(false);
     }
-    let bytes = std::fs::read(path)?;
-    let Ok(text) = std::str::from_utf8(&bytes) else {
-        return Ok(false);
-    };
-    for line in text.lines() {
+    let mut reader = BufReader::new(std::fs::File::open(path)?);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        if reader.read_until(b'\n', &mut buf)? == 0 {
+            break;
+        }
+        let Ok(line) = std::str::from_utf8(&buf) else {
+            // Non-UTF-8 `.rs` in OUT_DIR: fail closed and run locally.
+            return Ok(true);
+        };
         let trimmed = line.trim_start();
         if trimmed.starts_with("//") {
             continue;
@@ -256,11 +269,10 @@ fn collect_with_limits(
     };
     walk(package_dir, true, max_file, &mut acc)?;
     if let Some(out) = out_dir_env {
-        let before = acc.files.len();
         walk(out, false, max_file, &mut acc)?;
         let needles = path_needles(&[package_dir, out]);
-        for (path, _, _) in &acc.files[before..] {
-            if rs_embeds_local_path(path, &needles)? {
+        for (path, _, _) in &acc.files {
+            if path.starts_with(out) && rs_embeds_local_path(path, &needles)? {
                 return Err(CollectError::EmbeddedLocalPath);
             }
         }
@@ -647,7 +659,10 @@ mod tests {
         let d = tempfile::tempdir().expect("tmp");
         let pkg = d.path().join("khronos_api-3.1.0");
         let out = d.path().join("out");
-        write(&pkg.join("src/lib.rs"), b"include!(concat!(env!(\"OUT_DIR\"), \"/exts.rs\"));");
+        write(
+            &pkg.join("src/lib.rs"),
+            b"include!(concat!(env!(\"OUT_DIR\"), \"/exts.rs\"));",
+        );
         write(&pkg.join("api_webgl/ext.xml"), b"<xml/>");
         let embedded = format!(
             "pub const X: &[u8] = include_bytes!(r\"{}\");\n",
@@ -693,5 +708,35 @@ mod tests {
         );
         write(&out.join("exts.rs"), comment.as_bytes());
         assert!(collect(&pkg, Some(&out), &[], &[], true).is_ok());
+
+        // Embedding OUT_DIR itself is caught too.
+        let out_embed = format!(
+            "pub const DATA: &[u8] = include_bytes!(r\"{}\");\n",
+            out.join("blob.bin").display()
+        );
+        write(&out.join("exts.rs"), out_embed.as_bytes());
+        assert!(matches!(
+            collect(&pkg, Some(&out), &[], &[], true),
+            Err(CollectError::EmbeddedLocalPath)
+        ));
+
+        // Non-UTF-8 generated `.rs` fails closed (runs locally).
+        write(&out.join("exts.rs"), b"\xff\xfeinvalid utf8");
+        assert!(matches!(
+            collect(&pkg, Some(&out), &[], &[], true),
+            Err(CollectError::EmbeddedLocalPath)
+        ));
+
+        // OUT_DIR nested inside package_dir (non-target dir) is still checked.
+        let nested_out = pkg.join("gen_out");
+        let nested_embed = format!(
+            "pub const X: &[u8] = include_bytes!(r\"{}\");\n",
+            pkg.join("api_webgl/ext.xml").display()
+        );
+        write(&nested_out.join("nested.rs"), nested_embed.as_bytes());
+        assert!(matches!(
+            collect(&pkg, Some(&nested_out), &[], &[], true),
+            Err(CollectError::EmbeddedLocalPath)
+        ));
     }
 }

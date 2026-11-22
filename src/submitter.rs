@@ -224,7 +224,7 @@ const JOB_SLACK: Duration = Duration::from_secs(120);
 /// What the node knows about the liveness of the work behind one `Submit`.
 /// The keepalive to the wrapper is sent only while this says the job is alive,
 /// so a wrapper never mistakes "the node is up" for "my job is progressing".
-struct Liveness {
+pub(crate) struct Liveness {
     base: Instant,
     last_ms: AtomicU64,
     /// A remote attempt is in flight (waiting on a peer).
@@ -234,7 +234,7 @@ struct Liveness {
 }
 
 impl Liveness {
-    fn new() -> Arc<Liveness> {
+    pub(crate) fn new() -> Arc<Liveness> {
         Arc::new(Liveness {
             base: Instant::now(),
             last_ms: AtomicU64::new(0),
@@ -702,11 +702,10 @@ fn build_inputs(node: &Node, spec: &JobSpec, info: &SubmitInfo) -> Result<Built,
     }
     for c in closure {
         let local = c.to_local();
-        total = total.saturating_add(
-            std::fs::metadata(&local)
-                .map(|m| m.len())
-                .map_err(|_| PrepError::UnknownDep(crate::depgraph::Unknown::Changed(c.clone())))?,
-        );
+        total =
+            total.saturating_add(std::fs::metadata(&local).map(|m| m.len()).map_err(|_| {
+                PrepError::UnknownDep(crate::depgraph::Unknown::Changed(c.clone()))
+            })?);
         if total > inputs::MAX_TOTAL {
             tracing::info!(
                 crate_name = spec.crate_name.as_str(),
@@ -771,6 +770,29 @@ struct PeerView {
     free: u32,
     speed: u32,
     bandwidth: u64,
+}
+
+/// Outcome of asking a peer to dial back (CF-40): keeps local queue saturation
+/// distinct from real network/peer failures so a healthy peer is never marked
+/// `Failing` because local jobs queued for a handshake slot.
+pub(crate) enum DialBackOutcome {
+    Connected(Link),
+    QueueTimeout,
+    Failed,
+}
+
+/// Clears `PeerState::probing` when `probe_peer` exits for any reason.
+struct ProbeGuard {
+    node: Arc<Node>,
+    peer: NodeId,
+}
+
+impl Drop for ProbeGuard {
+    fn drop(&mut self) {
+        if let Some(p) = lock(&self.node.peers).get_mut(&self.peer) {
+            p.probing = false;
+        }
+    }
 }
 
 /// Pure transition rule for [`Node::note_job_connect_failed`] (CF-40):
@@ -1686,45 +1708,72 @@ impl Node {
 
     /// Ask `peer` over its control connection to open a connection to this
     /// node (CF-34) and wait for it until `deadline`. Concurrent outgoing
-    /// dial-back handshakes are bounded below `MAX_UNAUTHENTICATED` so bursts
-    /// of jobs queue cleanly instead of overflowing the inbound accept cap
-    /// (CF-40).
+    /// dial-back handshakes are bounded below `MAX_UNAUTHENTICATED` (per-peer
+    /// permit acquired before the global permit so one busy peer cannot starve
+    /// another), and a local queue wait timeout returns
+    /// [`DialBackOutcome::QueueTimeout`] without blaming the peer (CF-40).
     pub(crate) async fn dial_back_link(
         self: &Arc<Self>,
         peer: NodeId,
         deadline: tokio::time::Instant,
-    ) -> Option<Link> {
-        let (ctrl, peer_sem, peer_name) = {
+    ) -> DialBackOutcome {
+        self.dial_back_link_inner(peer, deadline, true).await
+    }
+
+    async fn dial_back_link_inner(
+        self: &Arc<Self>,
+        peer: NodeId,
+        deadline: tokio::time::Instant,
+        count_stat: bool,
+    ) -> DialBackOutcome {
+        let Some((ctrl, peer_sem, peer_name)) = ({
             let peers = lock(&self.peers);
-            let p = peers.get(&peer)?;
-            let name = crate::proto::log_safe(&p.info.node_name);
-            let Some((_, ctrl)) = p.ctrl.first() else {
-                tracing::info!(
-                    peer = name.as_str(),
-                    "dial-back failed: no live control connection"
-                );
-                return None;
-            };
-            (ctrl.clone(), p.dial_back_sem.clone(), name)
+            peers.get(&peer).and_then(|p| {
+                let name = crate::proto::log_safe(&p.info.node_name);
+                let Some((_, ctrl)) = p.ctrl.first() else {
+                    tracing::info!(
+                        peer = name.as_str(),
+                        "dial-back failed: no live control connection"
+                    );
+                    return None;
+                };
+                Some((ctrl.clone(), p.dial_back_sem.clone(), name))
+            })
+        }) else {
+            return DialBackOutcome::Failed;
         };
-        let Ok(Ok(_total_permit)) =
-            tokio::time::timeout_at(deadline, self.dial_back_inflight.clone().acquire_owned())
-                .await
-        else {
-            tracing::info!(
-                peer = peer_name.as_str(),
-                "dial-back failed: timed out waiting for local dial-back concurrency slot"
-            );
-            return None;
-        };
+        // Reserve half the remaining budget (up to DIALBACK_WAIT) for the
+        // actual network handshake so queueing cannot starve it and blame a
+        // healthy peer.
+        let now = tokio::time::Instant::now();
+        let remaining = deadline.saturating_duration_since(now);
+        let handshake_reserve = DIALBACK_WAIT.min(remaining / 2);
+        let queue_deadline = deadline
+            .checked_sub(handshake_reserve)
+            .unwrap_or(now)
+            .max(now);
+        // Take the per-peer permit BEFORE the global permit so waiters for one
+        // busy peer never hold global permits and starve another peer.
         let Ok(Ok(_peer_permit)) =
-            tokio::time::timeout_at(deadline, peer_sem.acquire_owned()).await
+            tokio::time::timeout_at(queue_deadline, peer_sem.acquire_owned()).await
         else {
             tracing::info!(
                 peer = peer_name.as_str(),
-                "dial-back failed: timed out waiting for per-peer dial-back slot"
+                "dial-back queued too long: per-peer concurrency slot busy"
             );
-            return None;
+            return DialBackOutcome::QueueTimeout;
+        };
+        let Ok(Ok(_total_permit)) = tokio::time::timeout_at(
+            queue_deadline,
+            self.dial_back_inflight.clone().acquire_owned(),
+        )
+        .await
+        else {
+            tracing::info!(
+                peer = peer_name.as_str(),
+                "dial-back queued too long: local dial-back concurrency slot busy"
+            );
+            return DialBackOutcome::QueueTimeout;
         };
         let token: [u8; 16] = rand::random();
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1738,27 +1787,29 @@ impl Node {
                     peer = peer_name.as_str(),
                     "dial-back failed: control connection closed while sending DialBack"
                 );
-                return None;
+                return DialBackOutcome::Failed;
             }
             Err(_) => {
                 tracing::info!(
                     peer = peer_name.as_str(),
                     "dial-back failed: timed out sending DialBack on control connection"
                 );
-                return None;
+                return DialBackOutcome::Failed;
             }
         }
         match tokio::time::timeout_at(wait, rx).await {
             Ok(Ok(link)) => {
-                self.count("dialbacks", 1);
-                Some(link)
+                if count_stat {
+                    self.count("dialbacks", 1);
+                }
+                DialBackOutcome::Connected(link)
             }
             Ok(Err(_)) => {
                 tracing::info!(
                     peer = peer_name.as_str(),
                     "dial-back failed: waiter channel closed"
                 );
-                None
+                DialBackOutcome::Failed
             }
             Err(_) => {
                 tracing::info!(
@@ -1766,7 +1817,7 @@ impl Node {
                     "dial-back failed: peer did not connect back within {}s",
                     DIALBACK_WAIT.as_secs()
                 );
-                None
+                DialBackOutcome::Failed
             }
         }
     }
@@ -1776,6 +1827,10 @@ impl Node {
     /// probe connection cleanly and updates reachability so `status` and
     /// `doctor` recover without waiting for another build.
     pub(crate) async fn probe_peer(self: Arc<Self>, peer: NodeId) {
+        let _guard = ProbeGuard {
+            node: self.clone(),
+            peer,
+        };
         let Some((direct_ok, can_dial_back)) = self.direct_and_dial_back(peer) else {
             return;
         };
@@ -1804,12 +1859,16 @@ impl Node {
             }
             self.note_direct_failed(peer);
         }
-        if can_dial_back
-            && let Some(link) = self.dial_back_link(peer, deadline).await
-        {
-            self.note_reach(peer, Reach::DialBack);
-            link.close().await;
-            return;
+        if can_dial_back {
+            match self.dial_back_link_inner(peer, deadline, false).await {
+                DialBackOutcome::Connected(link) => {
+                    self.note_reach(peer, Reach::DialBack);
+                    link.close().await;
+                    return;
+                }
+                DialBackOutcome::QueueTimeout => return,
+                DialBackOutcome::Failed => {}
+            }
         }
         self.note_reach(peer, Reach::Failing);
     }
@@ -1834,7 +1893,10 @@ impl Node {
         if !can_dial_back {
             return None;
         }
-        self.dial_back_link(peer, deadline).await
+        match self.dial_back_link(peer, deadline).await {
+            DialBackOutcome::Connected(link) => Some(link),
+            DialBackOutcome::QueueTimeout | DialBackOutcome::Failed => None,
+        }
     }
 
     /// Send `Reserve` on a fresh job connection and wait for the answer.
@@ -1868,7 +1930,7 @@ impl Node {
     /// `deadline`. Direct first (its addresses race, CF-27); when no address
     /// answers, the peer is asked over the control connection to dial back
     /// (CF-34), and for [`DIRECT_RETRY_AFTER`] that comes first.
-    async fn open_job_link(
+    pub(crate) async fn open_job_link(
         self: &Arc<Self>,
         peer: NodeId,
         job_id: JobId,
@@ -1903,7 +1965,11 @@ impl Node {
             self.note_direct_failed(peer);
         }
         let link = if can_dial_back {
-            self.dial_back_link(peer, deadline).await
+            match self.dial_back_link(peer, deadline).await {
+                DialBackOutcome::Connected(link) => Some(link),
+                DialBackOutcome::QueueTimeout => return None,
+                DialBackOutcome::Failed => None,
+            }
         } else {
             None
         };
@@ -2979,5 +3045,98 @@ mod tests {
             "working Direct peer survives one blip"
         );
         assert!(record_connect_failure(Reach::Direct, &mut f));
+    }
+
+    /// CF-44 (M2): `unknown_dep.*` counters must only increment when a job
+    /// actually falls back with `LocalReason::UnknownDependency`, never when
+    /// `plan()` returns `NoPeer` or `LocalSlotFree`.
+    #[tokio::test]
+    async fn unknown_dep_counters_only_increment_on_unknown_dependency_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("node");
+        let id = crate::farm::create(&dir, "sub").unwrap();
+        let node = crate::node::tests::make_test_node(&dir, id, 4);
+        let tc = crate::proto::ToolchainId {
+            release: "1.99.0".into(),
+            commit_hash: "0".repeat(40),
+            commit_date: "2026-10-13".into(),
+            host: "x86_64-pc-windows-msvc".into(),
+        };
+        let spec = JobSpec {
+            job_id: JobId([9; 16]),
+            toolchain: tc.clone(),
+            target: "x86_64-pc-windows-msvc".into(),
+            crate_name: "demo".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            extra_env: Vec::new(),
+            build_env: Vec::new(),
+            cwd: posix("/p"),
+            out_dir: posix("/p/target/deps"),
+            inputs: Vec::new(),
+            dirs: Vec::new(),
+            no_retain: false,
+            needs_host: false,
+        };
+        let info = SubmitInfo {
+            produces: Vec::new(),
+            externs: Vec::new(),
+            input: posix("/p/src/lib.rs"),
+            search_dirs: Vec::new(),
+            link_libs: Vec::new(),
+        };
+        let dep = posix("/p/target/deps/libfoo-1.rlib");
+
+        // 1. No online peer: plan returns NoPeer and leaves unknown_dep.* at 0.
+        let r = node
+            .plan(
+                spec.clone(),
+                &info,
+                Some(Err(PrepError::UnknownDep(
+                    crate::depgraph::Unknown::NotRecorded(dep.clone()),
+                ))),
+            )
+            .await;
+        assert!(matches!(r, Err(LocalReason::NoPeer)));
+        let snap = node.counters_snapshot();
+        assert!(!snap.iter().any(|(k, _)| k.starts_with("unknown_dep.")));
+
+        // 2. Add an online eligible peer with free slots: plan now consumes the
+        // prepared UnknownDep and increments unknown_dep.changed.
+        let peer_id = NodeId([0xaa; 16]);
+        {
+            let mut st = crate::node::PeerState::new_for_test(peer_id, "worker");
+            st.conns = 1;
+            st.status = Some(crate::proto::Status {
+                node_id: peer_id,
+                node_name: "worker".into(),
+                host_triple: "x86_64-pc-windows-msvc".into(),
+                slots_total: 8,
+                slots_busy: 0,
+                queue_len: 0,
+                speed: 100,
+                toolchains: vec![tc],
+                targets: vec![vec!["x86_64-pc-windows-msvc".into()]],
+                accepting: true,
+            });
+            lock(&node.peers).insert(peer_id, st);
+        }
+        let r2 = node
+            .plan(
+                spec,
+                &info,
+                Some(Err(PrepError::UnknownDep(
+                    crate::depgraph::Unknown::Changed(dep),
+                ))),
+            )
+            .await;
+        assert!(matches!(r2, Err(LocalReason::UnknownDependency)));
+        let changed = node
+            .counters_snapshot()
+            .into_iter()
+            .find(|(k, _)| k == "unknown_dep.changed")
+            .map(|(_, v)| v)
+            .unwrap_or(0);
+        assert_eq!(changed, 1);
     }
 }

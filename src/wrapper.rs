@@ -735,11 +735,23 @@ fn submit(
     }
 }
 
-/// Shut the IPC connection down and drop it, so the node sees end-of-file now
-/// (bounded: a socket that will not close must not hold the build up).
+/// Shut the IPC connection down cleanly and drain any unread peer bytes before
+/// dropping, so Windows does not turn the close into a TCP RST that discards
+/// our last frame (`LocalDone`, CF-39, CF-44). Bounded to 1 s and 64 KiB.
 async fn close_ipc(mut conn: crate::transport::FramedConn<tokio::net::TcpStream>) {
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let _ = tokio::time::timeout(std::time::Duration::from_secs(1), conn.stream.shutdown()).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let mut buf = [0u8; 4096];
+        let mut left = 64 * 1024usize;
+        while left > 0 {
+            match conn.stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => left = left.saturating_sub(n),
+            }
+        }
+    })
+    .await;
     drop(conn);
 }
 

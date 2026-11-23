@@ -22,6 +22,14 @@ pub const MAX_WATCH_INTERVAL_SECS: u64 = 3600;
 const WATCH_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 /// Width of the ASCII slot utilization bar in watch mode.
 const SLOT_BAR_WIDTH: usize = 16;
+/// Width of the SLOTS column: `[` + 16 + `]` (18) + ` ` (1) + `999/999` (7) = 26.
+const SLOT_COL_WIDTH: usize = SLOT_BAR_WIDTH + 10;
+
+/// Strip control characters (including ANSI ESC and newlines) from peer-supplied
+/// text before rendering it to a terminal.
+fn clean_cell(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
 
 fn counter(counters: &[(String, u64)], name: &str) -> u64 {
     counters
@@ -609,11 +617,11 @@ fn delta_suffix(delta: u64, theme: Theme) -> String {
 
 fn format_bar_cell(busy: u32, total: u32, accepting: bool, theme: Theme) -> String {
     if !accepting && busy == 0 {
-        let plain = format!("{:<23}", "not accepting");
+        let plain = format!("{:<w$}", "not accepting", w = SLOT_COL_WIDTH);
         return theme.dim(&plain);
     }
     let bar = slot_bar(busy, total, SLOT_BAR_WIDTH);
-    let ratio = format!("{busy:>2}/{total:<2}");
+    let ratio = format!("{busy:>3}/{total:<3}");
     if !theme.color {
         return format!("{bar} {ratio}");
     }
@@ -711,11 +719,22 @@ pub fn format_watch_frame(
     ));
 
     // Unified nodes & peers table with visual slot bars
-    let local_build_label = format!("{} (local)", local.node_name);
-    let local_serve_label = format!("{} (serve)", local.node_name);
-    let name_w = peers
+    let local_name = clean_cell(&local.node_name);
+    let local_host = clean_cell(&local.host_triple);
+    let local_build_label = format!("{local_name} (local)");
+    let local_serve_label = format!("{local_name} (serve)");
+    let clean_peers: Vec<(String, Option<String>)> = peers
         .iter()
-        .map(|(p, _)| p.node_name.chars().count())
+        .map(|(p, s)| {
+            (
+                clean_cell(&p.node_name),
+                s.as_ref().map(|st| clean_cell(&st.host_triple)),
+            )
+        })
+        .collect();
+    let name_w = clean_peers
+        .iter()
+        .map(|(n, _)| n.chars().count())
         .chain([
             4,
             local_build_label.chars().count(),
@@ -723,16 +742,21 @@ pub fn format_watch_frame(
         ])
         .max()
         .unwrap_or(4);
-    let host_w = peers
+    let host_w = clean_peers
         .iter()
-        .filter_map(|(_, s)| s.as_ref().map(|st| st.host_triple.chars().count()))
-        .chain([4, local.host_triple.chars().count()])
+        .filter_map(|(_, h)| h.as_ref().map(|x| x.chars().count()))
+        .chain([4, local_host.chars().count()])
         .max()
         .unwrap_or(4);
 
     let table_hdr = format!(
-        "{:<name_w$}  {:<host_w$}  {:<23}  {:<9}  {}",
-        "NODE", "HOST", "SLOTS", "MODE", "LAST SEEN",
+        "{:<name_w$}  {:<host_w$}  {:<slot_w$}  {:<9}  {}",
+        "NODE",
+        "HOST",
+        "SLOTS",
+        "MODE",
+        "LAST SEEN",
+        slot_w = SLOT_COL_WIDTH,
     );
     out.push_str(&theme.dim(&table_hdr));
     out.push('\n');
@@ -741,7 +765,7 @@ pub fn format_watch_frame(
     out.push_str(&format!(
         "{:<name_w$}  {:<host_w$}  {}  {:<9}  {}\n",
         local_build_label,
-        local.host_triple,
+        local_host,
         format_bar_cell(running_local as u32, local_slots, true, theme),
         "local",
         "now",
@@ -750,17 +774,17 @@ pub fn format_watch_frame(
     out.push_str(&format!(
         "{:<name_w$}  {:<host_w$}  {}  {:<9}  {}\n",
         local_serve_label,
-        local.host_triple,
+        local_host,
         format_bar_cell(local.slots_busy, local.slots_total, local.accepting, theme),
         "serving",
         "now",
     ));
 
     let mut failing = Vec::new();
-    for (p, s) in peers {
+    for ((p, s), (peer_name, peer_host)) in peers.iter().zip(&clean_peers) {
         let reach = reach_of(counters, p);
         if s.is_some() && reach == Reach::Failing {
-            failing.push(p.node_name.as_str());
+            failing.push(peer_name.as_str());
         }
         match s {
             Some(s) => {
@@ -772,8 +796,8 @@ pub fn format_watch_frame(
                 };
                 out.push_str(&format!(
                     "{:<name_w$}  {:<host_w$}  {}  {}  {}\n",
-                    p.node_name,
-                    s.host_triple,
+                    peer_name,
+                    peer_host.as_deref().unwrap_or("-"),
                     format_bar_cell(s.slots_busy, s.slots_total, s.accepting, theme),
                     reach_styled,
                     ago(now, p.last_seen),
@@ -781,12 +805,13 @@ pub fn format_watch_frame(
             }
             None => {
                 let offline_line = format!(
-                    "{:<name_w$}  {:<host_w$}  {:<23}  {:<9}  {}",
-                    p.node_name,
+                    "{:<name_w$}  {:<host_w$}  {:<slot_w$}  {:<9}  {}",
+                    peer_name,
                     "-",
                     "offline",
                     "-",
                     ago(now, p.last_seen),
+                    slot_w = SLOT_COL_WIDTH,
                 );
                 out.push_str(&theme.dim(&offline_line));
                 out.push('\n');
@@ -1166,7 +1191,7 @@ where
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut stop = std::pin::pin!(stop);
     let mut tick_count: u64 = 0;
-    let mut last_final: Option<String> = None;
+    let mut last_state: Option<(WatchSample, WatchDelta, Duration)> = None;
 
     loop {
         tokio::select! {
@@ -1183,7 +1208,7 @@ where
 
         let now_inst = Instant::now();
         let elapsed = now_inst.saturating_duration_since(started);
-        let (frame, final_frame) = match sample.reply {
+        let (frame, delta) = match sample.reply {
             Some(ref r) => {
                 let delta = state.record(&r.local, &r.counters, now_inst);
                 let live = format_watch_frame(
@@ -1198,19 +1223,7 @@ where
                     color,
                     false,
                 );
-                let done = format_watch_frame(
-                    &r.local,
-                    &r.peers,
-                    &r.counters,
-                    sample.now_unix,
-                    interval,
-                    elapsed,
-                    &delta,
-                    sample.unresponsive.as_deref(),
-                    color,
-                    true,
-                );
-                (live, done)
+                (live, delta)
             }
             None => {
                 state.note_disconnected();
@@ -1221,17 +1234,10 @@ where
                     color,
                     false,
                 );
-                let done = format_watch_offline(
-                    interval,
-                    elapsed,
-                    sample.unresponsive.as_deref(),
-                    color,
-                    true,
-                );
-                (live, done)
+                (live, WatchDelta::default())
             }
         };
-        last_final = Some(final_frame);
+        last_state = Some((sample, delta, elapsed));
 
         let write_res = if ansi {
             out.write_all(render_ansi_frame(&frame).as_bytes())
@@ -1250,7 +1256,29 @@ where
         tick_count += 1;
     }
 
-    Ok(last_final)
+    let final_frame = last_state.map(|(sample, delta, elapsed)| match sample.reply {
+        Some(ref r) => format_watch_frame(
+            &r.local,
+            &r.peers,
+            &r.counters,
+            sample.now_unix,
+            interval,
+            elapsed,
+            &delta,
+            sample.unresponsive.as_deref(),
+            color,
+            true,
+        ),
+        None => format_watch_offline(
+            interval,
+            elapsed,
+            sample.unresponsive.as_deref(),
+            color,
+            true,
+        ),
+    });
+
+    Ok(final_frame)
 }
 
 /// Run `crabfarm status --watch` until Ctrl+C.
@@ -1597,7 +1625,7 @@ mod tests {
             "{frame}"
         );
         assert!(frame.contains("active: 6 remote, 2 local"), "{frame}");
-        assert!(frame.contains("[############....] 12/16"), "{frame}");
+        assert!(frame.contains("[############....]  12/16 "), "{frame}");
         assert!(frame.contains("not accepting"), "{frame}");
         assert!(frame.contains("offline"), "{frame}");
         assert!(frame.contains("40 remote ok (+7)"), "{frame}");
@@ -1606,6 +1634,49 @@ mod tests {
         assert!(frame.contains("2.0 MiB/s"), "{frame}");
         assert!(frame.contains("512.0 KiB/s"), "{frame}");
         assert!(!frame.contains("\x1b["), "plain mode must not emit ANSI");
+
+        // Column alignment: header and every peer/node row place LAST SEEN at the exact same column.
+        let hdr = frame.lines().find(|l| l.starts_with("NODE")).unwrap();
+        let mode_col = hdr.find("MODE").unwrap();
+        for row in frame.lines().filter(|l| {
+            l.starts_with("me (")
+                || l.starts_with("desktop")
+                || l.starts_with("paused")
+                || l.starts_with("laptop")
+        }) {
+            assert!(
+                row.len() > mode_col && !row[mode_col..].starts_with(' '),
+                "MODE column misaligned on row `{row}` (expected col {mode_col})"
+            );
+        }
+
+        // Control chars / ANSI escapes in peer-supplied names are stripped.
+        let evil_peer = vec![(
+            PeerInfo {
+                node_id: NodeId([9; 16]),
+                node_name: "evil\x1b[31m\nFORGED".into(),
+                addrs: vec![],
+                last_seen: 999,
+            },
+            Some(st("evil\x1b[31m", 4, 1)),
+        )];
+        let safe = format_watch_frame(
+            &st("me", 8, 0),
+            &evil_peer,
+            &counters,
+            1000,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            &delta,
+            None,
+            false,
+            false,
+        );
+        assert!(!safe.contains("\x1b["), "peer escape leaked: {safe}");
+        assert!(
+            !safe.lines().any(|l| l == "FORGED"),
+            "newline forged: {safe}"
+        );
 
         let ansi_frame = render_ansi_frame(&frame);
         assert!(ansi_frame.starts_with("\x1b[H"));

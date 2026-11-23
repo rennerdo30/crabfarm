@@ -876,8 +876,9 @@ pub fn tail_log(path: &Path, max_lines: usize, max_bytes: usize) -> LogTail {
     let _ = file.take(to_read as u64).read_to_end(&mut buf);
     let text = String::from_utf8_lossy(&buf);
     let mut iter = text.lines();
-    if truncated_by_bytes {
-        // Drop the leading partial line after seeking into the middle of the file.
+    if truncated_by_bytes && buf.contains(&b'\n') {
+        // Drop the leading partial line after seeking into the middle of the file,
+        // unless the entire capped tail has no newline at all (single very long line).
         let _ = iter.next();
     }
     let all: Vec<String> = iter.map(sanitize_dump_line).collect();
@@ -1213,9 +1214,9 @@ pub fn render_dump(d: &DumpData) -> String {
                             let _ = writeln!(
                                 out,
                                 "peer {} (id={}): ONLINE host={} accepting={} slots={}/{} speed={} reach={:?} addrs={:?}",
-                                p.node_name,
+                                crate::proto::log_safe(&p.node_name),
                                 &p.node_id.to_hex()[..16],
-                                st.host_triple,
+                                crate::proto::log_safe(&st.host_triple),
                                 st.accepting,
                                 st.slots_busy,
                                 st.slots_total,
@@ -1266,7 +1267,7 @@ pub fn render_dump(d: &DumpData) -> String {
                             let _ = writeln!(
                                 out,
                                 "peer {} (id={}): OFFLINE last_seen={} addrs={:?}",
-                                p.node_name,
+                                crate::proto::log_safe(&p.node_name),
                                 &p.node_id.to_hex()[..16],
                                 p.last_seen,
                                 p.addrs
@@ -1337,7 +1338,7 @@ pub fn render_dump(d: &DumpData) -> String {
                 let _ = writeln!(
                     out,
                     "  - {} (id={}) addrs={:?} last_seen={}",
-                    p.node_name,
+                    crate::proto::log_safe(&p.node_name),
                     &p.node_id.to_hex()[..16],
                     p.addrs,
                     p.last_seen
@@ -1670,6 +1671,13 @@ mod tests {
             "partial leading line should be dropped: {:?}",
             capped.lines.first()
         );
+
+        // Single line longer than the byte cap is still preserved instead of yielding empty.
+        std::fs::write(&log, "x".repeat(1024)).unwrap();
+        let one_long = tail_log(&log, 10, 256);
+        assert!(one_long.truncated_by_bytes);
+        assert_eq!(one_long.lines.len(), 1);
+        assert_eq!(one_long.lines[0].len(), 256);
     }
 
     #[test]

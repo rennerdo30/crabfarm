@@ -90,6 +90,12 @@ pub fn recorded(data_dir: &Path, crate_name: &str) -> Vec<String> {
     load(data_dir).remove(crate_name).unwrap_or_default()
 }
 
+/// Snapshot of all recorded crate -> variable-name entries (names only, never values),
+/// capped and sanitized by [`load`].
+pub fn summary(data_dir: &Path) -> BTreeMap<String, Vec<String>> {
+    load(data_dir)
+}
+
 /// Exclusive lock on `env_forward.lock`, released on drop.
 struct Lock(std::fs::File);
 

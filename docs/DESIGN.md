@@ -35,7 +35,8 @@ Two programs from one crate: `crabfarm` (CLI, below) and `crabfarmd` (CF-22), th
 | `crabfarm farm invite` | Print a one-time join code (valid 10 minutes, single use). |
 | `crabfarm farm join <code>` | Join a farm. |
 | `crabfarm cargo <args...>` | Run cargo with `RUSTC_WRAPPER=crabfarm` and a farm-sized `-j`. |
-| `crabfarm status` | Peers, slots, running jobs, local/remote counters, compile cache hits. |
+| `crabfarm status [--watch] [--interval SECS]` | Peers, slots, running jobs, local/remote counters, compile cache hits. `--watch` (`-w`) refreshes live over a persistent IPC connection with visual slot bars, session counter deltas, and live traffic rates until Ctrl+C (`--interval`/`-n`, default 1 s, range 0.1..=3600 s). |
+| `crabfarm doctor [--fix \| --dump [--out PATH] [--log-lines N]]` | Check machine/project setup and report fixes; `--fix` repairs safe local issues; `--dump` writes a read-only, secret-free diagnostic report (findings, effective config, cargo wrapper setup, toolchains/targets per node with compatibility check, counters, disk state, and `node.log` tail). |
 | `crabfarm cache stats\|clear` | What the compile cache holds and its hit counters; delete it (section 16). |
 | `crabfarm <path-to-rustc> <rustc args...>` | Wrapper mode (cargo calls this). Detected when argv[1] is a path whose file stem is `rustc` (or `clippy-driver`). |
 
@@ -221,9 +222,9 @@ prefer_remote = false           # true: eligible jobs go to a peer with a free s
 
 ## 13. Observability
 
-- `crabfarm status`: table of peers (name, OS/host, slots busy/total, speed, RTT, bandwidth), local running jobs (crate, where, elapsed), counters (remote ok, local by reason, bytes up/down) and the compile cache line (section 16).
+- `crabfarm status`: table of peers (name, OS/host, slots busy/total, speed, RTT, bandwidth), local running jobs (crate, where, elapsed), counters (remote ok, local by reason, bytes up/down) and the compile cache line (section 16). `crabfarm status --watch` (`-w`, optional `--interval`/`-n` in `0.1..=3600` seconds, default `1`) reuses one authenticated IPC connection (reconnecting automatically if the node stops or restarts) and renders a live view with ASCII slot bars for this node and each peer, session counter deltas `(+N)` since watch started (reset if the node restarts), and instantaneous upload/download rates. On a TTY it uses alternate-screen ANSI updates (enabling Windows VT processing via `SetConsoleMode` and restoring it on exit; respecting `NO_COLOR`) and prints the final snapshot to scrollback on Ctrl+C; on non-TTY stdout it emits plain newline-separated snapshots and exits cleanly on `BrokenPipe`.
 - Logs: `tracing` to stderr and appended to `<data>/logs/node.log` (**rotation is P2**), level from `CRABFARM_LOG` (default `info`; the wrapper prints its local-classification reasons to stderr when `CRABFARM_LOG` is set). Info level logs crate names, sizes, timings, failed job-connection causes, `TooLarge`, embedded local paths in `OUT_DIR`, and the first 64 distinct `UnknownDependency` paths per node run — never stderr contents, environment values, keys or tokens (CF-45).
-- `status` also shows peers that are known but offline, and a one-line summary first. While the `node-unresponsive` marker (section 10, CF-25) is live it starts with a warning line saying how long wrappers still skip the node, also when the node does not answer the status query. The counter `wrapper_gone` counts remote jobs dropped because their wrapper had left. `crabfarm doctor` ignores 0-byte `.rmeta` files written by `clippy --all-targets` `--test` targets (CF-44) and prints a `CRABFARM_LOG=debug` + `node.log` note whenever it reports a warning or problem (CF-45).
+- `status` also shows peers that are known but offline, and a one-line summary first. While the `node-unresponsive` marker (section 10, CF-25) is live it starts with a warning line saying how long wrappers still skip the node, also when the node does not answer the status query. The counter `wrapper_gone` counts remote jobs dropped because their wrapper had left. `crabfarm doctor` ignores 0-byte `.rmeta` files written by `clippy --all-targets` `--test` targets (CF-44), notes online peers with `accept_remote_jobs = false`, and prints a `CRABFARM_LOG=debug` + `node.log` note whenever it reports a warning or problem (CF-45). `crabfarm doctor --dump` (optional `--out <PATH>` and `--log-lines <N>`, default 200, conflicts with `--fix`) emits a strictly read-only, secret-free diagnostic bundle covering findings, effective `config.toml`, cargo/wrapper env & global/project configs, local and peer toolchains/targets with compatibility checks, all counters, on-disk metadata (never reading keys, `ipc.token`, or `invites.toml`), and the last `N` lines (capped at 256 KiB from EOF) of `logs/node.log` (CF-47).
 
 ## 14. Testing
 
@@ -235,7 +236,7 @@ prefer_remote = false           # true: eligible jobs go to a peer with a free s
 ## 15. Phase plan
 
 - **P1** (this round): everything above unless marked P2/P3; Windows to Windows tested on the owner PC with two local nodes; real notebook + desktop run by the owner.
-- **P2**: cross-OS jobs without proc macros (`--target` added, needs_host routing), ~~result cache keyed by (toolchain, normalized args, env, input hashes)~~ (done in 1.0.0, CF-28, section 16), `crabfarm status --watch` live view, `node --detach` and autostart helpers (opt-in commands only), revocation list, persistent job connections.
+- **P2**: cross-OS jobs without proc macros (`--target` added, needs_host routing), ~~result cache keyed by (toolchain, normalized args, env, input hashes)~~ (done in 1.0.0, CF-28, section 16), ~~`crabfarm status --watch` live view~~ (done, CF-46), `node --detach` and autostart helpers (opt-in commands only), revocation list, persistent job connections.
 - **P3**: proc-macro rebuild for the executing peer's host: peers record the job specs of proc-macro crates and their host dependency chain and replay them with `--target <peer host>`; result cached per host.
 
 ## 16. Compile cache (CF-28)

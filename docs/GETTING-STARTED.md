@@ -143,6 +143,7 @@ Build something, then:
 
 ```powershell
 crabfarm status
+crabfarm status --watch   # live view while building (--interval 0.5 for faster refresh)
 ```
 
 ```
@@ -175,6 +176,7 @@ Start with:
 ```powershell
 crabfarm doctor        # checks this machine and says how to fix each problem
 crabfarm doctor --fix  # also repairs what is safe to repair: starts the node, points autostart at this install
+crabfarm doctor --dump # prints a safe-to-share diagnostic dump (config, toolchains, peers, counters, node.log tail; --out file.txt to save)
 ```
 
 Run it inside a project to also check that project: whether plain `cargo build` uses crabfarm there, and how many of its built libraries crabfarm does not know (those keep the crates that depend on them local, `UnknownDependency` in `status`). `doctor` never changes PATH, environment variables, the firewall or project files; for those it prints what to do.

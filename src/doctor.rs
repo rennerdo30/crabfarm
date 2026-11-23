@@ -384,7 +384,17 @@ pub fn diagnose(x: &Facts) -> Vec<Finding> {
             );
         }
         for (p, s) in &n.peers {
-            if s.is_none() {
+            let Some(st) = s.as_ref() else {
+                continue;
+            };
+            if !st.accepting {
+                out.push(f(
+                    Level::Note,
+                    format!(
+                        "{} is online, but does not accept remote jobs (`accept_remote_jobs = false`).",
+                        p.node_name
+                    ),
+                ));
                 continue;
             }
             let reach = Reach::from_code(counter(
@@ -717,6 +727,709 @@ pub fn run(fix: bool) -> anyhow::Result<i32> {
     Ok(i32::from(failed))
 }
 
+// ------------------------------------------------------------ diagnostic dump
+
+/// Default number of trailing lines of `node.log` included in `crabfarm doctor --dump`.
+pub const DEFAULT_DUMP_LOG_LINES: usize = 200;
+/// Maximum bytes read from the tail of `node.log` during `--dump`.
+pub const MAX_DUMP_LOG_BYTES: usize = 256 * 1024;
+/// Maximum `env_forward.toml` crates listed individually in `--dump`.
+const MAX_DUMP_ENV_FORWARD_CRATES: usize = 32;
+
+/// Non-secret cargo/crabfarm configuration variables inspected by `--dump`.
+const DUMP_ENV_VARS: [&str; 8] = [
+    "RUSTC_WRAPPER",
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "CRABFARM_INNER_WRAPPER",
+    "CARGO_BUILD_JOBS",
+    "CARGO_INCREMENTAL",
+    "CARGO_TARGET_DIR",
+    "CARGO_BUILD_TARGET_DIR",
+    "CRABFARM_LOG",
+];
+
+#[derive(Debug, Clone, Default)]
+pub struct CargoConfigSummary {
+    pub file: PathBuf,
+    pub rustc_wrapper: Option<String>,
+    pub jobs: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct DiskSummary {
+    pub short_farm_id: Option<String>,
+    pub node_id_short: Option<String>,
+    pub listen_addr: Option<String>,
+    pub ipc_port: Option<u16>,
+    pub unresponsive_remaining_secs: Option<u64>,
+    pub peers_book: Result<Vec<PeerInfo>, String>,
+    pub depgraph_entries: usize,
+    pub ccache_usage: crate::ccache::DiskUsage,
+    pub env_forward: std::collections::BTreeMap<String, Vec<String>>,
+    pub auto_toolchains: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default)]
+pub struct LogTail {
+    pub path: PathBuf,
+    pub exists: bool,
+    pub total_bytes: u64,
+    pub lines: Vec<String>,
+    pub truncated_by_bytes: bool,
+}
+
+pub struct DumpData {
+    pub version: String,
+    pub proto_version: u16,
+    pub os: String,
+    pub arch: String,
+    pub now_unix: u64,
+    pub data_dir: PathBuf,
+    pub crabfarm_home_env: Option<String>,
+    pub cwd: PathBuf,
+    pub facts: Facts,
+    pub config_source: String,
+    pub config: config::Config,
+    pub env_vars: Vec<(String, Option<String>)>,
+    pub global_cargo_config: Option<CargoConfigSummary>,
+    pub project_cargo_jobs: Option<(String, PathBuf)>,
+    pub disk: DiskSummary,
+    pub log_tail: LogTail,
+}
+
+fn read_cargo_config_summary(dir: &Path) -> Option<CargoConfigSummary> {
+    for name in ["config.toml", "config"] {
+        let file = dir.join(name);
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let Ok(table) = toml::from_str::<toml::Table>(&text) else {
+            return Some(CargoConfigSummary {
+                file,
+                rustc_wrapper: Some("<invalid TOML>".into()),
+                jobs: None,
+            });
+        };
+        let build = table.get("build").and_then(|b| b.as_table());
+        let rustc_wrapper = build
+            .and_then(|b| b.get("rustc-wrapper"))
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string);
+        let jobs = build.and_then(|b| b.get("jobs")).map(ToString::to_string);
+        return Some(CargoConfigSummary {
+            file,
+            rustc_wrapper,
+            jobs,
+        });
+    }
+    None
+}
+
+fn project_jobs_in_ancestors(cwd: &Path, cargo_home: Option<&Path>) -> Option<(String, PathBuf)> {
+    let mut dirs: Vec<PathBuf> = cwd.ancestors().map(|d| d.join(".cargo")).collect();
+    dirs.extend(cargo_home.map(Path::to_path_buf));
+    for d in dirs {
+        if let Some(s) = read_cargo_config_summary(&d)
+            && let Some(jobs) = s.jobs
+        {
+            return Some((jobs, s.file));
+        }
+    }
+    None
+}
+
+/// Read only `farm/ca.crt` (public CA cert DER, never `ca.key`) to compute the short farm id.
+fn short_farm_id_from_disk(data_dir: &Path) -> Option<String> {
+    let der = std::fs::read(data_dir.join("farm").join("ca.crt")).ok()?;
+    let fp = farm::cert_fingerprint(&der);
+    Some(fp.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Read up to the last `max_lines` lines from `path`, bounded by `max_bytes` from EOF.
+pub fn tail_log(path: &Path, max_lines: usize, max_bytes: usize) -> LogTail {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return LogTail {
+            path: path.to_path_buf(),
+            exists: false,
+            ..LogTail::default()
+        };
+    };
+    let total_bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if max_lines == 0 || total_bytes == 0 {
+        return LogTail {
+            path: path.to_path_buf(),
+            exists: true,
+            total_bytes,
+            lines: Vec::new(),
+            truncated_by_bytes: false,
+        };
+    }
+    let cap = max_bytes.max(1) as u64;
+    let (to_read, truncated_by_bytes) = if total_bytes > cap {
+        let _ = file.seek(SeekFrom::End(-(cap as i64)));
+        (cap as usize, true)
+    } else {
+        (total_bytes as usize, false)
+    };
+    let mut buf = Vec::with_capacity(to_read);
+    let _ = file.take(to_read as u64).read_to_end(&mut buf);
+    let text = String::from_utf8_lossy(&buf);
+    let mut iter = text.lines();
+    if truncated_by_bytes {
+        // Drop the leading partial line after seeking into the middle of the file.
+        let _ = iter.next();
+    }
+    let all: Vec<String> = iter.map(sanitize_dump_line).collect();
+    let skip = all.len().saturating_sub(max_lines);
+    LogTail {
+        path: path.to_path_buf(),
+        exists: true,
+        total_bytes,
+        lines: all.into_iter().skip(skip).collect(),
+        truncated_by_bytes,
+    }
+}
+
+fn sanitize_dump_line(line: &str) -> String {
+    line.chars()
+        .filter(|c| !c.is_control() || *c == '\t')
+        .collect()
+}
+
+/// Strictly read-only diagnostic collector. Never reads keys (`ca.key`,
+/// `node.key`, `blob.key`, `cache.key`), `ipc.token`, `invites.toml`, or
+/// arbitrary environment variables.
+pub fn gather_dump(data_dir: &Path, log_lines: usize) -> anyhow::Result<DumpData> {
+    let now_unix = crate::node::unix_now();
+    let facts = gather(data_dir)?;
+    let cwd = std::env::current_dir()?;
+    let home = cargo_home();
+
+    let cfg_path = data_dir.join("config.toml");
+    let (config_source, config) = match std::fs::read_to_string(&cfg_path) {
+        Ok(s) => match toml::from_str::<config::Config>(&s) {
+            Ok(c) => ("config.toml".into(), c),
+            Err(e) => (
+                format!("parse error ({e}); using defaults"),
+                config::Config::default(),
+            ),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
+            "default (config.toml absent)".into(),
+            config::Config::default(),
+        ),
+        Err(e) => (
+            format!("read error ({e}); using defaults"),
+            config::Config::default(),
+        ),
+    };
+
+    let env_vars = DUMP_ENV_VARS
+        .iter()
+        .map(|&name| (name.to_string(), std::env::var(name).ok()))
+        .collect();
+
+    let global_cargo_config = home.as_deref().and_then(read_cargo_config_summary);
+    let project_cargo_jobs = project_jobs_in_ancestors(&cwd, home.as_deref());
+
+    let node_id_short = std::fs::read_to_string(data_dir.join("node.id"))
+        .ok()
+        .map(|s| s.trim().chars().take(16).collect::<String>())
+        .filter(|s| !s.is_empty());
+    let listen_addr = std::fs::read_to_string(data_dir.join("listen.addr"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let ipc_port = std::fs::read_to_string(ipc::port_path(data_dir))
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok());
+    let unresponsive_remaining_secs =
+        ipc::unresponsive_until(data_dir).and_then(|u| u.checked_sub(now_unix));
+    let peers_book = crate::discovery::PeerBook::load(data_dir)
+        .map(|b| b.peers)
+        .map_err(|e| format!("{e:#}"));
+    let depgraph_entries = crate::depgraph::DepGraph::load(&data_dir.join("depgraph.bin")).len();
+    let ccache_usage = crate::ccache::disk_usage(data_dir);
+    let env_forward = crate::envlearn::summary(data_dir);
+
+    #[derive(serde::Deserialize, Default)]
+    struct AutoToolchainsFile {
+        #[serde(default)]
+        names: Vec<String>,
+    }
+    let auto_toolchains = std::fs::read_to_string(data_dir.join("auto-toolchains.toml"))
+        .ok()
+        .and_then(|s| toml::from_str::<AutoToolchainsFile>(&s).ok())
+        .map(|f| f.names);
+
+    let log_tail = tail_log(
+        &data_dir.join("logs").join("node.log"),
+        log_lines,
+        MAX_DUMP_LOG_BYTES,
+    );
+
+    Ok(DumpData {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        proto_version: crate::proto::PROTO_VERSION,
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        now_unix,
+        data_dir: data_dir.to_path_buf(),
+        crabfarm_home_env: std::env::var("CRABFARM_HOME").ok(),
+        cwd,
+        facts,
+        config_source,
+        config,
+        env_vars,
+        global_cargo_config,
+        project_cargo_jobs,
+        disk: DiskSummary {
+            short_farm_id: short_farm_id_from_disk(data_dir),
+            node_id_short,
+            listen_addr,
+            ipc_port,
+            unresponsive_remaining_secs,
+            peers_book,
+            depgraph_entries,
+            ccache_usage,
+            env_forward,
+            auto_toolchains,
+        },
+        log_tail,
+    })
+}
+
+fn format_toolchain(tc: &crate::proto::ToolchainId, targets: Option<&[String]>) -> String {
+    let short_hash: String = tc.commit_hash.chars().take(10).collect();
+    let t_list = targets
+        .map(|ts| ts.join(", "))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "none".into());
+    format!(
+        "{} (commit={}, date={}, host={}) targets=[{}]",
+        tc.release, short_hash, tc.commit_date, tc.host, t_list
+    )
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// Render [`DumpData`] into a self-contained, secret-free plain-text report.
+pub fn render_dump(d: &DumpData) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+
+    let _ = writeln!(
+        out,
+        "=== crabfarm diagnostic dump ({}, proto {}) ===",
+        d.version, d.proto_version
+    );
+    let _ = writeln!(out, "platform: {}/{}", d.os, d.arch);
+    let _ = writeln!(out, "unix_time: {}", d.now_unix);
+    let _ = writeln!(out, "exe: {}", d.facts.exe.display());
+    let _ = writeln!(
+        out,
+        "on_path: {}",
+        d.facts
+            .on_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "not found".into())
+    );
+    let _ = writeln!(
+        out,
+        "data_dir: {} (CRABFARM_HOME={})",
+        d.data_dir.display(),
+        d.crabfarm_home_env.as_deref().unwrap_or("unset")
+    );
+    let _ = writeln!(out, "cwd: {}", d.cwd.display());
+    if let Some(a) = &d.facts.autostart {
+        let _ = writeln!(
+            out,
+            "autostart: {} (stale={}, node_running={})",
+            if a.autostart { "on" } else { "off" },
+            a.stale,
+            a.node_running
+        );
+    } else {
+        let _ = writeln!(out, "autostart: n/a");
+    }
+
+    // 1. Doctor findings
+    let findings = diagnose(&d.facts);
+    let problems = findings
+        .iter()
+        .filter(|x| x.level == Level::Problem)
+        .count();
+    let warnings = findings.iter().filter(|x| x.level == Level::Warn).count();
+    let _ = writeln!(
+        out,
+        "\n--- doctor findings ({problems} problem(s), {warnings} warning(s)) ---"
+    );
+    out.push_str(&render(&findings));
+
+    // 2. Configuration
+    let c = &d.config;
+    let _ = writeln!(out, "\n--- config ({}) ---", d.config_source);
+    let _ = writeln!(out, "node_name = {:?}", c.node_name);
+    let _ = writeln!(out, "listen = {:?}", c.listen);
+    let _ = writeln!(
+        out,
+        "slots = {}  local_slots = {}  accept_remote_jobs = {}  prefer_remote = {}",
+        c.slots, c.local_slots, c.accept_remote_jobs, c.prefer_remote
+    );
+    let _ = writeln!(
+        out,
+        "remote_incremental = {:?}  auto_install = {} (max={})  mdns = {}",
+        c.remote_incremental, c.auto_install, c.max_auto_toolchains, c.mdns
+    );
+    let _ = writeln!(
+        out,
+        "cache = {} (entries_max={} GB, blobs_max={} GB, retain_blobs={})  job_timeout_min = {}  accept_build_env = {}",
+        c.cache,
+        c.cache_entries_max_gb,
+        c.cache_max_gb,
+        c.retain_blobs,
+        c.job_timeout_min,
+        c.accept_build_env
+    );
+    let _ = writeln!(out, "peers = {:?}", c.peers);
+    let _ = writeln!(out, "local_only = {:?}", c.local_only);
+    let _ = writeln!(out, "sensitive = {:?}", c.sensitive);
+    let _ = writeln!(out, "forward_env (names) = {:?}", c.forward_env);
+    let _ = writeln!(out, "accept_env (names) = {:?}", c.accept_env);
+
+    // 3. Cargo & wrapper setup
+    let _ = writeln!(out, "\n--- cargo & wrapper setup ---");
+    for (k, v) in &d.env_vars {
+        match v {
+            Some(val) => {
+                let _ = writeln!(out, "env {k} = {}", sanitize_dump_line(val));
+            }
+            None => {
+                let _ = writeln!(out, "env {k} = <unset>");
+            }
+        }
+    }
+    match &d.global_cargo_config {
+        Some(g) => {
+            let _ = writeln!(
+                out,
+                "global cargo config ({}): rustc-wrapper={}, jobs={}",
+                g.file.display(),
+                g.rustc_wrapper.as_deref().unwrap_or("<unset>"),
+                g.jobs.as_deref().unwrap_or("<unset>")
+            );
+        }
+        None => {
+            let _ = writeln!(out, "global cargo config: none found");
+        }
+    }
+    match &d.facts.project {
+        Some(p) => {
+            let _ = writeln!(out, "project root: {}", p.root.display());
+            match &p.config_wrapper {
+                Some((w, file)) => {
+                    let _ = writeln!(
+                        out,
+                        "project effective rustc-wrapper: {w:?} ({})",
+                        file.display()
+                    );
+                }
+                None => {
+                    let _ = writeln!(out, "project effective rustc-wrapper: <none>");
+                }
+            }
+            if let Some((jobs, file)) = &d.project_cargo_jobs {
+                let _ = writeln!(
+                    out,
+                    "project effective build.jobs: {jobs} ({})",
+                    file.display()
+                );
+            }
+            if let Some(l) = &p.libs {
+                let _ = writeln!(
+                    out,
+                    "project libs ({}): total={}, unrecorded={}, changed={}",
+                    l.dir.display(),
+                    l.total,
+                    l.unrecorded,
+                    l.changed
+                );
+            }
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "project: cwd is not inside a Rust project (run inside your project dir to inspect its .cargo/config.toml and target/deps)"
+            );
+        }
+    }
+
+    // 4. Live node & farm state
+    let _ = writeln!(out, "\n--- live node & farm state ---");
+    match &d.facts.node {
+        Some(n) => {
+            out.push_str(&crate::status::format_status(
+                &n.local,
+                &n.peers,
+                &n.counters,
+                d.now_unix,
+            ));
+            let _ = writeln!(
+                out,
+                "\nlocal node: id={} name={} host={} accepting={} slots={}/{} speed={}",
+                &n.local.node_id.to_hex()[..16],
+                n.local.node_name,
+                n.local.host_triple,
+                n.local.accepting,
+                n.local.slots_busy,
+                n.local.slots_total,
+                n.local.speed
+            );
+            let _ = writeln!(out, "local toolchains ({}):", n.local.toolchains.len());
+            for (i, tc) in n.local.toolchains.iter().enumerate() {
+                let targets = n.local.targets.get(i).map(Vec::as_slice);
+                let _ = writeln!(out, "  - {}", format_toolchain(tc, targets));
+            }
+            if n.peers.is_empty() {
+                let _ = writeln!(out, "peers: none");
+            } else {
+                for (p, s) in &n.peers {
+                    let reach = Reach::from_code(counter(
+                        &n.counters,
+                        &format!("reach.{}", p.node_id.to_hex()),
+                    ));
+                    match s {
+                        Some(st) => {
+                            let _ = writeln!(
+                                out,
+                                "peer {} (id={}): ONLINE host={} accepting={} slots={}/{} speed={} reach={:?} addrs={:?}",
+                                p.node_name,
+                                &p.node_id.to_hex()[..16],
+                                st.host_triple,
+                                st.accepting,
+                                st.slots_busy,
+                                st.slots_total,
+                                st.speed,
+                                reach,
+                                p.addrs
+                            );
+                            let _ = writeln!(out, "  toolchains ({}):", st.toolchains.len());
+                            for (i, tc) in st.toolchains.iter().enumerate() {
+                                let targets = st.targets.get(i).map(Vec::as_slice);
+                                let _ = writeln!(out, "    - {}", format_toolchain(tc, targets));
+                            }
+                            if !st.accepting {
+                                let _ = writeln!(
+                                    out,
+                                    "  NOTE: peer has accept_remote_jobs = false; no jobs will be sent to it"
+                                );
+                            } else if !n.local.toolchains.is_empty() {
+                                let matched = n
+                                    .local
+                                    .toolchains
+                                    .iter()
+                                    .filter(|lt| {
+                                        st.toolchains.iter().zip(&st.targets).any(|(pt, pts)| {
+                                            pt.same_compiler(lt)
+                                                && pts.iter().any(|t| t == &n.local.host_triple)
+                                        })
+                                    })
+                                    .count();
+                                if matched == 0 {
+                                    let _ = writeln!(
+                                        out,
+                                        "  NOTE: 0 of {} local toolchain(s) match this peer with target {} (check rustc version/commit or auto_install)",
+                                        n.local.toolchains.len(),
+                                        n.local.host_triple
+                                    );
+                                } else {
+                                    let _ = writeln!(
+                                        out,
+                                        "  toolchain match: {matched}/{} local toolchain(s) ready for {}",
+                                        n.local.toolchains.len(),
+                                        n.local.host_triple
+                                    );
+                                }
+                            }
+                        }
+                        None => {
+                            let _ = writeln!(
+                                out,
+                                "peer {} (id={}): OFFLINE last_seen={} addrs={:?}",
+                                p.node_name,
+                                &p.node_id.to_hex()[..16],
+                                p.last_seen,
+                                p.addrs
+                            );
+                        }
+                    }
+                }
+            }
+            if !c.prefer_remote {
+                let _ = writeln!(
+                    out,
+                    "scheduling note: prefer_remote = false (local_slots={}); when local free slots >= peer free slots, ties run locally (LocalSlotFree)",
+                    c.local_slots
+                );
+            }
+            let mut sorted_counters = n.counters.clone();
+            sorted_counters.sort_by(|a, b| a.0.cmp(&b.0));
+            let _ = writeln!(out, "\ncounters ({}):", sorted_counters.len());
+            for (k, v) in sorted_counters {
+                let _ = writeln!(out, "  {k} = {v}");
+            }
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "node did not answer QueryStatus (node_running={})",
+                d.facts.node_running
+            );
+        }
+    }
+
+    // 5. On-disk state summary (no keys/tokens)
+    let _ = writeln!(out, "\n--- on-disk state (no keys or tokens) ---");
+    let _ = writeln!(
+        out,
+        "farm: in_farm={} created_farm={} short_farm_id={} node_id={}",
+        d.facts.in_farm,
+        d.facts.created_farm,
+        d.disk.short_farm_id.as_deref().unwrap_or("<none>"),
+        d.disk.node_id_short.as_deref().unwrap_or("<none>")
+    );
+    let _ = writeln!(
+        out,
+        "node.lock: {}  listen.addr: {}  ipc.port: {}",
+        if d.facts.node_running {
+            "held (running)"
+        } else {
+            "free"
+        },
+        d.disk.listen_addr.as_deref().unwrap_or("<absent>"),
+        d.disk
+            .ipc_port
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "<absent>".into())
+    );
+    let _ = writeln!(
+        out,
+        "node-unresponsive: {}",
+        d.disk
+            .unresponsive_remaining_secs
+            .map(|s| format!("ACTIVE ({s}s left)"))
+            .unwrap_or_else(|| "absent".into())
+    );
+    match &d.disk.peers_book {
+        Ok(peers) => {
+            let _ = writeln!(out, "peers.toml: {} peer(s)", peers.len());
+            for p in peers {
+                let _ = writeln!(
+                    out,
+                    "  - {} (id={}) addrs={:?} last_seen={}",
+                    p.node_name,
+                    &p.node_id.to_hex()[..16],
+                    p.addrs,
+                    p.last_seen
+                );
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(out, "peers.toml: error ({e})");
+        }
+    }
+    let _ = writeln!(
+        out,
+        "depgraph.bin: {} recorded entries",
+        d.disk.depgraph_entries
+    );
+    let _ = writeln!(
+        out,
+        "ccache: {} entries, {} blobs, {}",
+        d.disk.ccache_usage.entries,
+        d.disk.ccache_usage.blobs,
+        format_bytes(d.disk.ccache_usage.bytes)
+    );
+    let _ = writeln!(
+        out,
+        "env_forward.toml: {} crate(s) with recorded local env deps (names only)",
+        d.disk.env_forward.len()
+    );
+    for (krate, vars) in d.disk.env_forward.iter().take(MAX_DUMP_ENV_FORWARD_CRATES) {
+        let _ = writeln!(out, "  - {krate}: {:?}", vars);
+    }
+    if d.disk.env_forward.len() > MAX_DUMP_ENV_FORWARD_CRATES {
+        let _ = writeln!(
+            out,
+            "  ... ({} more crates omitted)",
+            d.disk.env_forward.len() - MAX_DUMP_ENV_FORWARD_CRATES
+        );
+    }
+    if let Some(auto) = &d.disk.auto_toolchains {
+        let _ = writeln!(out, "auto-toolchains.toml: {:?}", auto);
+    }
+
+    // 6. Recent node.log tail
+    if !d.log_tail.exists {
+        let _ = writeln!(
+            out,
+            "\n--- node.log ({}) ---\n<file does not exist>",
+            d.log_tail.path.display()
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "\n--- node.log ({}, {}, showing last {} line(s){}) ---",
+            d.log_tail.path.display(),
+            format_bytes(d.log_tail.total_bytes),
+            d.log_tail.lines.len(),
+            if d.log_tail.truncated_by_bytes {
+                ", tail capped at 256 KiB"
+            } else {
+                ""
+            }
+        );
+        for line in &d.log_tail.lines {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+
+    out
+}
+
+/// Run `crabfarm doctor --dump` (write to `out_path` or stdout).
+pub fn run_dump(out_path: Option<&Path>, log_lines: usize) -> anyhow::Result<i32> {
+    let data_dir = config::data_dir()?;
+    let data = gather_dump(&data_dir, log_lines)?;
+    let report = render_dump(&data);
+    match out_path {
+        Some(path) => {
+            std::fs::write(path, &report)
+                .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
+            println!(
+                "Wrote diagnostic dump ({}) to {}",
+                format_bytes(report.len() as u64),
+                path.display()
+            );
+        }
+        None => {
+            print!("{report}");
+        }
+    }
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -907,5 +1620,139 @@ mod tests {
             r.contains("CRABFARM_LOG=debug"),
             "missing debug log hint:\n{r}"
         );
+    }
+
+    #[test]
+    fn non_accepting_peer_is_noted_by_doctor() {
+        let mut x = healthy();
+        x.node.as_mut().unwrap().peers[0]
+            .1
+            .as_mut()
+            .unwrap()
+            .accepting = false;
+        let f = diagnose(&x);
+        let r = render(&f);
+        assert!(
+            r.contains("does not accept remote jobs"),
+            "missing non-accepting note:\n{r}"
+        );
+        assert_eq!(worst(&f), Level::Note);
+    }
+
+    #[test]
+    fn tail_log_handles_missing_small_and_large_files() {
+        let d = tempfile::tempdir().unwrap();
+        let missing = tail_log(&d.path().join("nope.log"), 50, 1024);
+        assert!(!missing.exists);
+        assert!(missing.lines.is_empty());
+
+        let log = d.path().join("node.log");
+        std::fs::write(&log, "line1\nline2\nline3\nline4\n").unwrap();
+        let small = tail_log(&log, 2, 1024);
+        assert!(small.exists);
+        assert!(!small.truncated_by_bytes);
+        assert_eq!(small.lines, vec!["line3", "line4"]);
+
+        // Large file exceeding byte cap: seeks from tail and drops the partial leading line.
+        let mut big = String::new();
+        for i in 0..200 {
+            big.push_str(&format!("entry-{i:04}-payload-0123456789\n"));
+        }
+        std::fs::write(&log, &big).unwrap();
+        let capped = tail_log(&log, 500, 512);
+        assert!(capped.truncated_by_bytes);
+        assert_eq!(
+            capped.lines.last().unwrap(),
+            "entry-0199-payload-0123456789"
+        );
+        assert!(
+            capped.lines.first().unwrap().starts_with("entry-"),
+            "partial leading line should be dropped: {:?}",
+            capped.lines.first()
+        );
+    }
+
+    #[test]
+    fn diagnostic_dump_includes_toolchains_config_log_and_excludes_secrets() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("farm")).unwrap();
+        std::fs::create_dir_all(d.path().join("logs")).unwrap();
+        // Plant recognizable secret values in every secret file that --dump must NEVER read.
+        std::fs::write(d.path().join("farm/ca.key"), "SECRET_CA_KEY_VALUE").unwrap();
+        std::fs::write(d.path().join("node.key"), "SECRET_NODE_KEY_VALUE").unwrap();
+        std::fs::write(d.path().join("blob.key"), "SECRET_BLOB_KEY_VALUE").unwrap();
+        std::fs::write(d.path().join("cache.key"), "SECRET_CACHE_KEY_VALUE").unwrap();
+        std::fs::write(d.path().join("ipc.token"), "SECRET_IPC_TOKEN_VALUE").unwrap();
+        std::fs::write(d.path().join("farm/invites.toml"), "SECRET_INVITE_TOKEN").unwrap();
+        std::fs::write(d.path().join("farm/ca.crt"), b"dummy-ca-cert-der").unwrap();
+        std::fs::write(d.path().join("node.id"), "0123456789abcdef0123456789abcdef").unwrap();
+        std::fs::write(
+            d.path().join("config.toml"),
+            "prefer_remote = true\nlocal_slots = 4\nforward_env = [\"MY_SAFE_VAR\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.path().join("env_forward.toml"),
+            "my_crate = [\"UNFORWARDED_VAR\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.path().join("logs/node.log"),
+            "2026-11-23 INFO node started\n2026-11-23 INFO job fell back\n",
+        )
+        .unwrap();
+
+        let mut dump = gather_dump(d.path(), 50).unwrap();
+        // Inject a live NodeView with mismatched toolchains to verify compatibility reporting.
+        let mut local_st = st("FOCALOR");
+        local_st.toolchains = vec![crate::proto::ToolchainId {
+            release: "1.100.0".into(),
+            commit_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            commit_date: "2026-11-09".into(),
+            host: "x86_64-pc-windows-msvc".into(),
+        }];
+        local_st.targets = vec![vec!["x86_64-pc-windows-msvc".into()]];
+
+        let mut peer_st = st("DESKTOP-PC");
+        peer_st.toolchains = vec![crate::proto::ToolchainId {
+            release: "1.99.0".into(),
+            commit_hash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            commit_date: "2026-10-01".into(),
+            host: "x86_64-pc-windows-msvc".into(),
+        }];
+        peer_st.targets = vec![vec!["x86_64-pc-windows-msvc".into()]];
+
+        dump.facts.node = Some(NodeView {
+            local: local_st,
+            peers: vec![(
+                PeerInfo {
+                    node_id: NodeId([2; 16]),
+                    node_name: "DESKTOP-PC".into(),
+                    addrs: vec!["192.168.1.20:47070".into()],
+                    last_seen: 1000,
+                },
+                Some(peer_st),
+            )],
+            counters: vec![("local.NoPeer".into(), 7), ("remote_ok".into(), 0)],
+        });
+
+        let text = render_dump(&dump);
+        assert!(text.contains("=== crabfarm diagnostic dump"), "{text}");
+        assert!(text.contains("prefer_remote = true"), "{text}");
+        assert!(text.contains("MY_SAFE_VAR"), "{text}");
+        assert!(text.contains("UNFORWARDED_VAR"), "{text}");
+        assert!(text.contains("0 of 1 local toolchain(s) match"), "{text}");
+        assert!(text.contains("local.NoPeer = 7"), "{text}");
+        assert!(text.contains("INFO job fell back"), "{text}");
+        for forbidden in [
+            "SECRET_CA_KEY_VALUE",
+            "SECRET_NODE_KEY_VALUE",
+            "SECRET_BLOB_KEY_VALUE",
+            "SECRET_CACHE_KEY_VALUE",
+            "SECRET_IPC_TOKEN_VALUE",
+            "SECRET_INVITE_TOKEN",
+        ] {
+            assert!(!text.contains(forbidden), "dump leaked secret {forbidden}!");
+        }
     }
 }

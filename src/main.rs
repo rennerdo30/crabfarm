@@ -69,14 +69,37 @@ enum Cmd {
     #[command(trailing_var_arg = true, allow_hyphen_values = true)]
     Cargo { args: Vec<String> },
     /// Show peers, slots, running jobs and counters.
-    Status,
-    /// Check this machine's crabfarm setup and say how to fix what is wrong.
+    Status {
+        /// Refresh the status view continuously until Ctrl+C.
+        #[arg(short, long)]
+        watch: bool,
+        /// Refresh interval in seconds for `--watch` (default: 1, range: 0.1..=3600).
+        #[arg(
+            short = 'n',
+            long,
+            value_name = "SECS",
+            value_parser = status::parse_watch_interval,
+            requires = "watch"
+        )]
+        interval: Option<std::time::Duration>,
+    },
+    /// Check this machine's crabfarm setup, repair safe issues, or write a diagnostic dump.
     Doctor {
         /// Also repair what is safe to repair here: start the node, point
         /// autostart at this install. Never edits PATH, the environment or
         /// project files.
         #[arg(long)]
         fix: bool,
+        /// Print a safe-to-share diagnostic dump (config, toolchains, peers,
+        /// counters, recent node.log) to help debug build/routing issues.
+        #[arg(long, conflicts_with = "fix")]
+        dump: bool,
+        /// Write `--dump` output to a file instead of stdout.
+        #[arg(long, value_name = "PATH", requires = "dump")]
+        out: Option<std::path::PathBuf>,
+        /// Number of trailing lines of `node.log` to include in `--dump` (default: 200).
+        #[arg(long, value_name = "N", requires = "dump")]
+        log_lines: Option<usize>,
     },
     /// Download the newest crabfarm release from GitHub and install it.
     Update {
@@ -425,8 +448,23 @@ fn real_main() -> anyhow::Result<i32> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Cargo { args } => Ok(cargo_cmd::run(&args)),
-        Cmd::Status => Ok(status::run()),
-        Cmd::Doctor { fix } => crabfarm::doctor::run(fix),
+        Cmd::Status { watch: false, .. } => Ok(status::run()),
+        Cmd::Status {
+            watch: true,
+            interval,
+        } => Ok(status::run_watch(
+            interval.unwrap_or(status::DEFAULT_WATCH_INTERVAL),
+        )),
+        Cmd::Doctor {
+            dump: true,
+            out,
+            log_lines,
+            ..
+        } => crabfarm::doctor::run_dump(
+            out.as_deref(),
+            log_lines.unwrap_or(crabfarm::doctor::DEFAULT_DUMP_LOG_LINES),
+        ),
+        Cmd::Doctor { fix, .. } => crabfarm::doctor::run(fix),
         Cmd::Update { check, pre, force } => {
             crabfarm::update::run(crabfarm::update::Options { check, pre, force })
         }
@@ -580,4 +618,84 @@ fn default_invite_addr(data_dir: &Path, cfg: &Config) -> anyhow::Result<String> 
         .next()
         .context("no LAN address found; pass --addr host:port")?;
     Ok(format!("{ip}:{port}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn status_watch_cli_flags_parse_and_validate() {
+        let plain = Cli::try_parse_from(["crabfarm", "status"]).unwrap();
+        assert!(matches!(
+            plain.cmd,
+            Cmd::Status {
+                watch: false,
+                interval: None
+            }
+        ));
+
+        let watch = Cli::try_parse_from(["crabfarm", "status", "--watch"]).unwrap();
+        assert!(matches!(
+            watch.cmd,
+            Cmd::Status {
+                watch: true,
+                interval: None
+            }
+        ));
+
+        let short = Cli::try_parse_from(["crabfarm", "status", "-w", "-n", "0.5"]).unwrap();
+        assert!(matches!(
+            short.cmd,
+            Cmd::Status {
+                watch: true,
+                interval: Some(d)
+            } if d == Duration::from_millis(500)
+        ));
+
+        // `--interval` without `--watch` is rejected.
+        assert!(Cli::try_parse_from(["crabfarm", "status", "--interval", "2"]).is_err());
+        // Out-of-range intervals are rejected.
+        assert!(Cli::try_parse_from(["crabfarm", "status", "--watch", "--interval", "0"]).is_err());
+    }
+
+    #[test]
+    fn doctor_dump_cli_flags_parse_and_validate() {
+        let plain = Cli::try_parse_from(["crabfarm", "doctor"]).unwrap();
+        assert!(matches!(
+            plain.cmd,
+            Cmd::Doctor {
+                fix: false,
+                dump: false,
+                out: None,
+                log_lines: None
+            }
+        ));
+
+        let dump = Cli::try_parse_from([
+            "crabfarm",
+            "doctor",
+            "--dump",
+            "--out",
+            "diag.txt",
+            "--log-lines",
+            "50",
+        ])
+        .unwrap();
+        assert!(matches!(
+            dump.cmd,
+            Cmd::Doctor {
+                fix: false,
+                dump: true,
+                out: Some(_),
+                log_lines: Some(50)
+            }
+        ));
+
+        // `--dump` conflicts with `--fix`, and `--out`/`--log-lines` require `--dump`.
+        assert!(Cli::try_parse_from(["crabfarm", "doctor", "--fix", "--dump"]).is_err());
+        assert!(Cli::try_parse_from(["crabfarm", "doctor", "--out", "diag.txt"]).is_err());
+        assert!(Cli::try_parse_from(["crabfarm", "doctor", "--log-lines", "50"]).is_err());
+    }
 }

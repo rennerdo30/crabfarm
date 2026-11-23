@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.0.0-rc.9
+
 - **Live status view (`crabfarm status --watch`, CF-46):** Add `--watch` (`-w`) and `--interval <SECS>` (`-n`, default `1`, range `0.1..=3600`) to `crabfarm status`. Reuses one authenticated IPC connection (automatically reconnecting across node restarts), shows ASCII slot utilization bars for this node and every peer, tracks session counter deltas `(+N)` since watch started, computes live upload/download rates, renders flicker-free alternate-screen ANSI frames on TTYs (enabling Windows VT processing and respecting `NO_COLOR`), and prints the final snapshot cleanly on Ctrl+C.
 - **Diagnostic dump (`crabfarm doctor --dump`, CF-47):** Add `crabfarm doctor --dump` (with optional `--out <PATH>` and `--log-lines <N>`, default 200; read-only, conflicts with `--fix`) to produce a safe-to-share bundle with doctor findings, effective `config.toml`, cargo/wrapper env and global/project configs, local and peer toolchains/targets with compatibility checks, all node counters, on-disk metadata (never reading keys, `ipc.token`, or `invites.toml`), and the tail of `logs/node.log`. `crabfarm doctor` also notes online peers with `accept_remote_jobs = false`.
 
